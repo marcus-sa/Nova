@@ -552,6 +552,22 @@ mod tests {
       T: E::Scalar::ZERO,
       X: u.X.clone(),
       u: E::Scalar::ONE,
+      // Stage 1.A added these `Option<>` lookup-fold fields. The legacy
+      // `test_sat_inner` exercises the R1CS-zero side only; the lookup-side
+      // is `None` to mirror a default running instance with no
+      // `LookupShape` attached (cf. `FoldedInstance::default`). Without
+      // these initialisers the test fails to compile under
+      // `--features lookup-fold`.
+      #[cfg(feature = "lookup-fold")]
+      comm_L: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_w: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_t: None,
+      #[cfg(feature = "lookup-fold")]
+      T_lookup: None,
     };
 
     S.is_sat(&ck, &U, &W)
