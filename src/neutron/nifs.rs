@@ -9,6 +9,11 @@ use crate::{
   traits::{commitment::CommitmentEngineTrait, AbsorbInRO2Trait, Engine, RO2Constants, ROTrait},
   Commitment, CommitmentKey, CE,
 };
+#[cfg(feature = "lookup-fold")]
+use crate::neutron::{
+  lookup_sumcheck::{lookup_running_claims_from, LookupSumcheckInstance},
+  relation::{LookupFreshWitness, LookupPayload, LookupRunningWitness},
+};
 use ff::Field;
 use rand_core::OsRng;
 use rayon::prelude::*;
@@ -21,6 +26,15 @@ use serde::{Deserialize, Serialize};
 pub struct NIFS<E: Engine> {
   pub(crate) comm_E: Commitment<E>,
   pub(crate) poly: UniPoly<E::Scalar>,
+
+  /// Lookup-fold extension fields (Stage C, C1-beta).
+  /// Present only when a lookup payload was supplied to the fold step.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) poly_lookup: Option<UniPoly<E::Scalar>>,
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_w: Option<Commitment<E>>,
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_t: Option<Commitment<E>>,
 }
 
 impl<E: Engine> NIFS<E> {
@@ -285,7 +299,19 @@ impl<E: Engine> NIFS<E> {
     let W = W1.fold(W2, &E, &r_E, &r_b)?;
 
     // return the folded instance and witness
-    Ok((Self { comm_E, poly }, (U, W)))
+    Ok((
+      Self {
+        comm_E,
+        poly,
+        #[cfg(feature = "lookup-fold")]
+        poly_lookup: None,
+        #[cfg(feature = "lookup-fold")]
+        comm_inv_w: None,
+        #[cfg(feature = "lookup-fold")]
+        comm_inv_t: None,
+      },
+      (U, W),
+    ))
   }
 
   /// Takes as input a relaxed R1CS instance `U1` and R1CS instance `U2`
@@ -339,6 +365,309 @@ impl<E: Engine> NIFS<E> {
     let U = U1.fold(U2, &self.comm_E, &r_b, &T_out)?;
 
     // return the folded instance and witness
+    Ok(U)
+  }
+
+  /// Prove a fold step with lookup data (Stages D, C1-beta).
+  ///
+  /// Extends the base `prove` with lookup-side FS transcript absorptions:
+  ///
+  /// 1. (Step 2) Absorb `payload.comm_L` and `payload.comm_ts` BEFORE tau squeeze
+  /// 2. (Step 5) After rho squeeze, squeeze `r_logup`
+  /// 3. (Step 6) Construct `LookupSumcheckInstance` with dual-instance data,
+  ///    absorb `comm_inv_w`, `comm_inv_t`
+  /// 4. (Step 7) Call `prove_step`, absorb `poly_lookup` AFTER R1CS `poly`
+  /// 5. After `r_b` squeeze, compute `T_lookup_out`
+  /// 6. Fold using `fold_with_lookup`
+  ///
+  /// Returns the NIFS proof, the folded instance+witness pair, the folded
+  /// lookup running witness, and the fresh witness data (with computed
+  /// inverses populated for downstream use).
+  #[cfg(feature = "lookup-fold")]
+  #[allow(clippy::too_many_arguments)]
+  pub fn prove_with_lookup(
+    ck: &CommitmentKey<E>,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    S: &Structure<E>,
+    U1: &FoldedInstance<E>,
+    W1: &FoldedWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+    payload: &LookupPayload<E>,
+    running_lw: &LookupRunningWitness<E>,
+    fresh_witness: &[E::Scalar],
+    fresh_table: &[E::Scalar],
+    fresh_multiplicities: &[E::Scalar],
+    fresh_eq_w_left: Vec<E::Scalar>,
+    fresh_eq_w_right: Vec<E::Scalar>,
+    fresh_eq_t_left: Vec<E::Scalar>,
+    fresh_eq_t_right: Vec<E::Scalar>,
+  ) -> Result<
+    (
+      NIFS<E>,
+      (FoldedInstance<E>, FoldedWitness<E>),
+      LookupRunningWitness<E>,
+    ),
+    NovaError,
+  > {
+    // initialize a new RO
+    let mut ro = E::RO2::new(ro_consts.clone());
+
+    // append the digest of pp to the transcript
+    ro.absorb(*pp_digest);
+
+    // append U2 to transcript
+    U2.absorb_in_ro2(&mut ro);
+
+    // --- Step (2): absorb lookup commitments BEFORE tau squeeze ---
+    payload.comm_L.absorb_in_ro2(&mut ro);
+    payload.comm_ts.absorb_in_ro2(&mut ro);
+
+    // generate a challenge for the eq polynomial
+    let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // compute a commitment to the eq polynomial
+    let E = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
+    let r_E = E::Scalar::random(&mut OsRng);
+    let comm_E = CE::<E>::commit(ck, &E, &r_E);
+
+    comm_E.absorb_in_ro2(&mut ro);
+
+    // --- Step (4): squeeze rho ---
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Step (5): squeeze r_logup ---
+    let r_logup = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Step (6): Construct LookupSumcheckInstance ---
+    let (lookup_inst, comm_inv_w2, comm_inv_t2) = LookupSumcheckInstance::<E>::new(
+      ck,
+      // U1 (running) data
+      &running_lw.witness,
+      &running_lw.inv_w,
+      &running_lw.table,
+      &running_lw.multiplicities,
+      &running_lw.inv_t,
+      running_lw.eq_w_left.clone(),
+      running_lw.eq_w_right.clone(),
+      running_lw.eq_t_left.clone(),
+      running_lw.eq_t_right.clone(),
+      // U2 (fresh) data
+      fresh_witness,
+      fresh_table,
+      fresh_multiplicities,
+      fresh_eq_w_left.clone(),
+      fresh_eq_w_right.clone(),
+      fresh_eq_t_left.clone(),
+      fresh_eq_t_right.clone(),
+      // shared
+      r_logup,
+    )?;
+
+    // Absorb the inverse commitments
+    comm_inv_w2.absorb_in_ro2(&mut ro);
+    comm_inv_t2.absorb_in_ro2(&mut ro);
+
+    // --- R1CS-side sumcheck (same as base prove) ---
+    let T = (E::Scalar::ONE - rho) * U1.T;
+
+    let (res1, res2) = rayon::join(
+      || {
+        let z1 = [W1.W.clone(), vec![U1.u], U1.X.clone()].concat();
+        S.S.multiply_vec(&z1)
+      },
+      || {
+        let z2 = [W2.W.clone(), vec![E::Scalar::ONE], U2.X.clone()].concat();
+        S.S.multiply_vec(&z2)
+      },
+    );
+
+    let (Az1, Bz1, Cz1) = res1?;
+    let (Az2, Bz2, Cz2) = res2?;
+
+    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5) =
+      Self::prove_helper(
+        &rho,
+        (S.left, S.right),
+        &W1.E,
+        &Az1,
+        &Bz1,
+        &Cz1,
+        &E,
+        &Az2,
+        &Bz2,
+        &Cz2,
+      );
+
+    let evals = vec![
+      eval_point_0,
+      T - eval_point_0,
+      eval_point_2,
+      eval_point_3,
+      eval_point_4,
+      eval_point_5,
+    ];
+    let poly = UniPoly::<E::Scalar>::from_evals(&evals);
+
+    // absorb R1CS poly in the RO
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
+
+    // --- Step (7): lookup sumcheck ---
+    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+    let poly_lookup = lookup_inst.prove_step(&rho, &t_lookup_running);
+
+    // absorb lookup poly AFTER R1CS poly
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_lookup, &mut ro);
+
+    // squeeze r_b
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Compute R1CS T_out ---
+    let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
+    let T_out = poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap();
+
+    // --- Compute T_lookup_out ---
+    let T_lookup_out =
+      LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, &poly_lookup, &t_lookup_running)?;
+
+    // --- Fold with lookup ---
+    // Build the effective payload with the freshly computed inverse commitments
+    // from LookupSumcheckInstance::new (the caller's payload may have placeholders).
+    let effective_payload = LookupPayload {
+      comm_L: payload.comm_L,
+      comm_ts: payload.comm_ts,
+      comm_inv_w: comm_inv_w2,
+      comm_inv_t: comm_inv_t2,
+      T2_lookup: payload.T2_lookup,
+    };
+    let U = U1.fold_with_lookup(U2, &comm_E, &r_b, &T_out, &effective_payload, &T_lookup_out)?;
+    let W = W1.fold(W2, &E, &r_E, &r_b)?;
+
+    // --- Fold the lookup running witness ---
+    // We need the fresh inverse witnesses that LookupSumcheckInstance computed.
+    // Reconstruct them from the lookup instance's internal state via
+    // batch_invert_plus_r (same computation).
+    let fresh_inv_w =
+      crate::spartan::logup_inverses::batch_invert_plus_r(fresh_witness, &r_logup)?;
+    let fresh_inv_t_raw =
+      crate::spartan::logup_inverses::batch_invert_plus_r(fresh_table, &r_logup)?;
+    let fresh_inv_t: Vec<E::Scalar> = fresh_inv_t_raw
+      .iter()
+      .zip(fresh_multiplicities.iter())
+      .map(|(inv, ts)| *inv * *ts)
+      .collect();
+
+    let fresh_lw = LookupFreshWitness {
+      witness: fresh_witness.to_vec(),
+      inv_w: fresh_inv_w,
+      table: fresh_table.to_vec(),
+      multiplicities: fresh_multiplicities.to_vec(),
+      inv_t: fresh_inv_t,
+      eq_w_left: fresh_eq_w_left,
+      eq_w_right: fresh_eq_w_right,
+      eq_t_left: fresh_eq_t_left,
+      eq_t_right: fresh_eq_t_right,
+    };
+    let folded_lw = running_lw.fold(&fresh_lw, &r_b);
+
+    let nifs = NIFS {
+      comm_E,
+      poly,
+      poly_lookup: Some(poly_lookup),
+      comm_inv_w: Some(comm_inv_w2),
+      comm_inv_t: Some(comm_inv_t2),
+    };
+
+    Ok((nifs, (U, W), folded_lw))
+  }
+
+  /// Verify a fold step with lookup data (Stage E, C1-beta).
+  ///
+  /// Symmetric to `prove_with_lookup`. Re-derives the same FS challenges
+  /// from the transcript, absorbing commitments in the same order, then
+  /// verifies both the R1CS and lookup sumcheck polynomials.
+  #[cfg(all(feature = "lookup-fold", test))]
+  pub fn verify_with_lookup(
+    &self,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    U1: &FoldedInstance<E>,
+    U2: &R1CSInstance<E>,
+    payload: &LookupPayload<E>,
+  ) -> Result<FoldedInstance<E>, NovaError> {
+    // initialize a new RO
+    let mut ro = E::RO2::new(ro_consts.clone());
+
+    // append the digest of pp to the transcript
+    ro.absorb(*pp_digest);
+
+    // append U2 to transcript
+    U2.absorb_in_ro2(&mut ro);
+
+    // --- Step (2): absorb lookup commitments BEFORE tau squeeze ---
+    payload.comm_L.absorb_in_ro2(&mut ro);
+    payload.comm_ts.absorb_in_ro2(&mut ro);
+
+    // generate a challenge for the eq polynomial (tau)
+    let _tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // absorb comm_E
+    self.comm_E.absorb_in_ro2(&mut ro);
+
+    // --- Step (4): squeeze rho ---
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Step (5): squeeze r_logup ---
+    let _r_logup = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Step (6): absorb inverse commitments ---
+    let comm_inv_w = self
+      .comm_inv_w
+      .as_ref()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let comm_inv_t = self
+      .comm_inv_t
+      .as_ref()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    comm_inv_w.absorb_in_ro2(&mut ro);
+    comm_inv_t.absorb_in_ro2(&mut ro);
+
+    // --- R1CS-side checks ---
+    let T = (E::Scalar::ONE - rho) * U1.T;
+
+    if self.poly.eval_at_zero() + self.poly.eval_at_one() != T {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    // absorb R1CS poly
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly, &mut ro);
+
+    // --- Step (7): lookup sumcheck verification ---
+    let poly_lookup = self
+      .poly_lookup
+      .as_ref()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+
+    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+
+    // absorb lookup poly AFTER R1CS poly
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup, &mut ro);
+
+    // squeeze r_b
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Compute R1CS T_out ---
+    let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
+    let T_out = self.poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap();
+
+    // --- Compute T_lookup_out ---
+    let T_lookup_out =
+      LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, poly_lookup, &t_lookup_running)?;
+
+    // --- Fold with lookup ---
+    let U = U1.fold_with_lookup(U2, &self.comm_E, &r_b, &T_out, payload, &T_lookup_out)?;
+
     Ok(U)
   }
 }
@@ -500,6 +829,331 @@ mod tests {
     test_tiny_r1cs_bellpepper_with::<PallasEngine, RelaxedR1CSSNARK<_, EvaluationEngine<_>>>();
     test_tiny_r1cs_bellpepper_with::<Bn256EngineKZG, RelaxedR1CSSNARK<_, HyperKZGEE<_>>>();
     test_tiny_r1cs_bellpepper_with::<Secp256k1Engine, RelaxedR1CSSNARK<_, EvaluationEngine<_>>>();
+  }
+
+  /// Stage F: fold-of-two test exercising the full prove->verify->fold pipeline
+  /// with lookup data.
+  ///
+  /// 1. Creates a small R1CS shape (NonTrivialCircuit with 32 constraints)
+  /// 2. Creates a 16-entry lookup table
+  /// 3. Fold step 1: default running -> (U1, W1, payload1) with 4 in-table queries
+  /// 4. Fold step 2: running -> (U2, W2, payload2) with 4 different queries
+  ///    (including a duplicate for multiplicity > 1)
+  /// 5. Asserts prove/verify agreement at each step
+  /// 6. Asserts running_U.T_lookup is populated after each fold
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn execute_sequence_with_lookup() {
+    use crate::{
+      neutron::relation::{
+        LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+      },
+      spartan::polys::power::PowPolynomial,
+      traits::commitment::CommitmentEngineTrait,
+    };
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1BE_CF00);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // --- 1. Create a small R1CS shape (32 constraints) ---
+    let num_cons: usize = 32;
+
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // --- 2. Create a 16-entry lookup table ---
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let table: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 7 + 3) as u64))
+      .collect();
+
+    // Commit to table for the LookupTableHandle
+    let table_comm = <E as Engine>::CE::commit(&ck, &table, &Scalar::ZERO);
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: table_size,
+        commitment: table_comm,
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 1,
+      // For 4 queries: we need witness_ell such that 2^ell >= 4 => ell = 2.
+      // But table_ell = 4 (2^4 = 16).
+      // We pad queries to match table size for equal-size polynomials.
+      // Actually, witness and table can differ in size. Let's use table_ell=4
+      // for both to keep it simple (pad queries to 16).
+      witness_ell_cached: table_log2,
+    };
+
+    let str = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str.S.clone(); // padded shape
+
+    // --- Generate two R1CS instance-witness pairs ---
+    let circuit1: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs1 = SatisfyingAssignment::<E>::new();
+    let _ = circuit1.synthesize(&mut cs1);
+    let (U1, W1) = cs1
+      .r1cs_instance_and_witness(&shape, &ck)
+      .unwrap();
+    let W1 = W1.pad(&shape);
+
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(3)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs2 = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut cs2);
+    let (U2, W2) = cs2
+      .r1cs_instance_and_witness(&shape, &ck)
+      .unwrap();
+    let W2 = W2.pad(&shape);
+
+    // --- Initialize running state ---
+    let mut running_W = FoldedWitness::default(&str);
+    let mut running_U = FoldedInstance::default(&str);
+    let mut running_lw = LookupRunningWitness::default(&lookup_shape);
+
+    // Verify default instance satisfies the structure
+    let res = str.is_sat(&ck, &running_U, &running_W);
+    assert!(res.is_ok(), "default instance should be satisfying: {:?}", res);
+
+    // --- Helper: build a lookup payload from queries ---
+    // Queries are indices into the table. We pad to table_size (16).
+    let build_payload_and_witness = |query_indices: &[usize], rng: &mut ChaCha20Rng| {
+      // Build witness (padded to table_size with table[0])
+      let mut witness = vec![Scalar::ZERO; table_size];
+      let mut multiplicities = vec![Scalar::ZERO; table_size];
+      for (i, &idx) in query_indices.iter().enumerate() {
+        witness[i] = table[idx];
+        multiplicities[idx] += Scalar::ONE;
+      }
+      // Pad remaining witness entries with table[0] and count them
+      for i in query_indices.len()..table_size {
+        witness[i] = table[0];
+        multiplicities[0] += Scalar::ONE;
+      }
+
+      // Commit
+      let comm_L = <E as Engine>::CE::commit(&ck, &witness, &Scalar::ZERO);
+      let comm_ts = <E as Engine>::CE::commit(&ck, &multiplicities, &Scalar::ZERO);
+
+      // We need temporary inv commitments -- these will be overwritten by
+      // prove_with_lookup, but the payload needs them for fold_with_lookup.
+      // At this point we don't have r_logup yet, so we use placeholder zeros.
+      // prove_with_lookup will compute the actual inverse commitments.
+      // The payload's comm_inv_w and comm_inv_t are the U2 commitments.
+      // They get set inside prove_with_lookup too, but the payload struct
+      // carries them for fold_with_lookup's instance fold.
+      //
+      // Actually, prove_with_lookup computes and absorbs them internally,
+      // then builds the NIFS with them. The payload's comm_inv_w/t fields
+      // are used by fold_with_lookup for the INSTANCE-side fold. So we need
+      // to set them to what prove_with_lookup will compute.
+      //
+      // For the test, we'll set them to default and then prove_with_lookup
+      // will use the freshly computed commitments from LookupSumcheckInstance::new.
+      // Looking at fold_with_lookup: it uses payload.comm_inv_w and payload.comm_inv_t.
+      // But prove_with_lookup doesn't update the payload -- it uses
+      // comm_inv_w2 and comm_inv_t2 from LookupSumcheckInstance::new.
+      //
+      // Actually, re-reading prove_with_lookup: it calls
+      //   U1.fold_with_lookup(U2, &comm_E, &r_b, &T_out, payload, &T_lookup_out)
+      // where payload is the one passed in. So payload.comm_inv_w must
+      // be the commitment to the U2-side inverse witness. But we don't know r_logup
+      // yet when constructing the payload outside prove_with_lookup.
+      //
+      // This is a design tension. Let me fix it: the payload should carry the
+      // pre-r commitments (comm_L, comm_ts), and the post-r commitments
+      // (comm_inv_w, comm_inv_t) should come from prove_with_lookup itself.
+      // Let me update prove_with_lookup to construct the final payload
+      // with the computed inverse commitments and use THAT for fold_with_lookup.
+      //
+      // For now, use placeholder zero commitments. prove_with_lookup will
+      // override them via the NIFS struct.
+
+      let payload = LookupPayload {
+        comm_L,
+        comm_ts,
+        comm_inv_w: Commitment::<E>::default(),
+        comm_inv_t: Commitment::<E>::default(),
+        T2_lookup: Scalar::ZERO,
+      };
+
+      // Build eq polynomials from a random tau
+      let tau = Scalar::random(&mut *rng);
+      let pow = PowPolynomial::new(&tau, table_log2);
+      let (w_left, w_right) = lookup_shape.witness_split();
+      let combined_w = pow.split_evals(w_left, w_right);
+      let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+
+      let tau_t = Scalar::random(&mut *rng);
+      let pow_t = PowPolynomial::new(&tau_t, table_log2);
+      let (t_left, t_right) = lookup_shape.table_split();
+      let combined_t = pow_t.split_evals(t_left, t_right);
+      let (eq_t_left, eq_t_right) = combined_t.split_at(t_left);
+
+      (
+        payload,
+        witness,
+        table.clone(),
+        multiplicities,
+        eq_w_left.to_vec(),
+        eq_w_right.to_vec(),
+        eq_t_left.to_vec(),
+        eq_t_right.to_vec(),
+      )
+    };
+
+    // --- 3. Fold step 1: 4 in-table queries ---
+    let query_indices_1 = vec![0, 3, 7, 15]; // 4 distinct entries
+    let (
+      mut payload1,
+      witness1,
+      table1,
+      multiplicities1,
+      eq_w1_left,
+      eq_w1_right,
+      eq_t1_left,
+      eq_t1_right,
+    ) = build_payload_and_witness(&query_indices_1, &mut rng);
+
+    let res = NIFS::prove_with_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str,
+      &running_U,
+      &running_W,
+      &U1,
+      &W1,
+      &payload1,
+      &running_lw,
+      &witness1,
+      &table1,
+      &multiplicities1,
+      eq_w1_left,
+      eq_w1_right,
+      eq_t1_left,
+      eq_t1_right,
+    );
+    assert!(res.is_ok(), "prove_with_lookup step 1 failed: {:?}", res.err());
+    let (nifs1, (folded_U1, folded_W1), folded_lw1) = res.unwrap();
+
+    // Update payload with the computed inverse commitments for verify
+    payload1.comm_inv_w = nifs1.comm_inv_w.unwrap();
+    payload1.comm_inv_t = nifs1.comm_inv_t.unwrap();
+
+    // Verify step 1
+    let res = nifs1.verify_with_lookup(&ro_consts, &pp_digest, &running_U, &U1, &payload1);
+    assert!(res.is_ok(), "verify_with_lookup step 1 failed: {:?}", res.err());
+    let verified_U1 = res.unwrap();
+
+    // Assert prove/verify agreement
+    assert_eq!(
+      folded_U1, verified_U1,
+      "prove and verify must produce the same folded instance (step 1)"
+    );
+
+    // Assert T_lookup is populated
+    assert!(
+      folded_U1.T_lookup.is_some(),
+      "T_lookup must be populated after fold step 1"
+    );
+    println!(
+      "Step 1: T_lookup = {:?}",
+      folded_U1.T_lookup.unwrap()
+    );
+
+    // R1CS-side satisfiability check
+    let res = str.is_sat(&ck, &folded_U1, &folded_W1);
+    assert!(res.is_ok(), "folded instance must be satisfying after step 1: {:?}", res);
+
+    // Update running state
+    running_U = folded_U1;
+    running_W = folded_W1;
+    running_lw = folded_lw1;
+
+    // --- 4. Fold step 2: 4 queries with a duplicate for multiplicity > 1 ---
+    let query_indices_2 = vec![1, 5, 5, 10]; // index 5 appears twice (multiplicity 2)
+    let (
+      mut payload2,
+      witness2,
+      table2,
+      multiplicities2,
+      eq_w2_left,
+      eq_w2_right,
+      eq_t2_left,
+      eq_t2_right,
+    ) = build_payload_and_witness(&query_indices_2, &mut rng);
+
+    let res = NIFS::prove_with_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str,
+      &running_U,
+      &running_W,
+      &U2,
+      &W2,
+      &payload2,
+      &running_lw,
+      &witness2,
+      &table2,
+      &multiplicities2,
+      eq_w2_left,
+      eq_w2_right,
+      eq_t2_left,
+      eq_t2_right,
+    );
+    assert!(res.is_ok(), "prove_with_lookup step 2 failed: {:?}", res.err());
+    let (nifs2, (folded_U2, folded_W2), _folded_lw2) = res.unwrap();
+
+    // Update payload with computed inverse commitments for verify
+    payload2.comm_inv_w = nifs2.comm_inv_w.unwrap();
+    payload2.comm_inv_t = nifs2.comm_inv_t.unwrap();
+
+    // Verify step 2
+    let res = nifs2.verify_with_lookup(&ro_consts, &pp_digest, &running_U, &U2, &payload2);
+    assert!(res.is_ok(), "verify_with_lookup step 2 failed: {:?}", res.err());
+    let verified_U2 = res.unwrap();
+
+    // Assert prove/verify agreement
+    assert_eq!(
+      folded_U2, verified_U2,
+      "prove and verify must produce the same folded instance (step 2)"
+    );
+
+    // Assert T_lookup is populated
+    assert!(
+      folded_U2.T_lookup.is_some(),
+      "T_lookup must be populated after fold step 2"
+    );
+    println!(
+      "Step 2: T_lookup = {:?}",
+      folded_U2.T_lookup.unwrap()
+    );
+
+    // R1CS-side satisfiability check
+    let res = str.is_sat(&ck, &folded_U2, &folded_W2);
+    assert!(res.is_ok(), "folded instance must be satisfying after step 2: {:?}", res);
+
+    println!("execute_sequence_with_lookup: both fold steps passed prove/verify/sat checks");
   }
 }
 

@@ -214,6 +214,125 @@ pub struct LookupPayload<E: Engine> {
   pub T2_lookup: E::Scalar,
 }
 
+/// Running lookup witness vectors accumulated across fold steps.
+///
+/// Carries the witness-side data that `NIFS::prove_with_lookup` needs for the
+/// U1 (running) instance in the dual-instance `LookupSumcheckInstance`. At
+/// outer base (first fold), all vectors are zeros. At subsequent steps, they
+/// carry the linear-combination-folded values from prior fold steps.
+///
+/// These vectors are NOT recomputed from the running `FoldedWitness::W`; they
+/// are stored alongside it and folded independently using the same `r_b` weight.
+///
+/// Option (b) from the task spec: passed separately through the prove API,
+/// not embedded in `FoldedWitness`, to keep the non-lookup path untouched.
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupRunningWitness<E: Engine> {
+  /// Running lookup-witness vector (pooled query values).
+  pub witness: Vec<E::Scalar>,
+  /// Running inverse-witness vector `1/(w_i + r)`.
+  pub inv_w: Vec<E::Scalar>,
+  /// Running table vector.
+  pub table: Vec<E::Scalar>,
+  /// Running multiplicity vector.
+  pub multiplicities: Vec<E::Scalar>,
+  /// Running inverse-table vector `ts_j/(T_j + r)`.
+  pub inv_t: Vec<E::Scalar>,
+  /// Running eq polynomial (witness side) in split-tensor form, left half.
+  pub eq_w_left: Vec<E::Scalar>,
+  /// Running eq polynomial (witness side) in split-tensor form, right half.
+  pub eq_w_right: Vec<E::Scalar>,
+  /// Running eq polynomial (table side) in split-tensor form, left half.
+  pub eq_t_left: Vec<E::Scalar>,
+  /// Running eq polynomial (table side) in split-tensor form, right half.
+  pub eq_t_right: Vec<E::Scalar>,
+}
+
+#[cfg(feature = "lookup-fold")]
+impl<E: Engine> LookupRunningWitness<E> {
+  /// Creates a default (all-zeros) running witness for the first fold step.
+  pub fn default(shape: &LookupShape<E>) -> Self {
+    let (w_left, w_right) = shape.witness_split();
+    let (t_left, t_right) = shape.table_split();
+    let n_w = w_left * w_right;
+    let n_t = t_left * t_right;
+    Self {
+      witness: vec![E::Scalar::ZERO; n_w],
+      inv_w: vec![E::Scalar::ZERO; n_w],
+      table: vec![E::Scalar::ZERO; n_t],
+      multiplicities: vec![E::Scalar::ZERO; n_t],
+      inv_t: vec![E::Scalar::ZERO; n_t],
+      eq_w_left: vec![E::Scalar::ZERO; w_left],
+      eq_w_right: vec![E::Scalar::ZERO; w_right],
+      eq_t_left: vec![E::Scalar::ZERO; t_left],
+      eq_t_right: vec![E::Scalar::ZERO; t_right],
+    }
+  }
+
+  /// Fold with per-step fresh data using the same `r_b` weight.
+  ///
+  /// Mirrors `FoldedWitness::fold`: `new = (1-r_b)*self + r_b*fresh`.
+  pub fn fold(
+    &self,
+    fresh: &LookupFreshWitness<E>,
+    r_b: &E::Scalar,
+  ) -> Self {
+    let one_minus = E::Scalar::ONE - r_b;
+    let interp = |a: &[E::Scalar], b: &[E::Scalar]| -> Vec<E::Scalar> {
+      a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| one_minus * x + *r_b * y)
+        .collect()
+    };
+    Self {
+      witness: interp(&self.witness, &fresh.witness),
+      inv_w: interp(&self.inv_w, &fresh.inv_w),
+      table: interp(&self.table, &fresh.table),
+      multiplicities: interp(&self.multiplicities, &fresh.multiplicities),
+      inv_t: interp(&self.inv_t, &fresh.inv_t),
+      eq_w_left: interp(&self.eq_w_left, &fresh.eq_w_left),
+      eq_w_right: interp(&self.eq_w_right, &fresh.eq_w_right),
+      eq_t_left: interp(&self.eq_t_left, &fresh.eq_t_left),
+      eq_t_right: interp(&self.eq_t_right, &fresh.eq_t_right),
+    }
+  }
+}
+
+/// Per-step fresh lookup witness data for the U2 (fresh) side of a fold step.
+///
+/// This carries the raw polynomial vectors that `LookupSumcheckInstance::new`
+/// needs for the U2 side. The inverse witnesses (`inv_w`, `inv_t`) are
+/// computed by `LookupSumcheckInstance::new` from the raw `witness` and
+/// `table` + `multiplicities` vectors, but for folding purposes we need
+/// them post-computation too — so they're stored back here after construction.
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupFreshWitness<E: Engine> {
+  /// Per-step lookup-witness vector (pooled query values).
+  pub witness: Vec<E::Scalar>,
+  /// Per-step inverse-witness vector `1/(w_i + r)`.
+  /// Populated AFTER `LookupSumcheckInstance::new` computes it.
+  pub inv_w: Vec<E::Scalar>,
+  /// Per-step table vector.
+  pub table: Vec<E::Scalar>,
+  /// Per-step multiplicity vector.
+  pub multiplicities: Vec<E::Scalar>,
+  /// Per-step inverse-table vector `ts_j/(T_j + r)`.
+  /// Populated AFTER `LookupSumcheckInstance::new` computes it.
+  pub inv_t: Vec<E::Scalar>,
+  /// Per-step eq polynomial (witness side) in split-tensor form, left half.
+  pub eq_w_left: Vec<E::Scalar>,
+  /// Per-step eq polynomial (witness side) in split-tensor form, right half.
+  pub eq_w_right: Vec<E::Scalar>,
+  /// Per-step eq polynomial (table side) in split-tensor form, left half.
+  pub eq_t_left: Vec<E::Scalar>,
+  /// Per-step eq polynomial (table side) in split-tensor form, right half.
+  pub eq_t_right: Vec<E::Scalar>,
+}
+
 impl<E: Engine> Structure<E> {
   /// Create a new structure using the provided shape
   pub fn new(S: &R1CSShape<E>) -> Self {
