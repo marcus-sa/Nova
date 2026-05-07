@@ -92,6 +92,12 @@ required-features = ["io"]
 default = ["io"]
 flamegraph = ["pprof2/flamegraph", "pprof2/criterion"]
 experimental = []
+# C1-β lookup-fold extension: NeutronNova NIFS extended with a per-step
+# Lasso-style lookup-zero-fold (LogUp, paper precedent: eprint 2023/1216 v3
+# §3 / 2022/1530). Pinned by ADR-0023 + the soundness sketch addendum
+# `docs/research/cryptography/c1-beta-lookup-fold-soundness-sketch-addendum-spike-design-pins.md`.
+# Implies `experimental` because it lives entirely inside the `neutron` module.
+lookup-fold = ["experimental"]
 evm = []
 io = []
 # Enables insecure setup methods that generate random tau. Only for testing!

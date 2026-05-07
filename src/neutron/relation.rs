@@ -10,6 +10,48 @@ use ff::Field;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// A handle to a lookup table that has been registered with a commitment key.
+///
+/// Carried in [`Structure::lookups`] (via [`LookupShape`]) and absorbed into the
+/// pp-digest as part of the running `Structure<E>`. The commitment is computed
+/// once at table-registration time and pins the table's identity for every
+/// subsequent fold step on the IVC chain.
+///
+/// Pinned by `c1-beta-lookup-fold-soundness-sketch-addendum-spike-design-pins.md`
+/// §A.1.1 property 4 ("table commitment provenance — public input, not per-step
+/// witness").
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupTableHandle<E: Engine> {
+  /// Stable identifier for the table; ordering on `LookupShape::tables` is
+  /// canonicalised by sorting on this id (addendum §A.1.1 property 4 line "sorted by table-id").
+  pub table_id: u64,
+  /// Number of entries in the table.
+  pub size: usize,
+  /// Commitment to the table contents under the table-derivation generator.
+  pub commitment: Commitment<E>,
+}
+
+/// Lookup-side shape for a [`Structure`] that uses the lookup-fold extension.
+///
+/// Pinned by addendum §A.2.1: `comm_L`, `comm_ts`, `comm_inv_w`, `comm_inv_t`
+/// per-step witness shapes are described here, and the table identities are
+/// fixed via `tables` (which is what binds the LogUp identity's table side).
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupShape<E: Engine> {
+  /// Tables registered for this `Structure`. Order canonicalised by ascending
+  /// `table_id` for deterministic `pp_digest` derivation (addendum §A.1.1
+  /// property 4).
+  pub tables: Vec<LookupTableHandle<E>>,
+  /// Number of address columns in the per-step lookup witness layout.
+  pub num_addr_columns: usize,
+  /// Number of witness columns in the per-step lookup witness layout.
+  pub num_witness_columns: usize,
+}
+
 /// A type that holds structure information for a zero-fold relation
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -21,6 +63,19 @@ pub struct Structure<E: Engine> {
   pub(crate) ell: usize,
   pub(crate) left: usize,
   pub(crate) right: usize,
+
+  /// Lookup-side shape, present iff the `Structure` participates in the
+  /// lookup-fold extension. `None` for the legacy zero-fold path so non-lookup
+  /// `StepCircuit`s pay zero serde / per-step cost. Pinned by addendum §A.2.1
+  /// (the `Option<>` wrapper is the backward-compatibility pin).
+  ///
+  /// Because `Structure<E>` participates in `SimpleDigestible` (see
+  /// `vendor/nova/src/neutron/mod.rs:54`), the `Serialize`/`Deserialize` derive
+  /// on this field makes the table commitments and sizes part of the
+  /// `pp_digest` automatically. This satisfies addendum §A.1.1 property 4
+  /// without a separate `Structure::digest()` method.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) lookups: Option<LookupShape<E>>,
 }
 
 /// A type that holds witness information for a zero-fold relation
@@ -45,6 +100,54 @@ pub struct FoldedInstance<E: Engine> {
   pub(crate) T: E::Scalar,
   pub(crate) u: E::Scalar,
   pub(crate) X: Vec<E::Scalar>,
+
+  /// Folded per-step lookup-witness commitment. `None` until a non-default
+  /// running instance has been produced via a fold step that carried
+  /// lookup data. Pinned by addendum §A.2.1.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_L: Option<Commitment<E>>,
+  /// Folded multiplicity-vector commitment.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_ts: Option<Commitment<E>>,
+  /// Folded inverse-witness commitment for `1/(w_i + r)`.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_w: Option<Commitment<E>>,
+  /// Folded inverse-table commitment for `1/(T_j + r)`.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_t: Option<Commitment<E>>,
+  /// Running target for the lookup-zero side. Mirrors the existing `T` for
+  /// the R1CS-zero side (§A.2.1).
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) T_lookup: Option<E::Scalar>,
+}
+
+/// Per-step lookup-side payload delivered to [`NIFS::prove`] alongside the
+/// incoming [`R1CSInstance`].
+///
+/// Carries the per-step lookup commitments and the per-step `T2_lookup` evaluation
+/// target. `NIFS::prove` absorbs the `comm_L` / `comm_ts` fields at addendum
+/// §A.1.1 step (2), squeezes `r`, and absorbs `comm_inv_w` / `comm_inv_t` at
+/// §A.1.1 step (6).
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupPayload<E: Engine> {
+  /// Per-step lookup-witness commitment (the pooled query vector under the
+  /// `LookupConstraintSystem` collector — addendum §A.3.2).
+  pub comm_L: Commitment<E>,
+  /// Per-step multiplicity-vector commitment.
+  pub comm_ts: Commitment<E>,
+  /// Per-step inverse-witness commitment for `1/(w_i + r)`. Computed AFTER
+  /// `r` is squeezed in §A.1.1 step (5); supplied at this point as a fully
+  /// committed value so `NIFS::prove` can absorb it at step (6).
+  pub comm_inv_w: Commitment<E>,
+  /// Per-step inverse-table commitment for `1/(T_j + r)`.
+  pub comm_inv_t: Commitment<E>,
+  /// Per-step lookup-zero evaluation target. For a fresh per-step `R1CSInstance`
+  /// satisfying the lookup relation, this is the per-step LogUp residual
+  /// evaluated at the bound randomness (the analogue of `T2 = 0` for the
+  /// R1CS-zero side at line 233 of `vendor/nova/src/neutron/nifs.rs`).
+  pub T2_lookup: E::Scalar,
 }
 
 impl<E: Engine> Structure<E> {
@@ -64,7 +167,23 @@ impl<E: Engine> Structure<E> {
       ell,
       left: 1 << ell1,
       right: 1 << ell2,
+      #[cfg(feature = "lookup-fold")]
+      lookups: None,
     }
+  }
+
+  /// Create a new structure with a lookup-side shape attached.
+  ///
+  /// Constructs a `Structure<E>` whose `lookups` field is `Some(shape)`. The
+  /// `tables` vec is canonicalised by sorting on `table_id` in place so the
+  /// `pp_digest` derivation is deterministic regardless of caller-side
+  /// insertion order (addendum §A.1.1 property 4).
+  #[cfg(feature = "lookup-fold")]
+  pub fn new_with_lookups(S: &R1CSShape<E>, mut shape: LookupShape<E>) -> Self {
+    let mut s = Self::new(S);
+    shape.tables.sort_by_key(|h| h.table_id);
+    s.lookups = Some(shape);
+    s
   }
 
   /// Check if the witness is satisfying
@@ -165,6 +284,19 @@ impl<E: Engine> FoldedInstance<E> {
       T: E::Scalar::ZERO,
       u: E::Scalar::ZERO,
       X: vec![E::Scalar::ZERO; S.S.num_io],
+      // Pinned by addendum §A.2.1: defaults to `None` so non-lookup `StepCircuit`s
+      // pay zero per-step cost. The lookup-side fields become `Some` only after
+      // a fold step that carried a lookup payload.
+      #[cfg(feature = "lookup-fold")]
+      comm_L: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_w: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_t: None,
+      #[cfg(feature = "lookup-fold")]
+      T_lookup: None,
     }
   }
 
@@ -193,6 +325,78 @@ impl<E: Engine> FoldedInstance<E> {
       T: *T_out,
       u,
       X,
+      #[cfg(feature = "lookup-fold")]
+      comm_L: self.comm_L,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts: self.comm_ts,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_w: self.comm_inv_w,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_t: self.comm_inv_t,
+      #[cfg(feature = "lookup-fold")]
+      T_lookup: self.T_lookup,
+    })
+  }
+
+  /// Fold the instance together with a per-step lookup payload.
+  ///
+  /// This is the lookup-fold extension's analogue of [`Self::fold`]. The
+  /// R1CS-zero side is folded identically to [`Self::fold`]; the lookup-zero
+  /// side folds the four per-step lookup commitments into the running ones
+  /// using the same `r_b` weight (Path β common-challenge composition,
+  /// addendum §A.2.4).
+  ///
+  /// On the FIRST fold of a default running instance, `self.comm_L` is `None`
+  /// and the lookup-side weighted sum degenerates to `0 * (1 - r_b) +
+  /// payload * r_b = payload * r_b` (treating absent commitments as the
+  /// identity / zero element). This matches the invariant that a default
+  /// running instance carries no committed lookup data.
+  #[cfg(feature = "lookup-fold")]
+  pub fn fold_with_lookup(
+    &self,
+    U2: &R1CSInstance<E>,
+    comm_E: &Commitment<E>,
+    r_b: &E::Scalar,
+    T_out: &E::Scalar,
+    payload: &LookupPayload<E>,
+    T_lookup_out: &E::Scalar,
+  ) -> Result<Self, NovaError> {
+    // R1CS-zero side: identical to `Self::fold`.
+    let comm_W = self.comm_W * (E::Scalar::ONE - r_b) + U2.comm_W * *r_b;
+    let comm_E = self.comm_E * (E::Scalar::ONE - r_b) + *comm_E * *r_b;
+    let X = self
+      .X
+      .par_iter()
+      .zip(U2.X.par_iter())
+      .map(|(x1, x2)| (E::Scalar::ONE - r_b) * x1 + *r_b * x2)
+      .collect::<Vec<_>>();
+    let u = (E::Scalar::ONE - r_b) * self.u + r_b;
+
+    // Lookup-zero side: fold each commitment independently under the SAME r_b
+    // (the common Fiat-Shamir challenge — Path β, addendum §A.2.4). Default
+    // (`None`) running commitments contribute zero to the (1 - r_b) weight.
+    let one_minus_rb = E::Scalar::ONE - r_b;
+    let zero = Commitment::<E>::default();
+    let fold_one = |running: Option<Commitment<E>>, fresh: Commitment<E>| -> Commitment<E> {
+      let r = running.unwrap_or(zero);
+      r * one_minus_rb + fresh * *r_b
+    };
+    let comm_L_new = fold_one(self.comm_L, payload.comm_L);
+    let comm_ts_new = fold_one(self.comm_ts, payload.comm_ts);
+    let comm_inv_w_new = fold_one(self.comm_inv_w, payload.comm_inv_w);
+    let comm_inv_t_new = fold_one(self.comm_inv_t, payload.comm_inv_t);
+
+    Ok(Self {
+      comm_W,
+      comm_E,
+      T: *T_out,
+      u,
+      X,
+      comm_L: Some(comm_L_new),
+      comm_ts: Some(comm_ts_new),
+      comm_inv_w: Some(comm_inv_w_new),
+      comm_inv_t: Some(comm_inv_t_new),
+      T_lookup: Some(*T_lookup_out),
     })
   }
 }
