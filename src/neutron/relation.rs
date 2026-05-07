@@ -33,6 +33,33 @@ pub struct LookupTableHandle<E: Engine> {
   pub commitment: Commitment<E>,
 }
 
+/// A multi-column lookup table.
+///
+/// Stage I-pri (Lasso §6.2 address-value combine): a multi-column table
+/// has an implicit address column `i ∈ [0, size)` plus `c >= 0` value
+/// columns. The single-column case (`columns.is_empty()`) collapses to
+/// the prior `LookupTableHandle` shape — the table is the identity
+/// `{0, 1, ..., size-1}` and the LogUp combine reduces to the identity.
+///
+/// `value_commitments[i]` is the commitment to `columns[i]` (parallel
+/// vectors). The address column has no separate commitment because the
+/// address `i` is implicit (the LogUp combined-witness preprocessing
+/// emits `combined[k] = address[k] + α·v₁[k] + ... + α^c·v_c[k]` and
+/// the verifier reconstructs `comm_combined` by linear homomorphism).
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct MultiColumnLookupTable<E: Engine> {
+  /// Stable identifier for the table.
+  pub table_id: u64,
+  /// Number of entries (rows) in the table.
+  pub size: usize,
+  /// Value columns. `columns[c][i]` is the c-th column's value at row i.
+  pub columns: Vec<Vec<E::Scalar>>,
+  /// Per-column commitments. `value_commitments[c]` commits to `columns[c]`.
+  pub value_commitments: Vec<Commitment<E>>,
+}
+
 /// Lookup-side shape for a [`Structure`] that uses the lookup-fold extension.
 ///
 /// Pinned by addendum §A.2.1: `comm_L`, `comm_ts`, `comm_inv_w`, `comm_inv_t`
@@ -216,8 +243,10 @@ pub struct LookupPayloadPublic<E: Engine> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct LookupPayload<E: Engine> {
-  /// Per-step lookup-witness commitment (the pooled query vector under the
-  /// `LookupConstraintSystem` collector — addendum §A.3.2).
+  /// Per-step lookup-witness commitment for the **address column** (the
+  /// pooled query vector under the `LookupConstraintSystem` collector —
+  /// addendum §A.3.2). For single-column lookups (`comm_values.is_empty()`)
+  /// this is the only witness commitment and `address ≡ value`.
   pub comm_L: Commitment<E>,
   /// Per-step multiplicity-vector commitment.
   pub comm_ts: Commitment<E>,
@@ -232,6 +261,21 @@ pub struct LookupPayload<E: Engine> {
   /// evaluated at the bound randomness (the analogue of `T2 = 0` for the
   /// R1CS-zero side at line 233 of `vendor/nova/src/neutron/nifs.rs`).
   pub T2_lookup: E::Scalar,
+  /// Per-step value-column commitments (Stage I-pri, Lasso §6.2 address-
+  /// value combine). Empty for the single-column path (Stage H), in which
+  /// case the multi-column transcript extension (per-column absorption +
+  /// α squeeze) is skipped and the FS transcript is byte-identical to the
+  /// Stage H pin. Pinned by Stage I-pri §I.4.
+  ///
+  /// For multi-column queries this carries the commitments to the per-step
+  /// value-column vectors `v₁[k], ..., v_c[k]`. The verifier reconstructs
+  /// the combined-witness commitment by linear homomorphism:
+  ///
+  /// ```text
+  /// comm_W_combined = comm_L + α·comm_values[0] + α²·comm_values[1] + ...
+  /// ```
+  #[serde(default = "Vec::new")]
+  pub comm_values: Vec<Commitment<E>>,
 }
 
 /// Running lookup witness vectors accumulated across fold steps.

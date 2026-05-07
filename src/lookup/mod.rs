@@ -24,8 +24,8 @@ pub mod circuit;
 mod collector;
 pub mod reference;
 
-pub use crate::neutron::relation::LookupTableHandle;
-pub use circuit::range_check_via_lookup;
+pub use crate::neutron::relation::{LookupTableHandle, MultiColumnLookupTable};
+pub use circuit::{lookup_via_address, range_check_via_lookup};
 pub use collector::{CSWithLookups, LookupConstraintSystem, LookupQuery, QueryCollector};
 pub use reference::range_check_native;
 
@@ -57,6 +57,58 @@ pub fn register_table<E: Engine>(
     table_id,
     size: values.len(),
     commitment,
+  }
+}
+
+/// Register a multi-column lookup table (Stage I-pri).
+///
+/// Each column is committed independently (zero blinding — table data is
+/// public). The address column is implicit (`i ∈ [0, size)`), so it has
+/// no separate commitment. All columns must have the same length.
+///
+/// The verifier reconstructs the combined-table commitment by linear
+/// homomorphism over a fresh FS challenge α once per fold step:
+///
+/// ```text
+/// comm_T_combined  =  comm_address  +  α·comm_columns[0]  +  α²·comm_columns[1] + ...
+/// ```
+///
+/// where `comm_address` is the publicly-known commitment to
+/// `(0, 1, ..., size-1)`. This is computed by the prover/verifier at
+/// fold time, not stored on the handle.
+pub fn register_multi_column_table<E: Engine>(
+  ck: &CommitmentKey<E>,
+  table_id: u64,
+  columns: &[Vec<E::Scalar>],
+) -> MultiColumnLookupTable<E> {
+  if columns.is_empty() {
+    return MultiColumnLookupTable {
+      table_id,
+      size: 0,
+      columns: Vec::new(),
+      value_commitments: Vec::new(),
+    };
+  }
+  let size = columns[0].len();
+  for (i, c) in columns.iter().enumerate() {
+    assert_eq!(
+      c.len(),
+      size,
+      "register_multi_column_table: column {} has length {} but column 0 has length {}",
+      i,
+      c.len(),
+      size,
+    );
+  }
+  let value_commitments: Vec<_> = columns
+    .iter()
+    .map(|col| CE::<E>::commit(ck, col, &E::Scalar::ZERO))
+    .collect();
+  MultiColumnLookupTable {
+    table_id,
+    size,
+    columns: columns.to_vec(),
+    value_commitments,
   }
 }
 
@@ -164,8 +216,12 @@ mod tests {
     assert_eq!(queries.len(), 2);
     assert_eq!(queries[0].table_id, 7);
     assert_eq!(queries[1].table_id, 7);
-    assert_eq!(queries[0].value.get_value(), Some(Scalar::from(11)));
-    assert_eq!(queries[1].value.get_value(), Some(Scalar::from(3)));
+    // Stage I-pri: range_check_via_lookup is the empty-values special case;
+    // the address carries the queried value.
+    assert!(queries[0].values.is_empty());
+    assert!(queries[1].values.is_empty());
+    assert_eq!(queries[0].address.get_value(), Some(Scalar::from(11)));
+    assert_eq!(queries[1].address.get_value(), Some(Scalar::from(3)));
     assert!(inner.is_satisfied());
   }
 

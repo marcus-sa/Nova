@@ -311,6 +311,7 @@ mod tests {
       comm_inv_w: Commitment::<E>::default(),
       comm_inv_t: Commitment::<E>::default(),
       T2_lookup: Scalar::ZERO,
+      comm_values: Vec::new(),
     };
     let tau_w = Scalar::random(&mut rng);
     let pow_w = PowPolynomial::new(&tau_w, table_log2);
@@ -362,6 +363,7 @@ mod tests {
       comm_inv_w,
       comm_inv_t,
       T2_lookup: Scalar::ZERO,
+      comm_values: Vec::new(),
     };
     let _verified_U = nifs
       .verify_with_lookup(&ro_consts, &pp_digest, &running_U, &U2, &payload_for_verify)
@@ -484,6 +486,268 @@ mod tests {
     assert_eq!(
       circuit_t_lookup_out, native_t_lookup_out,
       "FS-rebinding: in-circuit T_lookup_out must equal native verify_step output"
+    );
+  }
+
+  /// Stage I-pri: in-circuit `verify_with_multi_column_lookup` mirrors the
+  /// native multi-column transcript byte-for-byte, including the α
+  /// squeeze between `rho` and `r_logup`. The resulting in-circuit
+  /// `T_lookup_out` must equal the native `verify_step` output computed
+  /// from the same transcript replay.
+  #[test]
+  fn stage_i_pri_in_circuit_verify_multi_column_matches_native() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x1A55_E5A8);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // Build a small R1CS shape.
+    let num_cons: usize = 32;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut shape_cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut shape_cs);
+    let shape = shape_cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // 16-row table with 2 value columns.
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let t1: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 11 + 5) as u64))
+      .collect();
+    let t2: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 17 + 9) as u64))
+      .collect();
+
+    let identity: Vec<Scalar> =
+      (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: table_size,
+        commitment: identity_comm,
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 3,
+      witness_ell_cached: table_log2,
+    };
+    let str = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str.S.clone();
+
+    // Satisfying U2/W2.
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut sat_cs = SatisfyingAssignment::<E>::new();
+    let _ = circuit.synthesize(&mut sat_cs);
+    let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2 = W2.pad(&shape);
+
+    let running_W = FoldedWitness::default(&str);
+    let running_U = FoldedInstance::default(&str);
+    let running_lw = LookupRunningWitness::default(&lookup_shape);
+
+    // Build a satisfying multi-column witness pool.
+    let query_indices = [0usize, 3, 7, 15];
+    let mut witness_addr = vec![Scalar::ZERO; table_size];
+    let mut witness_v1 = vec![Scalar::ZERO; table_size];
+    let mut witness_v2 = vec![Scalar::ZERO; table_size];
+    let mut multiplicities = vec![Scalar::ZERO; table_size];
+    for (i, &idx) in query_indices.iter().enumerate() {
+      witness_addr[i] = Scalar::from(idx as u64);
+      witness_v1[i] = t1[idx];
+      witness_v2[i] = t2[idx];
+      multiplicities[idx] += Scalar::ONE;
+    }
+    for i in query_indices.len()..table_size {
+      witness_addr[i] = Scalar::from(0u64);
+      witness_v1[i] = t1[0];
+      witness_v2[i] = t2[0];
+      multiplicities[0] += Scalar::ONE;
+    }
+
+    let comm_addr = <E as Engine>::CE::commit(&ck, &witness_addr, &Scalar::ZERO);
+    let comm_v1 = <E as Engine>::CE::commit(&ck, &witness_v1, &Scalar::ZERO);
+    let comm_v2 = <E as Engine>::CE::commit(&ck, &witness_v2, &Scalar::ZERO);
+    let comm_ts = <E as Engine>::CE::commit(&ck, &multiplicities, &Scalar::ZERO);
+
+    let payload = LookupPayload::<E> {
+      comm_L: comm_addr,
+      comm_ts,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v1, comm_v2],
+    };
+
+    let tau_w = Scalar::random(&mut rng);
+    let pow_w = PowPolynomial::new(&tau_w, table_log2);
+    let (w_left, w_right) = lookup_shape.witness_split();
+    let combined_w = pow_w.split_evals(w_left, w_right);
+    let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+    let tau_t = Scalar::random(&mut rng);
+    let pow_t = PowPolynomial::new(&tau_t, table_log2);
+    let (t_left, t_right) = lookup_shape.table_split();
+    let combined_t_eq = pow_t.split_evals(t_left, t_right);
+    let (eq_t_left, eq_t_right) = combined_t_eq.split_at(t_left);
+
+    // Native prove with multi-column lookup.
+    let (nifs, _, _) = NIFS::<E>::prove_with_multi_column_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str,
+      &running_U,
+      &running_W,
+      &U2,
+      &W2,
+      &payload,
+      &running_lw,
+      &witness_addr,
+      &[witness_v1.clone(), witness_v2.clone()],
+      table_size,
+      &[t1.clone(), t2.clone()],
+      &multiplicities,
+      eq_w_left.to_vec(),
+      eq_w_right.to_vec(),
+      eq_t_left.to_vec(),
+      eq_t_right.to_vec(),
+    )
+    .expect("prove_with_multi_column_lookup must succeed");
+
+    let comm_inv_w = nifs.comm_inv_w.unwrap();
+    let comm_inv_t = nifs.comm_inv_t.unwrap();
+
+    // Native verify_with_multi_column_lookup.
+    let payload_for_verify = LookupPayload::<E> {
+      comm_L: payload.comm_L,
+      comm_ts: payload.comm_ts,
+      comm_inv_w,
+      comm_inv_t,
+      T2_lookup: Scalar::ZERO,
+      comm_values: payload.comm_values.clone(),
+    };
+    let _verified = nifs
+      .verify_with_multi_column_lookup(&ro_consts, &pp_digest, &running_U, &U2, &payload_for_verify)
+      .expect("native verify must succeed");
+
+    // Replay the FS transcript using the in-circuit's single-IO U2
+    // absorption pattern (same caveat as the Stage G test).
+    use crate::{
+      constants::NUM_CHALLENGE_BITS,
+      neutron::lookup_sumcheck::lookup_running_claims_from,
+      spartan::polys::univariate::UniPoly,
+      traits::{AbsorbInRO2Trait, ROTrait},
+    };
+
+    let mut ro = <E as Engine>::RO2::new(ro_consts.clone());
+    ro.absorb(pp_digest);
+    U2.comm_W.absorb_in_ro2(&mut ro);
+    ro.absorb(U2.X[0]);
+    payload.comm_L.absorb_in_ro2(&mut ro);
+    for cv in &payload.comm_values {
+      cv.absorb_in_ro2(&mut ro);
+    }
+    payload.comm_ts.absorb_in_ro2(&mut ro);
+    let _tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    nifs.comm_E.absorb_in_ro2(&mut ro);
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    let _alpha = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    let _r_logup = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    comm_inv_w.absorb_in_ro2(&mut ro);
+    comm_inv_t.absorb_in_ro2(&mut ro);
+    <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&nifs.poly, &mut ro);
+    let poly_lookup_ref = nifs.poly_lookup.as_ref().unwrap();
+    <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup_ref, &mut ro);
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    let t_lookup_running = lookup_running_claims_from::<E>(&running_U);
+    let native_t_lookup_out = LookupSumcheckInstance::<E>::verify_step(
+      &rho,
+      &r_b,
+      poly_lookup_ref,
+      &t_lookup_running,
+    )
+    .expect("native verify_step must succeed");
+
+    // In-circuit verify_with_multi_column_lookup.
+    let mut cs = TestConstraintSystem::<Scalar>::new();
+    let pp_digest_alloc =
+      AllocatedNum::alloc(cs.namespace(|| "pp_digest"), || Ok(pp_digest)).unwrap();
+    let U1_alloc =
+      AllocatedFoldedInstance::<E>::alloc(cs.namespace(|| "U1"), Some(&running_U)).unwrap();
+    let U2_alloc =
+      AllocatedNonnativeR1CSInstance::<E>::alloc(cs.namespace(|| "U2"), Some(&U2)).unwrap();
+    let allocated_nifs =
+      AllocatedNIFS::<E>::alloc(cs.namespace(|| "allocate nifs"), Some(&nifs), 5).unwrap();
+    let allocated_lookup = AllocatedLookupNIFS::<E>::alloc(
+      cs.namespace(|| "allocate lookup nifs"),
+      Some(&nifs),
+    )
+    .unwrap();
+
+    let comm_L_pub_alloc = AllocatedNonnativePoint::<E>::alloc(
+      cs.namespace(|| "comm_L pub"),
+      Some(payload.comm_L.to_coordinates()),
+    )
+    .unwrap();
+    let comm_ts_pub_alloc = AllocatedNonnativePoint::<E>::alloc(
+      cs.namespace(|| "comm_ts pub"),
+      Some(payload.comm_ts.to_coordinates()),
+    )
+    .unwrap();
+    let comm_values_pub_alloc: Vec<_> = payload
+      .comm_values
+      .iter()
+      .enumerate()
+      .map(|(i, cv)| {
+        AllocatedNonnativePoint::<E>::alloc(
+          cs.namespace(|| format!("comm_values[{}] pub", i)),
+          Some(cv.to_coordinates()),
+        )
+        .unwrap()
+      })
+      .collect();
+
+    let t_lookup_running_alloc = alloc_zero(cs.namespace(|| "t_lookup_running"));
+    let comm_W_fold = AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_W_fold")).unwrap();
+    let comm_E_fold = AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold")).unwrap();
+
+    let out = allocated_nifs
+      .verify_with_multi_column_lookup(
+        cs.namespace(|| "in-circuit verify_with_multi_column_lookup"),
+        &pp_digest_alloc,
+        &U1_alloc,
+        &U2_alloc,
+        &allocated_lookup,
+        &comm_L_pub_alloc,
+        &comm_values_pub_alloc,
+        &comm_ts_pub_alloc,
+        &t_lookup_running_alloc,
+        &comm_W_fold,
+        &comm_E_fold,
+        ro_consts_circuit,
+      )
+      .expect("in-circuit verify_with_multi_column_lookup must synthesise cleanly");
+
+    assert!(
+      cs.is_satisfied(),
+      "in-circuit multi-column verify must be satisfied; first unsatisfied: {:?}",
+      cs.which_is_unsatisfied()
+    );
+
+    let circuit_t_lookup_out = out
+      .T_lookup_out
+      .get_value()
+      .expect("T_lookup_out witness must be assigned");
+    assert_eq!(
+      circuit_t_lookup_out, native_t_lookup_out,
+      "Stage I-pri FS-rebinding: in-circuit multi-column T_lookup_out \
+       must equal native verify_step output"
     );
   }
 }

@@ -370,6 +370,195 @@ mod lookup_verify {
         T_lookup_out,
       })
     }
+
+    /// In-circuit **multi-column** lookup-aware verifier (Stage I-pri).
+    ///
+    /// Mirrors the native [`crate::neutron::nifs::NIFS::verify_with_multi_column_lookup`]
+    /// transcript:
+    ///
+    /// ```text
+    ///   ro.absorb(pp_digest)
+    ///   U2.absorb_in_ro
+    ///   comm_L_pub.absorb_in_ro                    [address column]
+    ///   for cv in comm_values_pub: cv.absorb_in_ro [Stage I-pri]
+    ///   comm_ts_pub.absorb_in_ro
+    ///   ro.squeeze() -> tau
+    ///   comm_E.absorb_in_ro
+    ///   ro.squeeze() -> rho
+    ///   if !comm_values_pub.is_empty():
+    ///     ro.squeeze() -> α                        [Stage I-pri]
+    ///   ro.squeeze() -> r_logup
+    ///   comm_inv_w / comm_inv_t / poly / poly_lookup absorptions
+    ///   ro.squeeze() -> r_b
+    /// ```
+    ///
+    /// When `comm_values_pub.is_empty()` the FS transcript is byte-
+    /// identical to [`Self::verify_with_lookup`] (Stage H byte-equivalence
+    /// pin).
+    ///
+    /// The combined-witness commitment is NEVER reconstructed in-circuit
+    /// — soundness flows through α's binding to all column commitments
+    /// at squeeze time and the (C)-binding on `poly_lookup` against the
+    /// running target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_with_multi_column_lookup<CS: ConstraintSystem<E::Scalar>>(
+      &self,
+      mut cs: CS,
+      pp_digest: &AllocatedNum<E::Scalar>,
+      U1: &AllocatedFoldedInstance<E>,
+      U2: &AllocatedNonnativeR1CSInstance<E>,
+      lookup: &AllocatedLookupNIFS<E>,
+      comm_L_pub: &AllocatedNonnativePoint<E>,
+      comm_values_pub: &[AllocatedNonnativePoint<E>],
+      comm_ts_pub: &AllocatedNonnativePoint<E>,
+      t_lookup_running: &AllocatedNum<E::Scalar>,
+      comm_W_fold: &AllocatedNonnativePoint<E>,
+      comm_E_fold: &AllocatedNonnativePoint<E>,
+      ro_consts: RO2ConstantsCircuit<E>,
+    ) -> Result<LookupVerifyOutput<E>, SynthesisError> {
+      let mut ro = E::RO2Circuit::new(ro_consts);
+      ro.absorb(pp_digest);
+
+      U2.absorb_in_ro(cs.namespace(|| "absorb U2"), &mut ro)?;
+
+      // --- Step (2): absorb address, value columns, ts ---
+      comm_L_pub.absorb_in_ro(cs.namespace(|| "absorb comm_L"), &mut ro)?;
+      for (i, cv) in comm_values_pub.iter().enumerate() {
+        cv.absorb_in_ro(cs.namespace(|| format!("absorb comm_values[{}]", i)), &mut ro)?;
+      }
+      comm_ts_pub.absorb_in_ro(cs.namespace(|| "absorb comm_ts"), &mut ro)?;
+
+      let _tau = ro.squeeze(cs.namespace(|| "tau"), NUM_CHALLENGE_BITS, false)?;
+      self
+        .comm_E
+        .absorb_in_ro(cs.namespace(|| "absorb comm_E"), &mut ro)?;
+
+      let rho_bits = ro.squeeze(cs.namespace(|| "rho_bits"), NUM_CHALLENGE_BITS, false)?;
+      let rho = le_bits_to_num(cs.namespace(|| "rho"), &rho_bits)?;
+
+      // Stage I-pri: squeeze α IFF value columns present.
+      if !comm_values_pub.is_empty() {
+        let _alpha_bits =
+          ro.squeeze(cs.namespace(|| "alpha_bits"), NUM_CHALLENGE_BITS, false)?;
+      }
+
+      let _r_logup_bits =
+        ro.squeeze(cs.namespace(|| "r_logup_bits"), NUM_CHALLENGE_BITS, false)?;
+
+      lookup.absorb_inv_comms_in_ro(cs.namespace(|| "absorb inv comms"), &mut ro)?;
+
+      // R1CS (C)-binding
+      let T = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS T"), || {
+        let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let U1_T = U1.T.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(U1_T * (E::Scalar::ONE - rho_v))
+      })?;
+      cs.enforce(
+        || "enforce R1CS T = (1-rho) * U1.T",
+        |lc| lc + U1.T.get_variable(),
+        |lc| lc + CS::one() - rho.get_variable(),
+        |lc| lc + T.get_variable(),
+      );
+
+      self
+        .poly
+        .check_poly_zero_poly_one_with(cs.namespace(|| "R1CS poly(0)+poly(1) = T"), &T)?;
+
+      lookup.poly_lookup.check_poly_zero_poly_one_with(
+        cs.namespace(|| "lookup poly(0)+poly(1) = t_lookup_running"),
+        t_lookup_running,
+      )?;
+
+      self.poly.absorb_in_ro(&mut ro);
+      lookup.absorb_poly_in_ro(&mut ro);
+
+      let r_b_bits = ro.squeeze(cs.namespace(|| "r_b_bits"), NUM_CHALLENGE_BITS, false)?;
+      let r_b = le_bits_to_num(cs.namespace(|| "r_b"), &r_b_bits)?;
+
+      // R1CS T_out
+      let eq_rho_r_b_one = AllocatedNum::alloc(
+        cs.namespace(|| "allocate R1CS eq_rho_r_b_one"),
+        || {
+          let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          let r_b_v = r_b.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          Ok((E::Scalar::ONE - rho_v) * (E::Scalar::ONE - r_b_v))
+        },
+      )?;
+      cs.enforce(
+        || "R1CS eq_rho_r_b_one = (1-rho)(1-r_b)",
+        |lc| lc + CS::one() - rho.get_variable(),
+        |lc| lc + CS::one() - r_b.get_variable(),
+        |lc| lc + eq_rho_r_b_one.get_variable(),
+      );
+
+      let eq_rho_r_b = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS eq_rho_r_b"), || {
+        let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let r_b_v = r_b.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok((E::Scalar::ONE - rho_v) * (E::Scalar::ONE - r_b_v) + rho_v * r_b_v)
+      })?;
+      cs.enforce(
+        || "R1CS eq_rho_r_b = (1-rho)(1-r_b) + rho*r_b",
+        |lc| lc + rho.get_variable(),
+        |lc| lc + r_b.get_variable(),
+        |lc| lc + eq_rho_r_b.get_variable() - eq_rho_r_b_one.get_variable(),
+      );
+
+      let r1cs_eval = self.poly.evaluate(cs.namespace(|| "R1CS eval(r_b)"), &r_b)?;
+      let T_out = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS T_out"), || {
+        let eval = r1cs_eval
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let eq_inv = eq_rho_r_b
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?
+          .invert()
+          .unwrap();
+        Ok(eval * eq_inv)
+      })?;
+      cs.enforce(
+        || "enforce R1CS T_out * eq_rho_r_b = eval(r_b)",
+        |lc| lc + T_out.get_variable(),
+        |lc| lc + eq_rho_r_b.get_variable(),
+        |lc| lc + r1cs_eval.get_variable(),
+      );
+
+      // Lookup T_lookup_out
+      let lookup_eval = lookup
+        .poly_lookup
+        .evaluate(cs.namespace(|| "lookup eval(r_b)"), &r_b)?;
+      let T_lookup_out =
+        AllocatedNum::alloc(cs.namespace(|| "allocate T_lookup_out"), || {
+          let eval = lookup_eval
+            .get_value()
+            .ok_or(SynthesisError::AssignmentMissing)?;
+          let eq_inv = eq_rho_r_b
+            .get_value()
+            .ok_or(SynthesisError::AssignmentMissing)?
+            .invert()
+            .unwrap();
+          Ok(eval * eq_inv)
+        })?;
+      cs.enforce(
+        || "enforce T_lookup_out * eq_rho_r_b = lookup eval(r_b)",
+        |lc| lc + T_lookup_out.get_variable(),
+        |lc| lc + eq_rho_r_b.get_variable(),
+        |lc| lc + lookup_eval.get_variable(),
+      );
+
+      let U_fold = U1.fold(
+        cs.namespace(|| "fold R1CS"),
+        U2,
+        &r_b,
+        &T_out,
+        comm_W_fold,
+        comm_E_fold,
+      )?;
+
+      Ok(LookupVerifyOutput {
+        U_fold,
+        T_lookup_out,
+      })
+    }
   }
 }
 

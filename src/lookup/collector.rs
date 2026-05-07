@@ -26,10 +26,14 @@ use std::marker::PhantomData;
 /// A single recorded lookup query.
 ///
 /// `address` is the table-side index (or whatever the table's domain is);
-/// `value` is the witness-side query value. For `range_check_via_lookup`
-/// over a `[0, 2^n_bits)` table both fields are the same `AllocatedNum`,
-/// but we keep them separate so the same collector can serve more general
-/// table-lookup primitives in future stages.
+/// `values` are the witness-side value columns returned for that address.
+///
+/// Stage I-pri extends the prior single-value shape (`value: AllocatedNum`)
+/// to a multi-column shape: a query supplies one address and `c >= 0` value
+/// columns. The single-column primitives (e.g.
+/// `range_check_via_lookup`) collapse to the `values.len() == 0` special
+/// case where `address ≡ value` and the LogUp combine reduces to the
+/// identity map.
 #[derive(Debug, Clone)]
 pub struct LookupQuery<F: PrimeField> {
   /// Stable identifier of the table this query targets. Matches
@@ -37,8 +41,9 @@ pub struct LookupQuery<F: PrimeField> {
   pub table_id: u64,
   /// In-circuit address (lookup-side index).
   pub address: AllocatedNum<F>,
-  /// In-circuit value (witness-side query value).
-  pub value: AllocatedNum<F>,
+  /// In-circuit value columns (one entry per table value column). Empty
+  /// for single-column lookups (`address ≡ value`).
+  pub values: Vec<AllocatedNum<F>>,
 }
 
 /// Per-step accumulator of lookup queries. Carried by `CSWithLookups`.
@@ -85,12 +90,18 @@ impl<F: PrimeField> QueryCollector<F> {
 /// Implementors carry a `QueryCollector` and forward queries to it. The
 /// canonical implementor is [`CSWithLookups`].
 pub trait LookupConstraintSystem<F: PrimeField>: ConstraintSystem<F> {
-  /// Record a lookup query against the table identified by `table_id`.
+  /// Record a multi-column lookup query against the table identified by
+  /// `table_id`.
+  ///
+  /// `values` carries the witness-side value columns returned by the
+  /// lookup (one entry per table value column). Pass an empty vector for
+  /// single-column lookups where `address ≡ value` (e.g.
+  /// `range_check_via_lookup`).
   fn register_lookup_query(
     &mut self,
     table_id: u64,
     address: AllocatedNum<F>,
-    value: AllocatedNum<F>,
+    values: Vec<AllocatedNum<F>>,
   );
 }
 
@@ -194,12 +205,12 @@ impl<F: PrimeField, CS: ConstraintSystem<F>> LookupConstraintSystem<F> for CSWit
     &mut self,
     table_id: u64,
     address: AllocatedNum<F>,
-    value: AllocatedNum<F>,
+    values: Vec<AllocatedNum<F>>,
   ) {
     self.collector.push(LookupQuery {
       table_id,
       address,
-      value,
+      values,
     });
   }
 }
