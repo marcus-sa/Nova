@@ -106,6 +106,32 @@ pub struct LookupShape<E: Engine> {
 
 #[cfg(feature = "lookup-fold")]
 impl<E: Engine> LookupShape<E> {
+  /// Construct a `LookupShape` from caller-supplied components.
+  ///
+  /// `witness_ell_cached` is `pub(crate)` to keep the Stage 3
+  /// `LookupConstraintSystem::finalize()` discipline in the vendor crate;
+  /// this constructor is the spike-scope escape hatch for direct callers
+  /// (e.g. proving-time benchmarks in `inumbra-spend-harness`) that need
+  /// to instantiate a `LookupShape` without rerunning the full Stage 3
+  /// pooling pipeline.
+  ///
+  /// Pinned by §B.4.3 of the implementation outline (amendment 2026-05-07).
+  pub fn new(
+    tables: Vec<LookupTableHandle<E>>,
+    multi_column_tables: Vec<MultiColumnLookupTable<E>>,
+    num_addr_columns: usize,
+    num_witness_columns: usize,
+    witness_ell_cached: usize,
+  ) -> Self {
+    Self {
+      tables,
+      multi_column_tables,
+      num_addr_columns,
+      num_witness_columns,
+      witness_ell_cached,
+    }
+  }
+
   /// Number of variables in the witness-side `eq` polynomial. The pooled
   /// per-step witness vector is padded to length `2^witness_ell()`.
   ///

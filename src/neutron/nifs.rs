@@ -1064,7 +1064,7 @@ impl<E: Engine> NIFS<E> {
   /// squeeze time, so a malicious prover who supplied wrong column
   /// witnesses would produce inconsistent inverse-witness commitments
   /// and fail the (C)-binding check downstream.
-  #[cfg(all(feature = "lookup-fold", test))]
+  #[cfg(feature = "lookup-fold")]
   #[allow(clippy::too_many_arguments)]
   pub fn verify_with_multi_column_lookup(
     &self,
