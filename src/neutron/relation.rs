@@ -50,6 +50,70 @@ pub struct LookupShape<E: Engine> {
   pub num_addr_columns: usize,
   /// Number of witness columns in the per-step lookup witness layout.
   pub num_witness_columns: usize,
+  /// Number of variables in the witness-side `eq` polynomial; the pooled
+  /// per-step witness vector is padded to length `2^witness_ell_cached`.
+  ///
+  /// Populated by `LookupConstraintSystem::finalize()` at end-of-step (Stage 3,
+  /// §H.3); set by callers explicitly at construction time for the spike
+  /// scope. Pinned by §B.4.3 of the implementation outline (amendment
+  /// 2026-05-07).
+  pub(crate) witness_ell_cached: usize,
+}
+
+#[cfg(feature = "lookup-fold")]
+impl<E: Engine> LookupShape<E> {
+  /// Number of variables in the witness-side `eq` polynomial. The pooled
+  /// per-step witness vector is padded to length `2^witness_ell()`.
+  ///
+  /// Populated by `LookupConstraintSystem::finalize()` at end-of-step
+  /// (Stage 3); for direct callers (Stage 1 spike), supplied via the
+  /// `witness_ell_cached` field at construction time.
+  ///
+  /// Pinned by §B.4.3 of the implementation outline (amendment 2026-05-07).
+  pub fn witness_ell(&self) -> usize {
+    self.witness_ell_cached
+  }
+
+  /// Number of variables in the table-side `eq` polynomial.
+  ///
+  /// Defined as `ceil(log2(Σ table.size for table in tables))` for the
+  /// merged-table pool (addendum §A.3.2). For single-table use (the spike
+  /// default), this is `log2(self.tables[0].size)`.
+  ///
+  /// Pinned by §B.4.3 of the implementation outline (amendment 2026-05-07).
+  pub fn table_ell(&self) -> usize {
+    let total = self.tables.iter().map(|h| h.size).sum::<usize>();
+    if total == 0 {
+      0
+    } else {
+      total.next_power_of_two().trailing_zeros() as usize
+    }
+  }
+
+  /// Split of `witness_ell()` into `(left, right)` matching `Structure`'s split
+  /// for tensor-form `eq` reuse with `evaluation_points_cubic_with_two_inputs`
+  /// (mirrors the R1CS-side split at `Structure::new`).
+  ///
+  /// Returns `(2^ell1, 2^ell2)` with `ell1 = ⌈ell/2⌉`, `ell2 = ⌊ell/2⌋`,
+  /// and `ell1 + ell2 = witness_ell()`.
+  ///
+  /// Pinned by §B.4.3 of the implementation outline (amendment 2026-05-07).
+  pub fn witness_split(&self) -> (usize, usize) {
+    let ell = self.witness_ell();
+    let ell1 = ell.div_ceil(2);
+    let ell2 = ell / 2;
+    (1 << ell1, 1 << ell2)
+  }
+
+  /// Split of `table_ell()` into `(left, right)` for tensor-form `eq` reuse.
+  ///
+  /// Pinned by §B.4.3 of the implementation outline (amendment 2026-05-07).
+  pub fn table_split(&self) -> (usize, usize) {
+    let ell = self.table_ell();
+    let ell1 = ell.div_ceil(2);
+    let ell2 = ell / 2;
+    (1 << ell1, 1 << ell2)
+  }
 }
 
 /// A type that holds structure information for a zero-fold relation
