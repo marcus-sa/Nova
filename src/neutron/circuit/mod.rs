@@ -20,9 +20,13 @@ use crate::{
   },
   Commitment,
 };
+#[cfg(feature = "lookup-fold")]
+use crate::neutron::relation::LookupPayloadPublic;
 use ff::Field;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "lookup-fold")]
+pub mod lookup;
 pub mod nifs;
 pub mod r1cs;
 pub mod relation;
@@ -47,6 +51,24 @@ pub struct NeutronAugmentedCircuitInputs<E: Engine> {
   nifs: Option<NIFS<E>>,
   comm_W_fold: Option<Commitment<E>>,
   comm_E_fold: Option<Commitment<E>>,
+
+  /// Lookup-side public payload (`comm_L`, `comm_ts`) — Stage G §G.4.
+  /// `None` for non-lookup steps and at outer base.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) lookup_payload_pub: Option<LookupPayloadPublic<E>>,
+  /// Folded `comm_L` hint (untrusted, like `comm_W_fold`). The augmented
+  /// circuit consumes this to absorb into the next-step Nova hash.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_L_fold: Option<Commitment<E>>,
+  /// Folded `comm_ts` hint.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_ts_fold: Option<Commitment<E>>,
+  /// Folded `comm_inv_w` hint.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_w_fold: Option<Commitment<E>>,
+  /// Folded `comm_inv_t` hint.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_inv_t_fold: Option<Commitment<E>>,
 }
 
 impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
@@ -76,7 +98,40 @@ impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
       nifs,
       comm_W_fold,
       comm_E_fold,
+      #[cfg(feature = "lookup-fold")]
+      lookup_payload_pub: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_L_fold: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts_fold: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_w_fold: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_t_fold: None,
     }
+  }
+
+  /// Attach lookup-side public payload + folded commitment hints to an
+  /// existing `NeutronAugmentedCircuitInputs` (Stage G §G.4).
+  ///
+  /// Builder-style so the legacy `new` constructor stays signature-stable.
+  #[cfg(feature = "lookup-fold")]
+  #[allow(clippy::too_many_arguments)]
+  #[allow(dead_code)]
+  pub fn with_lookup(
+    mut self,
+    lookup_payload_pub: Option<LookupPayloadPublic<E>>,
+    comm_L_fold: Option<Commitment<E>>,
+    comm_ts_fold: Option<Commitment<E>>,
+    comm_inv_w_fold: Option<Commitment<E>>,
+    comm_inv_t_fold: Option<Commitment<E>>,
+  ) -> Self {
+    self.lookup_payload_pub = lookup_payload_pub;
+    self.comm_L_fold = comm_L_fold;
+    self.comm_ts_fold = comm_ts_fold;
+    self.comm_inv_w_fold = comm_inv_w_fold;
+    self.comm_inv_t_fold = comm_inv_t_fold;
+    self
   }
 }
 

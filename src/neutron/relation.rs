@@ -185,6 +185,26 @@ pub struct FoldedInstance<E: Engine> {
   pub(crate) T_lookup: Option<E::Scalar>,
 }
 
+/// Verifier-side projection of [`LookupPayload`] carried as a public input
+/// to the augmented circuit (Stage G, §G.4).
+///
+/// The augmented-circuit verifier needs the per-step `comm_L` and `comm_ts`
+/// commitments to absorb them in the FS transcript at the same point as the
+/// native `verify_with_lookup` (mirroring `nifs.rs:609-610`). It does NOT
+/// need `comm_inv_w` / `comm_inv_t` (which the native code re-derives from
+/// the [`NIFS`] message) nor `T2_lookup` (which is verifier-computed).
+///
+/// Pinned by §G.4 of the implementation outline.
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupPayloadPublic<E: Engine> {
+  /// Per-step lookup-witness commitment.
+  pub comm_L: Commitment<E>,
+  /// Per-step multiplicity-vector commitment.
+  pub comm_ts: Commitment<E>,
+}
+
 /// Per-step lookup-side payload delivered to [`NIFS::prove`] alongside the
 /// incoming [`R1CSInstance`].
 ///

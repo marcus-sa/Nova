@@ -17,6 +17,11 @@ pub mod nova;
 #[cfg(feature = "experimental")]
 pub mod neutron;
 
+/// User-callable lookup gadgets and the `LookupConstraintSystem` collector
+/// trait. Stage H of the C1-β lookup-fold extension.
+#[cfg(feature = "lookup-fold")]
+pub mod lookup;
+
 // public modules
 pub mod constants;
 pub mod digest;
