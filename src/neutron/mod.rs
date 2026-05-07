@@ -26,6 +26,12 @@ mod circuit;
 pub mod nifs;
 pub mod relation;
 
+/// Closed-form, fold-step-collapsed sumcheck instance for the C1-β
+/// lookup-fold extension. Pinned by §B of the spike implementation
+/// outline (amendment 2026-05-07).
+#[cfg(feature = "lookup-fold")]
+pub(crate) mod lookup_sumcheck;
+
 use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
 use nifs::NIFS;
 use relation::{FoldedInstance, FoldedWitness, Structure};

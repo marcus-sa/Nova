@@ -21,6 +21,13 @@ pub mod polys;
 /// Module providing sumcheck protocol implementation.
 pub mod sumcheck;
 
+/// LogUp denominator-cleared inversions, shared between PPSNARK's row-half
+/// `MemorySumcheckInstance` and the C1-β lookup-fold extension's
+/// `LookupSumcheckInstance`. Pinned by §B.7 of the spike implementation
+/// outline.
+#[cfg(feature = "lookup-fold")]
+pub(crate) mod logup_inverses;
+
 pub use sumcheck::SumcheckEngine;
 
 use crate::{
