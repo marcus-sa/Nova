@@ -86,6 +86,12 @@ pub enum NovaError {
   /// returned when zero instances are provided where at least one is required
   #[error("InvalidNumInstances")]
   InvalidNumInstances,
+  /// returned when a `Structure` is missing required state for an operation
+  /// (e.g., a multi-column lookup operation references a `table_id` that is
+  /// not registered in `Structure::lookups.multi_column_tables`, or `lookups`
+  /// is `None` on the structure-side; Stage I-app.2)
+  #[error("InvalidStructure")]
+  InvalidStructure,
 }
 
 impl From<SynthesisError> for NovaError {

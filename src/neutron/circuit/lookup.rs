@@ -214,7 +214,7 @@ mod tests {
       nifs::NIFS,
       relation::{
         FoldedInstance, FoldedWitness, LookupPayload, LookupRunningWitness, LookupShape,
-        LookupTableHandle, Structure,
+        LookupTableHandle, MultiColumnLookupTable, Structure,
       },
     },
     provider::{hyperkzg::EvaluationEngine, Bn256EngineKZG},
@@ -269,6 +269,7 @@ mod tests {
         size: table_size,
         commitment: table_comm,
       }],
+      multi_column_tables: Vec::new(),
       num_addr_columns: 1,
       num_witness_columns: 1,
       witness_ell_cached: table_log2,
@@ -530,6 +531,15 @@ mod tests {
         size: table_size,
         commitment: identity_comm,
       }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![t1.clone(), t2.clone()],
+        value_commitments: vec![
+          <E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO),
+          <E as Engine>::CE::commit(&ck, &t2, &Scalar::ZERO),
+        ],
+      }],
       num_addr_columns: 1,
       num_witness_columns: 3,
       witness_ell_cached: table_log2,
@@ -607,10 +617,9 @@ mod tests {
       &W2,
       &payload,
       &running_lw,
+      0u64,
       &witness_addr,
       &[witness_v1.clone(), witness_v2.clone()],
-      table_size,
-      &[t1.clone(), t2.clone()],
       &multiplicities,
       eq_w_left.to_vec(),
       eq_w_right.to_vec(),
@@ -632,7 +641,15 @@ mod tests {
       comm_values: payload.comm_values.clone(),
     };
     let _verified = nifs
-      .verify_with_multi_column_lookup(&ro_consts, &pp_digest, &running_U, &U2, &payload_for_verify)
+      .verify_with_multi_column_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &running_U,
+        &U2,
+        &payload_for_verify,
+        0u64,
+      )
       .expect("native verify must succeed");
 
     // Replay the FS transcript using the in-circuit's single-IO U2

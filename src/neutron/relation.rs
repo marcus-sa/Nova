@@ -73,6 +73,23 @@ pub struct LookupShape<E: Engine> {
   /// `table_id` for deterministic `pp_digest` derivation (addendum §A.1.1
   /// property 4).
   pub tables: Vec<LookupTableHandle<E>>,
+  /// Multi-column lookup tables registered for this `Structure` (Stage I-app.2).
+  ///
+  /// Each entry's `table_id`, `size`, column count, and per-column commitments
+  /// are absorbed into `pp_digest` via the serde `Serialize` derive on
+  /// [`MultiColumnLookupTable`] — that pins the table identity globally across
+  /// every fold step on the IVC chain. The per-step
+  /// [`crate::neutron::nifs::NIFS::prove_with_multi_column_lookup`] /
+  /// [`crate::neutron::nifs::NIFS::verify_with_multi_column_lookup`]
+  /// take a `table_id: u64` argument that resolves into this vec — the
+  /// table contents are NEVER passed per-call.
+  ///
+  /// Order canonicalised by ascending `table_id` (matches the
+  /// [`tables`] vec discipline; addendum §A.1.1 property 4).
+  ///
+  /// Pinned by Stage I-app.2 (pp_digest binding for table identity).
+  #[serde(default = "Vec::new")]
+  pub multi_column_tables: Vec<MultiColumnLookupTable<E>>,
   /// Number of address columns in the per-step lookup witness layout.
   pub num_addr_columns: usize,
   /// Number of witness columns in the per-step lookup witness layout.
@@ -160,11 +177,15 @@ pub struct Structure<E: Engine> {
   /// `StepCircuit`s pay zero serde / per-step cost. Pinned by addendum §A.2.1
   /// (the `Option<>` wrapper is the backward-compatibility pin).
   ///
-  /// Because `Structure<E>` participates in `SimpleDigestible` (see
-  /// `vendor/nova/src/neutron/mod.rs:54`), the `Serialize`/`Deserialize` derive
-  /// on this field makes the table commitments and sizes part of the
-  /// `pp_digest` automatically. This satisfies addendum §A.1.1 property 4
-  /// without a separate `Structure::digest()` method.
+  /// Because `Structure<E>` is included in `PublicParams<E1, E2, C>` and
+  /// `PublicParams` participates in `SimpleDigestible` (see
+  /// `vendor/nova/src/neutron/mod.rs:60`), the `Serialize`/`Deserialize`
+  /// derive on this field makes both single-column `LookupTableHandle`s
+  /// AND `MultiColumnLookupTable`s (`LookupShape::tables` and
+  /// `LookupShape::multi_column_tables`) part of the `pp_digest`
+  /// automatically. This satisfies addendum §A.1.1 property 4 (single-
+  /// column) and Stage I-app.2 (multi-column) — the table contents are
+  /// pinned globally at IVC initialisation, not per-call.
   #[cfg(feature = "lookup-fold")]
   pub(crate) lookups: Option<LookupShape<E>>,
 }
@@ -429,6 +450,10 @@ impl<E: Engine> Structure<E> {
   pub fn new_with_lookups(S: &R1CSShape<E>, mut shape: LookupShape<E>) -> Self {
     let mut s = Self::new(S);
     shape.tables.sort_by_key(|h| h.table_id);
+    // Stage I-app.2: canonicalise multi-column tables by ascending `table_id`
+    // so the `pp_digest` derivation (via serde on `Structure → LookupShape →
+    // multi_column_tables`) is independent of caller-side insertion order.
+    shape.multi_column_tables.sort_by_key(|t| t.table_id);
     s.lookups = Some(shape);
     s
   }

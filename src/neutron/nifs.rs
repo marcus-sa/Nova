@@ -766,21 +766,27 @@ impl<E: Engine> NIFS<E> {
   ///
   /// ## Arguments
   ///
+  /// - `table_id`: identifier of the multi-column table registered in
+  ///   `S.lookups.multi_column_tables` (Stage I-app.2). The table data
+  ///   (`size`, `columns`) is resolved from the structure at call time —
+  ///   the table identity is bound globally via `pp_digest`, NOT passed
+  ///   per-call.
   /// - `fresh_witness_address`: the U2 address column (length = pooled
   ///   query count).
   /// - `fresh_witness_value_columns`: the U2 value columns (one Vec per
   ///   column, parallel to `payload.comm_values`). Must all have the
   ///   same length as `fresh_witness_address`. May be empty (degenerates
   ///   to single-column path).
-  /// - `fresh_table_value_columns`: the table-side value columns (one
-  ///   Vec per column, parallel to `payload.comm_values`). Must all
-  ///   have length `fresh_table_size` (the table size). The address
-  ///   column on the table side is implicit (`{0, ..., size-1}`).
   /// - `fresh_multiplicities`, `fresh_eq_*`: as in `prove_with_lookup`.
   ///
   /// Returns `(nifs, (folded_U, folded_W), folded_lw)` exactly like
   /// `prove_with_lookup`. The transcript byte-stream is identical to
   /// `prove_with_lookup` when `fresh_witness_value_columns.is_empty()`.
+  ///
+  /// ## Errors
+  ///
+  /// Returns [`NovaError::InvalidStructure`] if `table_id` is not registered
+  /// in `S.lookups.multi_column_tables` (Stage I-app.2 pp_digest binding).
   #[cfg(feature = "lookup-fold")]
   #[allow(clippy::too_many_arguments)]
   pub fn prove_with_multi_column_lookup(
@@ -794,10 +800,9 @@ impl<E: Engine> NIFS<E> {
     W2: &R1CSWitness<E>,
     payload: &LookupPayload<E>,
     running_lw: &LookupRunningWitness<E>,
+    table_id: u64,
     fresh_witness_address: &[E::Scalar],
     fresh_witness_value_columns: &[Vec<E::Scalar>],
-    fresh_table_size: usize,
-    fresh_table_value_columns: &[Vec<E::Scalar>],
     fresh_multiplicities: &[E::Scalar],
     fresh_eq_w_left: Vec<E::Scalar>,
     fresh_eq_w_right: Vec<E::Scalar>,
@@ -811,6 +816,22 @@ impl<E: Engine> NIFS<E> {
     ),
     NovaError,
   > {
+    // Stage I-app.2: resolve the multi-column table from the structure-side
+    // registry. The table contents are pinned by `pp_digest` (via serde on
+    // `Structure → LookupShape → multi_column_tables`), so the table
+    // identity cannot drift across fold steps.
+    let lookup_shape = S
+      .lookups
+      .as_ref()
+      .ok_or(NovaError::InvalidStructure)?;
+    let multi_table = lookup_shape
+      .multi_column_tables
+      .iter()
+      .find(|t| t.table_id == table_id)
+      .ok_or(NovaError::InvalidStructure)?;
+    let fresh_table_size = multi_table.size;
+    let fresh_table_value_columns: &[Vec<E::Scalar>] = &multi_table.columns;
+
     // Sanity: column counts must agree across payload, witness, and table.
     let c = payload.comm_values.len();
     if fresh_witness_value_columns.len() != c {
@@ -826,8 +847,8 @@ impl<E: Engine> NIFS<E> {
     if fresh_table_value_columns.len() != c {
       return Err(NovaError::UnSat {
         reason: format!(
-          "prove_with_multi_column_lookup: table column count ({}) \
-           differs from payload.comm_values ({})",
+          "prove_with_multi_column_lookup: structure-registered table \
+           column count ({}) differs from payload.comm_values ({})",
           fresh_table_value_columns.len(),
           c,
         ),
@@ -851,8 +872,8 @@ impl<E: Engine> NIFS<E> {
       if col.len() != fresh_table_size {
         return Err(NovaError::UnSat {
           reason: format!(
-            "prove_with_multi_column_lookup: table value column {} length ({}) \
-             differs from fresh_table_size ({})",
+            "prove_with_multi_column_lookup: structure-registered table \
+             value column {} length ({}) differs from registered size ({})",
             i,
             col.len(),
             fresh_table_size,
@@ -1044,14 +1065,41 @@ impl<E: Engine> NIFS<E> {
   /// witnesses would produce inconsistent inverse-witness commitments
   /// and fail the (C)-binding check downstream.
   #[cfg(all(feature = "lookup-fold", test))]
+  #[allow(clippy::too_many_arguments)]
   pub fn verify_with_multi_column_lookup(
     &self,
     ro_consts: &RO2Constants<E>,
     pp_digest: &E::Scalar,
+    S: &Structure<E>,
     U1: &FoldedInstance<E>,
     U2: &R1CSInstance<E>,
     payload: &LookupPayload<E>,
+    table_id: u64,
   ) -> Result<FoldedInstance<E>, NovaError> {
+    // Stage I-app.2: verifier-side check that the supplied `table_id` is
+    // registered in the structure. Soundness for the table contents
+    // themselves comes from `pp_digest` (which the prover and verifier
+    // both absorbed at the head of the transcript). The lookup here
+    // is a structural sanity gate — a mismatched id surfaces as
+    // `NovaError::InvalidStructure` rather than as a downstream
+    // sumcheck rejection.
+    let lookup_shape = S
+      .lookups
+      .as_ref()
+      .ok_or(NovaError::InvalidStructure)?;
+    let multi_table = lookup_shape
+      .multi_column_tables
+      .iter()
+      .find(|t| t.table_id == table_id)
+      .ok_or(NovaError::InvalidStructure)?;
+    // Cross-check: the per-step payload's value-column count must match the
+    // structurally-pinned table column count. This is a structure-bound
+    // check that the verifier can perform without ever reconstructing
+    // the combined witness/table.
+    if payload.comm_values.len() != multi_table.columns.len() {
+      return Err(NovaError::InvalidStructure);
+    }
+
     let mut ro = E::RO2::new(ro_consts.clone());
     ro.absorb(*pp_digest);
     U2.absorb_in_ro2(&mut ro);
@@ -1414,6 +1462,7 @@ mod tests {
         size: table_size,
         commitment: table_comm,
       }],
+      multi_column_tables: Vec::new(),
       num_addr_columns: 1,
       num_witness_columns: 1,
       // For 4 queries: we need witness_ell such that 2^ell >= 4 => ell = 2.
@@ -1742,6 +1791,7 @@ mod tests {
     use crate::{
       neutron::relation::{
         LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+        MultiColumnLookupTable,
       },
       spartan::polys::power::PowPolynomial,
       traits::commitment::CommitmentEngineTrait,
@@ -1794,6 +1844,15 @@ mod tests {
         table_id: 0,
         size: table_size,
         commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![t1.clone(), t2.clone()],
+        value_commitments: vec![
+          <E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO),
+          <E as Engine>::CE::commit(&ck, &t2, &Scalar::ZERO),
+        ],
       }],
       num_addr_columns: 1,
       num_witness_columns: 3,
@@ -1878,10 +1937,9 @@ mod tests {
         &W2,
         &payload,
         &running_lw,
+        0u64,
         &witness_addr,
         &[witness_v1.clone(), witness_v2.clone()],
-        table_size,
-        &[t1.clone(), t2.clone()],
         &multiplicities,
         eq_w_left.to_vec(),
         eq_w_right.to_vec(),
@@ -1904,9 +1962,11 @@ mod tests {
       .verify_with_multi_column_lookup(
         &ro_consts,
         &pp_digest,
+        &str,
         &running_U,
         &U2,
         &payload_for_verify,
+        0u64,
       )
       .expect("verify_with_multi_column_lookup must succeed");
 
@@ -1930,6 +1990,7 @@ mod tests {
     use crate::{
       neutron::relation::{
         LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+        MultiColumnLookupTable,
       },
       spartan::polys::power::PowPolynomial,
       traits::commitment::CommitmentEngineTrait,
@@ -1966,6 +2027,12 @@ mod tests {
         table_id: 0,
         size: table_size,
         commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![t1.clone()],
+        value_commitments: vec![<E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO)],
       }],
       num_addr_columns: 1,
       num_witness_columns: 2,
@@ -2053,10 +2120,9 @@ mod tests {
         &W2,
         &payload,
         &running_lw,
+        0u64,
         &witness_addr,
         &[witness_v1.clone()],
-        table_size,
-        &[t1.clone()],
         &multiplicities,
         eq_w_left.to_vec(),
         eq_w_right.to_vec(),
@@ -2078,9 +2144,11 @@ mod tests {
       .verify_with_multi_column_lookup(
         &ro_consts,
         &pp_digest,
+        &str,
         &running_U,
         &U2,
         &payload_for_verify,
+        0u64,
       )
       .expect("per-step verify completes — soundness is downstream");
 
@@ -2111,6 +2179,7 @@ mod tests {
     use crate::{
       neutron::relation::{
         LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+        MultiColumnLookupTable,
       },
       spartan::polys::power::PowPolynomial,
       traits::commitment::CommitmentEngineTrait,
@@ -2149,6 +2218,15 @@ mod tests {
         table_id: 0,
         size: table_size,
         commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![t1.clone(), t2.clone()],
+        value_commitments: vec![
+          <E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO),
+          <E as Engine>::CE::commit(&ck, &t2, &Scalar::ZERO),
+        ],
       }],
       num_addr_columns: 1,
       num_witness_columns: 3,
@@ -2258,10 +2336,9 @@ mod tests {
         &W1_r1cs,
         &payload1,
         &running_lw,
+        0u64,
         &witness_addr1,
         &[witness_v1_1.clone(), witness_v2_1.clone()],
-        table_size,
-        &[t1.clone(), t2.clone()],
         &multiplicities1,
         eq_w1l,
         eq_w1r,
@@ -2275,9 +2352,11 @@ mod tests {
       .verify_with_multi_column_lookup(
         &ro_consts,
         &pp_digest,
+        &str,
         &running_U,
         &U1_r1cs,
         &payload1,
+        0u64,
       )
       .expect("step 1 verify must succeed");
     assert_eq!(folded_U1, verified1);
@@ -2313,10 +2392,9 @@ mod tests {
         &W2_r1cs,
         &payload2,
         &running_lw,
+        0u64,
         &witness_addr2,
         &[witness_v1_2.clone(), witness_v2_2.clone()],
-        table_size,
-        &[t1.clone(), t2.clone()],
         &multiplicities2,
         eq_w2l,
         eq_w2r,
@@ -2330,13 +2408,495 @@ mod tests {
       .verify_with_multi_column_lookup(
         &ro_consts,
         &pp_digest,
+        &str,
         &running_U,
         &U2_r1cs,
         &payload2,
+        0u64,
       )
       .expect("step 2 verify must succeed");
     assert_eq!(folded_U2, verified2);
     assert!(folded_U2.T_lookup.is_some());
+    str.is_sat(&ck, &folded_U2, &folded_W2).expect("step 2 R1CS sat");
+  }
+
+  // -----------------------------------------------------------------
+  // Stage I-app.2 — pp_digest binds multi-column table identity.
+  //
+  // The three tests below exercise the soundness gain from registering
+  // multi-column tables in `LookupShape::multi_column_tables` (instead
+  // of passing them per-call):
+  //
+  // 1. `stage_i_app_2_pp_digest_binds_table_identity` — building two
+  //    `Structure`s with different multi-column tables yields different
+  //    `Structure` bytes (and hence different pp_digest), pinning the
+  //    table at IVC initialisation.
+  // 2. `stage_i_app_2_unregistered_table_id_rejects` — passing an
+  //    unregistered `table_id` to prove returns
+  //    `NovaError::InvalidStructure`.
+  // 3. `stage_i_app_2_merged_table_two_logical_partitions` — register
+  //    one merged 64-row table simulating two 32-row logical sub-tables
+  //    (high bit = sub-table id, low 5 bits = address); two consecutive
+  //    fold steps each query a different sub-table and both succeed.
+  //
+  // Pinned by Stage I-app.2 (pp_digest binding for multi-column tables).
+  // -----------------------------------------------------------------
+
+  /// Stage I-app.2 T1: pp_digest binds the multi-column table identity.
+  /// Two `Structure`s with different multi-column-table contents must
+  /// produce different bincode-serialised bytes — `pp_digest` (which is
+  /// SHA3-256 over `bincode(PublicParams)` and `PublicParams` includes
+  /// `Structure`) therefore differs whenever the structurally-pinned
+  /// multi-column table changes.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn stage_i_app_2_pp_digest_binds_table_identity() {
+    use crate::{
+      neutron::relation::{LookupShape, LookupTableHandle, MultiColumnLookupTable},
+      traits::commitment::CommitmentEngineTrait,
+    };
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let num_cons = 32usize;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let identity: Vec<Scalar> =
+      (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+
+    // Two distinct multi-column table contents.
+    let t1_a: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 11 + 5) as u64))
+      .collect();
+    let t1_b: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 13 + 7) as u64))
+      .collect();
+    let comm_t1_a = <E as Engine>::CE::commit(&ck, &t1_a, &Scalar::ZERO);
+    let comm_t1_b = <E as Engine>::CE::commit(&ck, &t1_b, &Scalar::ZERO);
+
+    let mk_shape = |columns: Vec<Scalar>, comm: Commitment<E>| LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: table_size,
+        commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![columns],
+        value_commitments: vec![comm],
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: table_log2,
+    };
+
+    let str_a = Structure::new_with_lookups(&shape, mk_shape(t1_a.clone(), comm_t1_a));
+    let str_b = Structure::new_with_lookups(&shape, mk_shape(t1_b.clone(), comm_t1_b));
+
+    // Bincode-serialise via the same encoder `DigestComputer` uses (legacy
+    // little-endian fixed-int — see `src/digest.rs`). Different bytes
+    // implies different SHA3-256 hash and therefore different
+    // pp_digest field element.
+    let cfg = bincode::config::legacy()
+      .with_little_endian()
+      .with_fixed_int_encoding();
+    let bytes_a =
+      bincode::serde::encode_to_vec(&str_a, cfg).expect("bincode a must encode");
+    let bytes_b =
+      bincode::serde::encode_to_vec(&str_b, cfg).expect("bincode b must encode");
+    assert_ne!(
+      bytes_a, bytes_b,
+      "Stage I-app.2: bincode(Structure) must differ when the multi-column \
+       table contents change. If this assertion fires, the table identity \
+       is NOT bound into pp_digest and the spike's soundness pin is broken."
+    );
+  }
+
+  /// Stage I-app.2 T2: passing an unregistered `table_id` to
+  /// `prove_with_multi_column_lookup` returns `NovaError::InvalidStructure`.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn stage_i_app_2_unregistered_table_id_rejects() {
+    use crate::{
+      neutron::relation::{
+        LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+        MultiColumnLookupTable,
+      },
+      spartan::polys::power::PowPolynomial,
+      traits::commitment::CommitmentEngineTrait,
+    };
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0x1A55_BAD_1D);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    let num_cons = 32usize;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let t1: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 11 + 5) as u64))
+      .collect();
+    let identity: Vec<Scalar> =
+      (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+
+    // Register table_id=7 (NOT 0).
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: table_size,
+        commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 7,
+        size: table_size,
+        columns: vec![t1.clone()],
+        value_commitments: vec![<E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO)],
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: table_log2,
+    };
+    let str = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str.S.clone();
+
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs = SatisfyingAssignment::<E>::new();
+    let _ = circuit.synthesize(&mut cs);
+    let (U2, W2) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2 = W2.pad(&shape);
+
+    let running_W = FoldedWitness::default(&str);
+    let running_U = FoldedInstance::default(&str);
+    let running_lw = LookupRunningWitness::default(&lookup_shape);
+
+    // Build a satisfying multi-column witness pool (table_id=7 contents).
+    let query_indices = [0usize, 3, 7, 15];
+    let mut witness_addr = vec![Scalar::ZERO; table_size];
+    let mut witness_v1 = vec![Scalar::ZERO; table_size];
+    let mut multiplicities = vec![Scalar::ZERO; table_size];
+    for (i, &idx) in query_indices.iter().enumerate() {
+      witness_addr[i] = Scalar::from(idx as u64);
+      witness_v1[i] = t1[idx];
+      multiplicities[idx] += Scalar::ONE;
+    }
+    for i in query_indices.len()..table_size {
+      witness_addr[i] = Scalar::from(0u64);
+      witness_v1[i] = t1[0];
+      multiplicities[0] += Scalar::ONE;
+    }
+    let comm_addr = <E as Engine>::CE::commit(&ck, &witness_addr, &Scalar::ZERO);
+    let comm_v1 = <E as Engine>::CE::commit(&ck, &witness_v1, &Scalar::ZERO);
+    let comm_ts = <E as Engine>::CE::commit(&ck, &multiplicities, &Scalar::ZERO);
+
+    let payload = LookupPayload::<E> {
+      comm_L: comm_addr,
+      comm_ts,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v1],
+    };
+
+    let tau_w = Scalar::random(&mut rng);
+    let pow_w = PowPolynomial::new(&tau_w, table_log2);
+    let (w_left, w_right) = lookup_shape.witness_split();
+    let combined_w = pow_w.split_evals(w_left, w_right);
+    let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+    let tau_t = Scalar::random(&mut rng);
+    let pow_t = PowPolynomial::new(&tau_t, table_log2);
+    let (t_left, t_right) = lookup_shape.table_split();
+    let combined_t_eq = pow_t.split_evals(t_left, t_right);
+    let (eq_t_left, eq_t_right) = combined_t_eq.split_at(t_left);
+
+    // Pass UNREGISTERED table_id=99.
+    let res = NIFS::<E>::prove_with_multi_column_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str,
+      &running_U,
+      &running_W,
+      &U2,
+      &W2,
+      &payload,
+      &running_lw,
+      99u64, // unregistered
+      &witness_addr,
+      &[witness_v1.clone()],
+      &multiplicities,
+      eq_w_left.to_vec(),
+      eq_w_right.to_vec(),
+      eq_t_left.to_vec(),
+      eq_t_right.to_vec(),
+    );
+    assert!(matches!(res, Err(NovaError::InvalidStructure)));
+  }
+
+  /// Stage I-app.2 T3: merged-table partitioning. Register ONE merged
+  /// 32-row multi-column table that simulates two 16-row "logical"
+  /// sub-tables — high bit of the address selects which sub-table the
+  /// query targets. Two consecutive fold steps each query a different
+  /// logical sub-table; both must complete prove/verify.
+  ///
+  /// This is the BIP-340 chunk-step pattern in miniature: rather than
+  /// extending the algebra to handle multi-table-per-step, the four
+  /// (g, λg, p, λp) windowed tables are merged into one 64-row table
+  /// with a 6-bit address (`table_id_2bit << 4 | window_digit_4bit`).
+  /// This test exercises the same merge with two sub-tables for clarity.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn stage_i_app_2_merged_table_two_logical_partitions() {
+    use crate::{
+      neutron::relation::{
+        LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+        MultiColumnLookupTable,
+      },
+      spartan::polys::power::PowPolynomial,
+      traits::commitment::CommitmentEngineTrait,
+    };
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0x1A55_E69_E5);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    let num_cons = 32usize;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // Merged 32-row table = (sub_table_id=0: 16 rows) || (sub_table_id=1: 16 rows).
+    // Address `i ∈ [0, 32)` decomposes into (high_bit=sub_table, low_4_bits=offset).
+    let merged_size = 32usize;
+    let merged_log2 = 5usize;
+    let mut merged_t1: Vec<Scalar> = Vec::with_capacity(merged_size);
+    for i in 0..merged_size {
+      // Sub-table 0 uses (11i+5); sub-table 1 uses (17i+9). Different formulas
+      // for clarity — the merge just concatenates rows under one identity.
+      let sub_table_id = (i >> 4) & 0x1;
+      let offset = i & 0xF;
+      let v = if sub_table_id == 0 {
+        offset * 11 + 5
+      } else {
+        offset * 17 + 9
+      };
+      merged_t1.push(Scalar::from(v as u64));
+    }
+    let merged_identity: Vec<Scalar> =
+      (0..merged_size).map(|i| Scalar::from(i as u64)).collect();
+    let merged_identity_comm =
+      <E as Engine>::CE::commit(&ck, &merged_identity, &Scalar::ZERO);
+    let merged_t1_comm =
+      <E as Engine>::CE::commit(&ck, &merged_t1, &Scalar::ZERO);
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: merged_size,
+        commitment: merged_identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: merged_size,
+        columns: vec![merged_t1.clone()],
+        value_commitments: vec![merged_t1_comm],
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: merged_log2,
+    };
+    let str = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str.S.clone();
+
+    // Two satisfying R1CS pairs.
+    let circuit1: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs1 = SatisfyingAssignment::<E>::new();
+    let _ = circuit1.synthesize(&mut cs1);
+    let (U1_r1cs, W1_r1cs) = cs1.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W1_r1cs = W1_r1cs.pad(&shape);
+
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(3)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs2 = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut cs2);
+    let (U2_r1cs, W2_r1cs) = cs2.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2_r1cs = W2_r1cs.pad(&shape);
+
+    let mut running_W = FoldedWitness::default(&str);
+    let mut running_U = FoldedInstance::default(&str);
+    let mut running_lw = LookupRunningWitness::default(&lookup_shape);
+
+    // Helper closure to build a payload+witness for an arbitrary in-range
+    // set of merged-table addresses.
+    let build = |query_indices: &[usize], rng: &mut ChaCha20Rng| {
+      let mut witness_addr = vec![Scalar::ZERO; merged_size];
+      let mut witness_v1 = vec![Scalar::ZERO; merged_size];
+      let mut multiplicities = vec![Scalar::ZERO; merged_size];
+      for (i, &idx) in query_indices.iter().enumerate() {
+        witness_addr[i] = Scalar::from(idx as u64);
+        witness_v1[i] = merged_t1[idx];
+        multiplicities[idx] += Scalar::ONE;
+      }
+      for i in query_indices.len()..merged_size {
+        witness_addr[i] = Scalar::from(0u64);
+        witness_v1[i] = merged_t1[0];
+        multiplicities[0] += Scalar::ONE;
+      }
+      let comm_addr = <E as Engine>::CE::commit(&ck, &witness_addr, &Scalar::ZERO);
+      let comm_v1 = <E as Engine>::CE::commit(&ck, &witness_v1, &Scalar::ZERO);
+      let comm_ts = <E as Engine>::CE::commit(&ck, &multiplicities, &Scalar::ZERO);
+      let payload = LookupPayload::<E> {
+        comm_L: comm_addr,
+        comm_ts,
+        comm_inv_w: Commitment::<E>::default(),
+        comm_inv_t: Commitment::<E>::default(),
+        T2_lookup: Scalar::ZERO,
+        comm_values: vec![comm_v1],
+      };
+      let tau_w = Scalar::random(&mut *rng);
+      let pow_w = PowPolynomial::new(&tau_w, merged_log2);
+      let (w_left, w_right) = lookup_shape.witness_split();
+      let combined_w = pow_w.split_evals(w_left, w_right);
+      let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+      let tau_t = Scalar::random(&mut *rng);
+      let pow_t = PowPolynomial::new(&tau_t, merged_log2);
+      let (t_left, t_right) = lookup_shape.table_split();
+      let combined_t_eq = pow_t.split_evals(t_left, t_right);
+      let (eq_t_left, eq_t_right) = combined_t_eq.split_at(t_left);
+      (
+        payload,
+        witness_addr,
+        witness_v1,
+        multiplicities,
+        eq_w_left.to_vec(),
+        eq_w_right.to_vec(),
+        eq_t_left.to_vec(),
+        eq_t_right.to_vec(),
+      )
+    };
+
+    // Step 1 queries SUB-TABLE 0 (high bit = 0; addresses [0, 16)).
+    let q1 = vec![0usize, 3, 7, 15];
+    let (mut p1, wa1, wv1, m1, e1wl, e1wr, e1tl, e1tr) = build(&q1, &mut rng);
+    let (nifs1, (folded_U1, folded_W1), folded_lw1) =
+      NIFS::<E>::prove_with_multi_column_lookup(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &running_U,
+        &running_W,
+        &U1_r1cs,
+        &W1_r1cs,
+        &p1,
+        &running_lw,
+        0u64,
+        &wa1,
+        &[wv1.clone()],
+        &m1,
+        e1wl,
+        e1wr,
+        e1tl,
+        e1tr,
+      )
+      .expect("step 1 (sub-table 0) prove must succeed");
+    p1.comm_inv_w = nifs1.comm_inv_w.unwrap();
+    p1.comm_inv_t = nifs1.comm_inv_t.unwrap();
+    let v1 = nifs1
+      .verify_with_multi_column_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &running_U,
+        &U1_r1cs,
+        &p1,
+        0u64,
+      )
+      .expect("step 1 (sub-table 0) verify must succeed");
+    assert_eq!(folded_U1, v1);
+    str.is_sat(&ck, &folded_U1, &folded_W1).expect("step 1 R1CS sat");
+    running_U = folded_U1;
+    running_W = folded_W1;
+    running_lw = folded_lw1;
+
+    // Step 2 queries SUB-TABLE 1 (high bit = 1; addresses [16, 32)).
+    let q2 = vec![16usize, 19, 23, 31];
+    let (mut p2, wa2, wv2, m2, e2wl, e2wr, e2tl, e2tr) = build(&q2, &mut rng);
+    let (nifs2, (folded_U2, folded_W2), _) =
+      NIFS::<E>::prove_with_multi_column_lookup(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &running_U,
+        &running_W,
+        &U2_r1cs,
+        &W2_r1cs,
+        &p2,
+        &running_lw,
+        0u64,
+        &wa2,
+        &[wv2.clone()],
+        &m2,
+        e2wl,
+        e2wr,
+        e2tl,
+        e2tr,
+      )
+      .expect("step 2 (sub-table 1) prove must succeed");
+    p2.comm_inv_w = nifs2.comm_inv_w.unwrap();
+    p2.comm_inv_t = nifs2.comm_inv_t.unwrap();
+    let v2 = nifs2
+      .verify_with_multi_column_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str,
+        &running_U,
+        &U2_r1cs,
+        &p2,
+        0u64,
+      )
+      .expect("step 2 (sub-table 1) verify must succeed");
+    assert_eq!(folded_U2, v2);
     str.is_sat(&ck, &folded_U2, &folded_W2).expect("step 2 R1CS sat");
   }
 }
