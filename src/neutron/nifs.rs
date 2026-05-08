@@ -715,7 +715,17 @@ impl<E: Engine> NIFS<E> {
       T2_lookup: payload.T2_lookup,
       comm_values: payload.comm_values.clone(),
     };
-    let U = U1.fold_with_lookup(U2, &comm_E, &r_b, &T_out, &effective_payload, &T_lookup_out)?;
+    // Multi-table extension (GH-#2 M.2): `fold_with_lookup` takes a slice
+    // of per-table running scalars. The single-table caller passes a
+    // one-element slice; storage shape is byte-identical to M.1.
+    let U = U1.fold_with_lookup(
+      U2,
+      &comm_E,
+      &r_b,
+      &T_out,
+      &effective_payload,
+      std::slice::from_ref(&T_lookup_out),
+    )?;
     let W = W1.fold(W2, &E, &r_E, &r_b)?;
 
     // --- Fold the lookup running witness ---
@@ -1041,7 +1051,16 @@ impl<E: Engine> NIFS<E> {
       T2_lookup: payload.T2_lookup,
       comm_values: payload.comm_values.clone(),
     };
-    let U = U1.fold_with_lookup(U2, &comm_E, &r_b, &T_out, &effective_payload, &T_lookup_out)?;
+    // Multi-table extension (GH-#2 M.2): one-element slice; see commentary
+    // at the analogous site in `prove_with_lookup`.
+    let U = U1.fold_with_lookup(
+      U2,
+      &comm_E,
+      &r_b,
+      &T_out,
+      &effective_payload,
+      std::slice::from_ref(&T_lookup_out),
+    )?;
     let W = W1.fold(W2, &E, &r_E, &r_b)?;
 
     // Fold the running lookup witness with the combined fresh data.
@@ -1201,7 +1220,16 @@ impl<E: Engine> NIFS<E> {
     let T_lookup_out =
       LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, poly_lookup, &t_lookup_running)?;
 
-    let U = U1.fold_with_lookup(U2, &self.comm_E, &r_b, &T_out, payload, &T_lookup_out)?;
+    // Multi-table extension (GH-#2 M.2): one-element slice; verify-side
+    // path mirrors the prove-side single-table contract.
+    let U = U1.fold_with_lookup(
+      U2,
+      &self.comm_E,
+      &r_b,
+      &T_out,
+      payload,
+      std::slice::from_ref(&T_lookup_out),
+    )?;
     Ok(U)
   }
 
@@ -1305,7 +1333,16 @@ impl<E: Engine> NIFS<E> {
       LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, poly_lookup, &t_lookup_running)?;
 
     // --- Fold with lookup ---
-    let U = U1.fold_with_lookup(U2, &self.comm_E, &r_b, &T_out, payload, &T_lookup_out)?;
+    // Multi-table extension (GH-#2 M.2): one-element slice for the
+    // single-table multi-column verify path.
+    let U = U1.fold_with_lookup(
+      U2,
+      &self.comm_E,
+      &r_b,
+      &T_out,
+      payload,
+      std::slice::from_ref(&T_lookup_out),
+    )?;
 
     Ok(U)
   }

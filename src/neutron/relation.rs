@@ -658,6 +658,22 @@ impl<E: Engine> FoldedInstance<E> {
   /// payload * r_b = payload * r_b` (treating absent commitments as the
   /// identity / zero element). This matches the invariant that a default
   /// running instance carries no committed lookup data.
+  ///
+  /// Multi-table extension (GH-#2 M.2, design pin §1.3): `T_lookup_out` is
+  /// a slice of length `k` carrying one running scalar per registered
+  /// `MultiColumnLookupTable` entry, in `table_id`-canonical order. The
+  /// resulting running instance stores `T_lookup = Some(Vec<…>)` of the
+  /// same length, threading each per-table running claim independently per
+  /// the VECTOR (C)-invariant. Single-table callers pass a one-element
+  /// slice; the k=1 storage shape is byte-identical to M.1's
+  /// `Some(vec![T_lookup_out])` wrap, preserving the regression contract
+  /// validated by `stage_i_pri_multi_column_fold_of_two`.
+  ///
+  /// Per orchestrator A1: this method threads the running-scalar VECTOR
+  /// only. The per-table (C)-binding `∀ j: poly_lookup_j(0) +
+  /// poly_lookup_j(1) == T_lookup_running_j` is enforced at verify time
+  /// (M.4 native, M.6 in-circuit) — `fold_with_lookup` itself does NOT
+  /// re-check the binding.
   #[cfg(feature = "lookup-fold")]
   pub fn fold_with_lookup(
     &self,
@@ -666,7 +682,7 @@ impl<E: Engine> FoldedInstance<E> {
     r_b: &E::Scalar,
     T_out: &E::Scalar,
     payload: &LookupPayload<E>,
-    T_lookup_out: &E::Scalar,
+    T_lookup_out: &[E::Scalar],
   ) -> Result<Self, NovaError> {
     // R1CS-zero side: identical to `Self::fold`.
     let comm_W = self.comm_W * (E::Scalar::ONE - r_b) + U2.comm_W * *r_b;
@@ -712,10 +728,14 @@ impl<E: Engine> FoldedInstance<E> {
       comm_ts: Some(comm_ts_new),
       comm_inv_w: Some(comm_inv_w_new),
       comm_inv_t: Some(comm_inv_t_new),
-      // Multi-table extension (GH-#2, design pin §5.1): only `T_lookup` is
-      // Vec-typed at the FoldedInstance level. Single-table use wraps the
-      // folded running scalar in a one-element Vec.
-      T_lookup: Some(vec![*T_lookup_out]),
+      // Multi-table extension (GH-#2 M.2, design pin §1.3): `T_lookup` is
+      // Vec-typed at the FoldedInstance level. The slice is copied
+      // verbatim into a fresh Vec so the storage shape mirrors the
+      // (C)-invariant exactly (one entry per registered table). For the
+      // k=1 single-table caller (e.g. `prove_with_multi_column_lookup` /
+      // `prove_with_lookup` passing `&[T_lookup_out]`), this produces
+      // `Some(vec![T_lookup_out])`, byte-identical to M.1's storage.
+      T_lookup: Some(T_lookup_out.to_vec()),
     })
   }
 }
@@ -834,5 +854,112 @@ mod tests {
     type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
     let res = test_sat_inner::<E, S>();
     assert!(res.is_ok());
+  }
+
+  /// GH-#2 M.2: `fold_with_lookup` per-table extension — k=2 fold-of-two
+  /// unit test demonstrating per-table threading at the `FoldedInstance`
+  /// level under the Vec-typed `T_lookup` field.
+  ///
+  /// Per design pin §1.3, the running-claim invariant is a VECTOR
+  /// `[T_lookup_1, ..., T_lookup_k]` rather than a sum. M.1 widened
+  /// `FoldedInstance::T_lookup` to `Option<Vec<E::Scalar>>`; M.2 extends
+  /// `fold_with_lookup` to accept a per-table running-scalar slice and
+  /// thread each scalar independently into the next-step running
+  /// instance.
+  ///
+  /// k=1 byte-equivalence (the k=1 path produces an output where
+  /// `T_lookup = Some(vec![T_lookup_out])`, matching M.1's storage
+  /// shape) is preserved by the existing
+  /// `stage_i_pri_multi_column_fold_of_two` regression test. This
+  /// k=2 test exercises the structural-threading property the pin
+  /// requires.
+  ///
+  /// Per orchestrator A1: M.2's positive test demonstrates per-table
+  /// threading works structurally; the cross-table-cancellation
+  /// negative test (pin §5.2 #6) lands at M.14 in inumbra harness, NOT
+  /// here.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn fold_with_lookup_threads_per_table_running_scalars_k2() {
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
+
+    let _rng = ChaCha20Rng::seed_from_u64(0xC1B2_F002);
+
+    // Minimal R1CS shape via DirectCircuit (mirrors `test_sat_inner`).
+    let num_cons: usize = 16;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    let str = Structure::new(&shape);
+
+    // Default running U1 (T_lookup = None at outer base).
+    let U1 = FoldedInstance::default(&str);
+
+    // A satisfying fresh R1CSInstance for U2.
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs2 = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut cs2);
+    let (U2, _W2) = cs2.r1cs_instance_and_witness(&shape, &ck).unwrap();
+
+    // A LookupPayload populated with default (zero) commitments — this
+    // test exercises only the `T_lookup` per-table threading path; the
+    // four `comm_*` fields on `FoldedInstance` remain
+    // `Option<Commitment<E>>` per pin §5.1's explicit listing, so we do
+    // not need real lookup commitments to validate the running-scalar
+    // threading.
+    let payload = LookupPayload::<E> {
+      comm_L: Commitment::<E>::default(),
+      comm_ts: Commitment::<E>::default(),
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![],
+    };
+
+    let comm_E = Commitment::<E>::default();
+    let r_b = Scalar::from(7u64);
+    let T_out = Scalar::ZERO;
+
+    // Two distinct per-table running scalars. The choice of distinct
+    // non-zero values makes the per-table threading observable:
+    // a buggy implementation that collapsed both into one scalar (or
+    // dropped the second) would fail the post-condition.
+    let T_lookup_out_1 = Scalar::from(0xAA_AAu64);
+    let T_lookup_out_2 = Scalar::from(0x55_55u64);
+    let T_lookup_out: [Scalar; 2] = [T_lookup_out_1, T_lookup_out_2];
+
+    let folded = U1
+      .fold_with_lookup(&U2, &comm_E, &r_b, &T_out, &payload, &T_lookup_out)
+      .expect("fold_with_lookup must succeed under k=2 per-table threading");
+
+    // Per-table threading assertion: the resulting running instance
+    // carries BOTH per-table scalars in canonical order.
+    let stored = folded
+      .T_lookup
+      .as_ref()
+      .expect("T_lookup must be populated after a fold step that carried lookup data");
+    assert_eq!(
+      stored.len(),
+      2,
+      "M.2: T_lookup must thread one scalar per registered table (k=2 here)"
+    );
+    assert_eq!(
+      stored[0], T_lookup_out_1,
+      "M.2: per-table threading must preserve table-0 running scalar"
+    );
+    assert_eq!(
+      stored[1], T_lookup_out_2,
+      "M.2: per-table threading must preserve table-1 running scalar"
+    );
   }
 }
