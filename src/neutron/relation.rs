@@ -797,6 +797,33 @@ impl<E: Engine> AbsorbInRO2Trait<E> for FoldedInstance<E> {
     self.comm_E.absorb_in_ro2(ro);
 
     ro.absorb(self.T);
+
+    // GH-#5 design pin §1.4 / §3.2 (W1) binding-via-hash NATIVE-SIDE
+    // MIRROR: each `T_lookup[j]` is absorbed in `table_id`-canonical
+    // order BETWEEN the existing `T` absorption and the `u`/`X`
+    // absorptions. This is the byte-equivalent counterpart to the
+    // in-circuit `AllocatedFoldedInstance::absorb_in_ro` extension at
+    // `vendor/nova/src/neutron/circuit/relation.rs`. The extension is
+    // gated on `feature = "lookup-fold"`: non-`lookup-fold` builds emit
+    // the original absorption shape (T, u, X) without the new branch.
+    //
+    // At outer base where `T_lookup == None` no scalars are absorbed
+    // (the sequence is empty, not skipped). The `LookupPayloadPublicMultiTable`
+    // canonical-sort discipline at `relation.rs:482` (sort_by_key
+    // table_id) is what makes "table_id-canonical order" a stable
+    // structural pin — the order pin survives any future addition of
+    // tables to the registry as long as the sort key remains.
+    //
+    // M.GH5.0 STAGE 0 acceptance criterion: byte-equivalent
+    // squeeze output between this trait and the in-circuit
+    // `absorb_in_ro` for the SAME `FoldedInstance` content.
+    #[cfg(feature = "lookup-fold")]
+    if let Some(t_lookup) = &self.T_lookup {
+      for t_j in t_lookup {
+        ro.absorb(*t_j);
+      }
+    }
+
     ro.absorb(self.u);
     for x in &self.X {
       ro.absorb(*x);
