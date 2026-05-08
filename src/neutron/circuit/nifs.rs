@@ -163,7 +163,10 @@ impl<E: Engine> AllocatedNIFS<E> {
 #[allow(dead_code)]
 mod lookup_verify {
   use super::*;
-  use crate::neutron::circuit::lookup::AllocatedLookupNIFS;
+  use crate::neutron::circuit::lookup::{
+    AllocatedLookupNIFS, AllocatedLookupNIFSMultiTable,
+    AllocatedLookupPayloadPublicMultiTable,
+  };
 
   /// Result of `AllocatedNIFS::verify_with_lookup`: the folded R1CS-zero
   /// instance and the next-step lookup-zero running target. The augmented
@@ -559,9 +562,331 @@ mod lookup_verify {
         T_lookup_out,
       })
     }
+
+    /// In-circuit **multi-table** lookup-aware verifier (GH-#2 M.6).
+    ///
+    /// Multi-table extension of [`Self::verify_with_multi_column_lookup`]
+    /// per design pin §5.1 — the in-circuit half of the (M.4) native
+    /// `verify_with_multi_table_lookup` pair. Mirrors the native
+    /// transcript schedule of pin §2.2 byte-for-byte at the scalar-
+    /// sequence layer per pin §2.4 (the underlying RO2 Poseidon byte
+    /// encoding differs across the BN256/Grumpkin cycle, so equivalence
+    /// is asserted on the ordered (op, scalar) tuple sequence, not on
+    /// raw bytes).
+    ///
+    /// ```text
+    ///   ro.absorb(pp_digest)
+    ///   U2.absorb_in_ro
+    ///   for j in 0..k:                           // pin §2.2 Step 2
+    ///     comm_L_pub[j].absorb_in_ro
+    ///     for cv in comm_values_pub[j]: cv.absorb_in_ro
+    ///     comm_ts_pub[j].absorb_in_ro
+    ///   ro.squeeze() -> tau                      // Step 3
+    ///   comm_E.absorb_in_ro                      // Step 3
+    ///   ro.squeeze() -> rho                      // Step 4
+    ///   for j in 0..k:                           // Step 5a (gated)
+    ///     if !comm_values_pub[j].is_empty():
+    ///       ro.squeeze() -> alpha_j
+    ///   for j in 0..k:                           // Step 5b
+    ///     ro.squeeze() -> r_logup_j
+    ///   for j in 0..k: comm_inv_w[j].absorb_in_ro    // Step 6
+    ///   for j in 0..k: comm_inv_t[j].absorb_in_ro    // Step 6
+    ///   poly.check_poly_zero_poly_one_with(T)        // Step 7 (R1CS-side)
+    ///   for j in 0..k:                               // Step 8
+    ///     poly_lookup[j].check_poly_zero_poly_one_with(t_lookup_running[j])
+    ///   poly.absorb_in_ro                            // Step 7
+    ///   for j in 0..k: poly_lookup[j].absorb_in_ro   // Step 8
+    ///   ro.squeeze() -> r_b                          // Step 9
+    /// ```
+    ///
+    /// Constant-shape verifier per pin §1.5.4 (P1): always synthesises
+    /// `k` tables' worth of FS absorptions, commitment-decode
+    /// constraints, `r_logup_j` squeezes, and `poly_lookup_j`
+    /// (C)-binding checks. There is no `present_mask` to branch on —
+    /// absent tables are structurally indistinguishable from "queried
+    /// with all-zero values" at the FS-transcript and (C)-binding
+    /// layer.
+    ///
+    /// Per-table (C)-binding `poly_lookup_j(0) + poly_lookup_j(1) ==
+    /// t_lookup_running_j` is enforced per-table per pin §1.3
+    /// (load-bearing soundness check; closes the cross-table
+    /// cancellation forgery vector).
+    ///
+    /// `t_lookup_running_per_table` is the lookup-side running target
+    /// VECTOR projected from the running instance (cf. native
+    /// `lookup_running_claims_from`). Its length MUST equal `k =
+    /// lookups.k() = public_bundles.len()`. At outer base, all entries
+    /// are zero.
+    ///
+    /// `comm_values_pub` lengths per-table MUST match the structurally
+    /// pinned `multi_column_tables[j].columns.len()` — the caller is
+    /// responsible for that allocation; this method does not
+    /// branch on the size (it simply iterates the supplied slice).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_with_multi_table_lookup<CS: ConstraintSystem<E::Scalar>>(
+      &self,
+      mut cs: CS,
+      pp_digest: &AllocatedNum<E::Scalar>,
+      U1: &AllocatedFoldedInstance<E>,
+      U2: &AllocatedNonnativeR1CSInstance<E>,
+      lookups: &AllocatedLookupNIFSMultiTable<E>,
+      public_bundles: &[AllocatedLookupPayloadPublicMultiTable<E>],
+      t_lookup_running_per_table: &[AllocatedNum<E::Scalar>],
+      comm_W_fold: &AllocatedNonnativePoint<E>,
+      comm_E_fold: &AllocatedNonnativePoint<E>,
+      ro_consts: RO2ConstantsCircuit<E>,
+    ) -> Result<LookupVerifyOutputMultiTable<E>, SynthesisError> {
+      // --- Sanity: per-table count must agree across all four inputs ---
+      let k = lookups.k();
+      if public_bundles.len() != k
+        || t_lookup_running_per_table.len() != k
+        || lookups.comm_inv_w.len() != k
+        || lookups.comm_inv_t.len() != k
+      {
+        return Err(SynthesisError::Unsatisfiable(format!(
+          "verify_with_multi_table_lookup: per-table count mismatch \
+           (k={k}, public_bundles={}, t_lookup_running={}, comm_inv_w={}, comm_inv_t={})",
+          public_bundles.len(),
+          t_lookup_running_per_table.len(),
+          lookups.comm_inv_w.len(),
+          lookups.comm_inv_t.len(),
+        )));
+      }
+
+      let mut ro = E::RO2Circuit::new(ro_consts);
+      ro.absorb(pp_digest);
+
+      U2.absorb_in_ro(cs.namespace(|| "absorb U2"), &mut ro)?;
+
+      // --- Step 2: per-table commitments BEFORE tau (pin §2.2) ---
+      // Order: ALL tables' comm_L → ALL tables' value columns (intra-
+      // table order preserved) → ALL tables' comm_ts. Outer loop over
+      // j (table-id ascending; caller-pinned).
+      for (j, b) in public_bundles.iter().enumerate() {
+        b.comm_L.absorb_in_ro(
+          cs.namespace(|| format!("absorb comm_L[{}]", j)),
+          &mut ro,
+        )?;
+        for (i, cv) in b.comm_values.iter().enumerate() {
+          cv.absorb_in_ro(
+            cs.namespace(|| format!("absorb comm_values[{}][{}]", j, i)),
+            &mut ro,
+          )?;
+        }
+        b.comm_ts.absorb_in_ro(
+          cs.namespace(|| format!("absorb comm_ts[{}]", j)),
+          &mut ro,
+        )?;
+      }
+
+      // --- Step 3: tau (single shared R1CS-side challenge) ---
+      let _tau = ro.squeeze(cs.namespace(|| "tau"), NUM_CHALLENGE_BITS, false)?;
+
+      // Absorb comm_E from the NIFS message.
+      self
+        .comm_E
+        .absorb_in_ro(cs.namespace(|| "absorb comm_E"), &mut ro)?;
+
+      // --- Step 4: rho (single shared R1CS / lookup batching challenge) ---
+      let rho_bits = ro.squeeze(cs.namespace(|| "rho_bits"), NUM_CHALLENGE_BITS, false)?;
+      let rho = le_bits_to_num(cs.namespace(|| "rho"), &rho_bits)?;
+
+      // --- Step 5a: per-table alpha_j (gated on c_j > 0 per pin §2.2) ---
+      // Per pin §2.2 step 5a, tables with empty value columns skip the
+      // squeeze, preserving Stage I-pri's per-table c=0 byte-equivalence.
+      // The verifier does not USE alpha_j directly (the combined-witness
+      // identity is reconstructed implicitly via the FS-bound transcript);
+      // what matters is that the squeeze fires per-bundle to advance the
+      // RO state in lockstep with the prover.
+      for (j, b) in public_bundles.iter().enumerate() {
+        if !b.comm_values.is_empty() {
+          let _alpha_j = ro.squeeze(
+            cs.namespace(|| format!("alpha_bits[{}]", j)),
+            NUM_CHALLENGE_BITS,
+            false,
+          )?;
+        }
+      }
+
+      // --- Step 5b: per-table r_logup_j (one squeeze per table) ---
+      // The verifier doesn't use r_logup_j directly (the LogUp identity
+      // is proven by the prover-supplied `poly_lookup_j` and the
+      // (C)-binding check below); the squeezes advance the RO state.
+      for j in 0..k {
+        let _r_logup_j = ro.squeeze(
+          cs.namespace(|| format!("r_logup_bits[{}]", j)),
+          NUM_CHALLENGE_BITS,
+          false,
+        )?;
+      }
+
+      // --- Step 6: per-table inverse-witness commitments ---
+      // Order: ALL tables' comm_inv_w → ALL tables' comm_inv_t (NOT
+      // interleaved per-table; matches native M.4 step 6 pair-grouping).
+      for (j, c) in lookups.comm_inv_w.iter().enumerate() {
+        c.absorb_in_ro(
+          cs.namespace(|| format!("absorb comm_inv_w[{}]", j)),
+          &mut ro,
+        )?;
+      }
+      for (j, c) in lookups.comm_inv_t.iter().enumerate() {
+        c.absorb_in_ro(
+          cs.namespace(|| format!("absorb comm_inv_t[{}]", j)),
+          &mut ro,
+        )?;
+      }
+
+      // --- Step 7: R1CS-side (C)-binding poly(0)+poly(1) = T ---
+      let T = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS T"), || {
+        let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let U1_T = U1.T.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(U1_T * (E::Scalar::ONE - rho_v))
+      })?;
+      cs.enforce(
+        || "enforce R1CS T = (1-rho) * U1.T",
+        |lc| lc + U1.T.get_variable(),
+        |lc| lc + CS::one() - rho.get_variable(),
+        |lc| lc + T.get_variable(),
+      );
+
+      self
+        .poly
+        .check_poly_zero_poly_one_with(cs.namespace(|| "R1CS poly(0)+poly(1) = T"), &T)?;
+
+      // --- Step 8: per-table lookup-side (C)-binding (pin §1.3) ---
+      // Per pin §1.3 the per-table (C)-binding
+      // `poly_lookup_j(0) + poly_lookup_j(1) == t_lookup_running_j` is
+      // the VECTOR running-claim invariant. Cross-table cancellation
+      // forgery is closed STRUCTURALLY here: any single table's binding
+      // failure rejects the whole fold step regardless of whether some
+      // hypothetical SUM-aggregate would have cancelled.
+      for (j, poly_lookup_j) in lookups.poly_lookup.iter().enumerate() {
+        poly_lookup_j.check_poly_zero_poly_one_with(
+          cs.namespace(|| format!("lookup poly(0)+poly(1) = t_lookup_running[{}]", j)),
+          &t_lookup_running_per_table[j],
+        )?;
+      }
+
+      // --- Absorb polynomials in transcript: R1CS first, then per-table lookup ---
+      self.poly.absorb_in_ro(&mut ro);
+      for poly_lookup_j in &lookups.poly_lookup {
+        poly_lookup_j.absorb_in_ro(&mut ro);
+      }
+
+      // --- Step 9: r_b (single fold randomness shared across all instances) ---
+      let r_b_bits = ro.squeeze(cs.namespace(|| "r_b_bits"), NUM_CHALLENGE_BITS, false)?;
+      let r_b = le_bits_to_num(cs.namespace(|| "r_b"), &r_b_bits)?;
+
+      // --- R1CS T_out: T_out * eq(rho, r_b) = poly(r_b) ---
+      let eq_rho_r_b_one = AllocatedNum::alloc(
+        cs.namespace(|| "allocate R1CS eq_rho_r_b_one"),
+        || {
+          let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          let r_b_v = r_b.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+          Ok((E::Scalar::ONE - rho_v) * (E::Scalar::ONE - r_b_v))
+        },
+      )?;
+      cs.enforce(
+        || "R1CS eq_rho_r_b_one = (1-rho)(1-r_b)",
+        |lc| lc + CS::one() - rho.get_variable(),
+        |lc| lc + CS::one() - r_b.get_variable(),
+        |lc| lc + eq_rho_r_b_one.get_variable(),
+      );
+
+      let eq_rho_r_b = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS eq_rho_r_b"), || {
+        let rho_v = rho.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        let r_b_v = r_b.get_value().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok((E::Scalar::ONE - rho_v) * (E::Scalar::ONE - r_b_v) + rho_v * r_b_v)
+      })?;
+      cs.enforce(
+        || "R1CS eq_rho_r_b = (1-rho)(1-r_b) + rho*r_b",
+        |lc| lc + rho.get_variable(),
+        |lc| lc + r_b.get_variable(),
+        |lc| lc + eq_rho_r_b.get_variable() - eq_rho_r_b_one.get_variable(),
+      );
+
+      let r1cs_eval = self.poly.evaluate(cs.namespace(|| "R1CS eval(r_b)"), &r_b)?;
+      let T_out = AllocatedNum::alloc(cs.namespace(|| "allocate R1CS T_out"), || {
+        let eval = r1cs_eval
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?;
+        let eq_inv = eq_rho_r_b
+          .get_value()
+          .ok_or(SynthesisError::AssignmentMissing)?
+          .invert()
+          .unwrap();
+        Ok(eval * eq_inv)
+      })?;
+      cs.enforce(
+        || "enforce R1CS T_out * eq_rho_r_b = eval(r_b)",
+        |lc| lc + T_out.get_variable(),
+        |lc| lc + eq_rho_r_b.get_variable(),
+        |lc| lc + r1cs_eval.get_variable(),
+      );
+
+      // --- Per-table T_lookup_out_j (VECTOR per pin §1.3) ---
+      // Reuse the same eq_rho_r_b across all per-table evaluations
+      // (FS-rebinding requires same rho, same r_b — pin §2.2 step 9).
+      let mut t_lookup_out_per_table: Vec<AllocatedNum<E::Scalar>> = Vec::with_capacity(k);
+      for (j, poly_lookup_j) in lookups.poly_lookup.iter().enumerate() {
+        let lookup_eval_j = poly_lookup_j.evaluate(
+          cs.namespace(|| format!("lookup eval[{}](r_b)", j)),
+          &r_b,
+        )?;
+        let t_lookup_out_j = AllocatedNum::alloc(
+          cs.namespace(|| format!("allocate T_lookup_out[{}]", j)),
+          || {
+            let eval = lookup_eval_j
+              .get_value()
+              .ok_or(SynthesisError::AssignmentMissing)?;
+            let eq_inv = eq_rho_r_b
+              .get_value()
+              .ok_or(SynthesisError::AssignmentMissing)?
+              .invert()
+              .unwrap();
+            Ok(eval * eq_inv)
+          },
+        )?;
+        cs.enforce(
+          || format!("enforce T_lookup_out[{}] * eq_rho_r_b = lookup eval[{}](r_b)", j, j),
+          |lc| lc + t_lookup_out_j.get_variable(),
+          |lc| lc + eq_rho_r_b.get_variable(),
+          |lc| lc + lookup_eval_j.get_variable(),
+        );
+        t_lookup_out_per_table.push(t_lookup_out_j);
+      }
+
+      // --- Fold the R1CS-zero instance ---
+      // (lookup-side instance fold is the augmented circuit's
+      // responsibility via the next-step Nova hash; the per-table
+      // T_lookup_out vector flows through the augmented public IO.)
+      let U_fold = U1.fold(
+        cs.namespace(|| "fold R1CS"),
+        U2,
+        &r_b,
+        &T_out,
+        comm_W_fold,
+        comm_E_fold,
+      )?;
+
+      Ok(LookupVerifyOutputMultiTable {
+        U_fold,
+        T_lookup_out_per_table: t_lookup_out_per_table,
+      })
+    }
+  }
+
+  /// Result of [`AllocatedNIFS::verify_with_multi_table_lookup`]: the
+  /// folded R1CS-zero instance and the next-step lookup-zero running
+  /// target VECTOR (one entry per registered table). The augmented
+  /// circuit attaches `T_lookup_out_per_table` to its public-input hash
+  /// per pin §1.3 (T_lookup is a Vec<E::Scalar> in `FoldedInstance`).
+  pub struct LookupVerifyOutputMultiTable<E: Engine> {
+    pub U_fold: AllocatedFoldedInstance<E>,
+    pub T_lookup_out_per_table: Vec<AllocatedNum<E::Scalar>>,
   }
 }
 
 #[cfg(feature = "lookup-fold")]
 #[allow(unused_imports)]
-pub use lookup_verify::LookupVerifyOutput;
+pub use lookup_verify::{LookupVerifyOutput, LookupVerifyOutputMultiTable};

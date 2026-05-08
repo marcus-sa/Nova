@@ -200,6 +200,113 @@ impl<E: Engine> AllocatedLookupNIFS<E> {
   }
 }
 
+/// In-circuit representation of the multi-table lookup-side NIFS message
+/// (GH-#2 M.6, design pin §5.1).
+///
+/// Companion to [`AllocatedLookupNIFS`] for the multi-table verifier
+/// surface. Carries `k` per-table entries — the `k` `poly_lookup_j`
+/// polynomials and the `2k` per-table inverse-witness commitments — that
+/// the native [`NIFS`] populates under `--features lookup-fold` when
+/// `prove_with_multi_table_lookup_inner` is invoked.
+///
+/// The single-table multi-column projection (the existing
+/// [`AllocatedLookupNIFS`]) reads entry `[0]` of these vectors; the
+/// multi-table allocation here owns the full per-table vector for the
+/// per-table loop in [`super::AllocatedNIFS::verify_with_multi_table_lookup`].
+pub struct AllocatedLookupNIFSMultiTable<E: Engine> {
+  /// Per-table lookup-side polynomial (one entry per registered table,
+  /// in `table_id`-ascending order per pin §2.2).
+  pub(crate) poly_lookup: Vec<AllocatedUniPoly<E>>,
+  /// Per-table inverse-witness commitment for `1/(w_j + r)`.
+  pub(crate) comm_inv_w: Vec<AllocatedNonnativePoint<E>>,
+  /// Per-table inverse-table commitment for `1/(T_j + r)`.
+  pub(crate) comm_inv_t: Vec<AllocatedNonnativePoint<E>>,
+}
+
+impl<E: Engine> AllocatedLookupNIFSMultiTable<E> {
+  /// Allocate from an optional native `NIFS<E>` carrying multi-table
+  /// lookup data.
+  ///
+  /// `k` is the structurally-pinned table count
+  /// (`LookupShape::multi_column_tables.len()`). The constructor
+  /// allocates `k` `poly_lookup` entries at degree
+  /// [`LOOKUP_POLY_DEGREE`] and `k` per-table inverse-witness/
+  /// inverse-table commitments. If `nifs` is `Some`, its
+  /// `poly_lookup` / `comm_inv_w` / `comm_inv_t` fields MUST be `Some`
+  /// AND have length `k` (otherwise this is a degenerate NIFS that does
+  /// not carry a multi-table payload — caller error). At synthesis time
+  /// without a hint (`nifs = None`), the entries default to zero.
+  pub fn alloc<CS: ConstraintSystem<E::Scalar>>(
+    mut cs: CS,
+    nifs: Option<&NIFS<E>>,
+    k: usize,
+  ) -> Result<Self, SynthesisError> {
+    let poly_lookup = (0..k)
+      .map(|j| {
+        AllocatedUniPoly::alloc(
+          cs.namespace(|| format!("allocate poly_lookup[{}]", j)),
+          LOOKUP_POLY_DEGREE,
+          nifs
+            .and_then(|n| n.poly_lookup.as_ref())
+            .and_then(|v| v.get(j)),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    let comm_inv_w = (0..k)
+      .map(|j| {
+        AllocatedNonnativePoint::alloc(
+          cs.namespace(|| format!("allocate comm_inv_w[{}]", j)),
+          nifs
+            .and_then(|n| n.comm_inv_w.as_ref())
+            .and_then(|v| v.get(j))
+            .map(|c| c.to_coordinates()),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    let comm_inv_t = (0..k)
+      .map(|j| {
+        AllocatedNonnativePoint::alloc(
+          cs.namespace(|| format!("allocate comm_inv_t[{}]", j)),
+          nifs
+            .and_then(|n| n.comm_inv_t.as_ref())
+            .and_then(|v| v.get(j))
+            .map(|c| c.to_coordinates()),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Self {
+      poly_lookup,
+      comm_inv_w,
+      comm_inv_t,
+    })
+  }
+
+  /// Number of registered tables (k).
+  pub fn k(&self) -> usize {
+    self.poly_lookup.len()
+  }
+}
+
+/// In-circuit projection of [`crate::neutron::relation::LookupPayloadPublicMultiTable`]
+/// — the per-step public lookup-witness commitments for one table
+/// (GH-#2 M.6).
+///
+/// The verifier consumes a `&[AllocatedLookupPayloadPublicMultiTable<E>]`
+/// of length `k` (the structurally-pinned table count), in
+/// `table_id`-ascending order per pin §2.2.
+pub struct AllocatedLookupPayloadPublicMultiTable<E: Engine> {
+  /// Per-step lookup-witness commitment for the table's address column.
+  pub comm_L: AllocatedNonnativePoint<E>,
+  /// Per-step value-column commitments (Lasso §6.2). Empty for the
+  /// single-column degenerate path (pin §2.2 step 5a empty-skip rule).
+  pub comm_values: Vec<AllocatedNonnativePoint<E>>,
+  /// Per-step multiplicity-vector commitment.
+  pub comm_ts: AllocatedNonnativePoint<E>,
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -790,6 +897,469 @@ mod tests {
       circuit_t_lookup_out, native_t_lookup_out,
       "Stage I-pri FS-rebinding: in-circuit multi-column T_lookup_out \
        must equal native verify_step output"
+    );
+  }
+
+  /// GH-#2 M.6: in-circuit `verify_with_multi_table_lookup` mirrors the
+  /// native multi-table transcript at the scalar-sequence layer (per
+  /// pin §2.4) for `k = 2` registered tables. The resulting per-table
+  /// in-circuit `T_lookup_out_per_table` must equal the native
+  /// `verify_with_multi_table_lookup` per-table outputs computed from
+  /// the same transcript replay.
+  ///
+  /// This is the gating regression test for M.6 per dispatch §3.
+  /// It mirrors `stage_i_pri_in_circuit_verify_multi_column_matches_native`,
+  /// extended to two structurally-pinned tables (per pin §1.2 list-of-
+  /// instances composition). Both tables are queried at this fold step
+  /// (no absent shape) — the absent-table differential is M.8 territory
+  /// per dispatch.
+  #[test]
+  fn m6_in_circuit_verify_multi_table_matches_native_k2() {
+    use super::AllocatedLookupNIFSMultiTable;
+    use crate::neutron::circuit::lookup::AllocatedLookupPayloadPublicMultiTable;
+    use crate::neutron::nifs::PerTableBundle;
+    use crate::neutron::relation::{LookupPayload, LookupPayloadPublicMultiTable};
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0x1A55_E5A6_C1B2_F006);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // Build a small R1CS shape (mirrors the M.4 k=2 fixture and the
+    // single-table multi-column in-circuit test).
+    let num_cons: usize = 32;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut shape_cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut shape_cs);
+    let shape = shape_cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // Two homogeneous-size random tables: n_1 = n_2 = 16, each with 1
+    // value column. Random table contents pinned via ChaCha20Rng.
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let t1_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+    let t2_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+
+    let identity: Vec<Scalar> = (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm_t1 = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+    let identity_comm_t2 = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![
+        LookupTableHandle {
+          table_id: 0,
+          size: table_size,
+          commitment: identity_comm_t1,
+        },
+        LookupTableHandle {
+          table_id: 1,
+          size: table_size,
+          commitment: identity_comm_t2,
+        },
+      ],
+      multi_column_tables: vec![
+        MultiColumnLookupTable {
+          table_id: 0,
+          size: table_size,
+          columns: vec![t1_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t1_col0, &Scalar::ZERO)],
+        },
+        MultiColumnLookupTable {
+          table_id: 1,
+          size: table_size,
+          columns: vec![t2_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t2_col0, &Scalar::ZERO)],
+        },
+      ],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: table_log2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // Satisfying R1CS instance.
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut sat_cs = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut sat_cs);
+    let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2 = W2.pad(&shape);
+
+    // Outer-base running state (per-table T_lookup_running = 0).
+    let running_W = FoldedWitness::default(&str_local);
+    let running_U = FoldedInstance::default(&str_local);
+
+    // Build a satisfying multi-column witness pool for one table, with
+    // distinct query indices per table to make the per-table threading
+    // observable (a buggy implementation that aliased per-table state
+    // would surface as scalar-sequence divergence).
+    let build_satisfying_witness =
+      |table: &[Scalar], query_indices: &[usize]| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let mut witness_addr = vec![Scalar::ZERO; table_size];
+        let mut witness_v0 = vec![Scalar::ZERO; table_size];
+        let mut multiplicities = vec![Scalar::ZERO; table_size];
+        for (i, &idx) in query_indices.iter().enumerate() {
+          witness_addr[i] = Scalar::from(idx as u64);
+          witness_v0[i] = table[idx];
+          multiplicities[idx] += Scalar::ONE;
+        }
+        for i in query_indices.len()..table_size {
+          witness_addr[i] = Scalar::from(0u64);
+          witness_v0[i] = table[0];
+          multiplicities[0] += Scalar::ONE;
+        }
+        (witness_addr, witness_v0, multiplicities)
+      };
+
+    let queries_t1 = [0usize, 3, 7, 15];
+    let queries_t2 = [1usize, 5, 9, 14];
+    let (wa_1, wv_1, m_1) = build_satisfying_witness(&t1_col0, &queries_t1);
+    let (wa_2, wv_2, m_2) = build_satisfying_witness(&t2_col0, &queries_t2);
+
+    let comm_addr_1 = <E as Engine>::CE::commit(&ck, &wa_1, &Scalar::ZERO);
+    let comm_v0_1 = <E as Engine>::CE::commit(&ck, &wv_1, &Scalar::ZERO);
+    let comm_ts_1 = <E as Engine>::CE::commit(&ck, &m_1, &Scalar::ZERO);
+    let comm_addr_2 = <E as Engine>::CE::commit(&ck, &wa_2, &Scalar::ZERO);
+    let comm_v0_2 = <E as Engine>::CE::commit(&ck, &wv_2, &Scalar::ZERO);
+    let comm_ts_2 = <E as Engine>::CE::commit(&ck, &m_2, &Scalar::ZERO);
+
+    let payload_1 = LookupPayload::<E> {
+      comm_L: comm_addr_1,
+      comm_ts: comm_ts_1,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v0_1],
+    };
+    let payload_2 = LookupPayload::<E> {
+      comm_L: comm_addr_2,
+      comm_ts: comm_ts_2,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v0_2],
+    };
+
+    // Per-table eq polynomials (dimensions match the per-table
+    // hypercube of size n_j, per pin §1.2 list-of-instances).
+    let per_table_log2 = table_log2;
+    let ell1 = per_table_log2.div_ceil(2);
+    let ell2 = per_table_log2 / 2;
+    let per_table_w_left = 1usize << ell1;
+    let per_table_w_right = 1usize << ell2;
+    let per_table_t_left = per_table_w_left;
+    let per_table_t_right = per_table_w_right;
+
+    let mk_eqs =
+      |rng: &mut ChaCha20Rng| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let tau_w = Scalar::random(&mut *rng);
+        let pow_w = PowPolynomial::new(&tau_w, per_table_log2);
+        let combined_w = pow_w.split_evals(per_table_w_left, per_table_w_right);
+        let (eq_w_left, eq_w_right) = combined_w.split_at(per_table_w_left);
+        let tau_t = Scalar::random(&mut *rng);
+        let pow_t = PowPolynomial::new(&tau_t, per_table_log2);
+        let combined_t_eq = pow_t.split_evals(per_table_t_left, per_table_t_right);
+        let (eq_t_left, eq_t_right) = combined_t_eq.split_at(per_table_t_left);
+        (
+          eq_w_left.to_vec(),
+          eq_w_right.to_vec(),
+          eq_t_left.to_vec(),
+          eq_t_right.to_vec(),
+        )
+      };
+    let (eq_w1l, eq_w1r, eq_t1l, eq_t1r) = mk_eqs(&mut rng);
+    let (eq_w2l, eq_w2r, eq_t2l, eq_t2r) = mk_eqs(&mut rng);
+
+    let mk_running_lw = || LookupRunningWitness::<E> {
+      witness: vec![Scalar::ZERO; table_size],
+      inv_w: vec![Scalar::ZERO; table_size],
+      table: vec![Scalar::ZERO; table_size],
+      multiplicities: vec![Scalar::ZERO; table_size],
+      inv_t: vec![Scalar::ZERO; table_size],
+      eq_w_left: vec![Scalar::ZERO; per_table_w_left],
+      eq_w_right: vec![Scalar::ZERO; per_table_w_right],
+      eq_t_left: vec![Scalar::ZERO; per_table_t_left],
+      eq_t_right: vec![Scalar::ZERO; per_table_t_right],
+    };
+
+    let bundle_1 = PerTableBundle::<E> {
+      table_id: 0,
+      payload: payload_1.clone(),
+      fresh_witness_address: wa_1,
+      fresh_witness_value_columns: vec![wv_1],
+      fresh_multiplicities: m_1,
+      fresh_eq_w_left: eq_w1l,
+      fresh_eq_w_right: eq_w1r,
+      fresh_eq_t_left: eq_t1l,
+      fresh_eq_t_right: eq_t1r,
+      running_lw: mk_running_lw(),
+    };
+    let bundle_2 = PerTableBundle::<E> {
+      table_id: 1,
+      payload: payload_2.clone(),
+      fresh_witness_address: wa_2,
+      fresh_witness_value_columns: vec![wv_2],
+      fresh_multiplicities: m_2,
+      fresh_eq_w_left: eq_w2l,
+      fresh_eq_w_right: eq_w2r,
+      fresh_eq_t_left: eq_t2l,
+      fresh_eq_t_right: eq_t2r,
+      running_lw: mk_running_lw(),
+    };
+
+    // --- Native prove + verify (M.3 + M.4) ---
+    let (nifs, _, _) = NIFS::<E>::prove_with_multi_table_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str_local,
+      &running_U,
+      &running_W,
+      &U2,
+      &W2,
+      &[bundle_1.clone(), bundle_2.clone()],
+    )
+    .expect("k=2 multi-table prove must succeed");
+
+    // M.4 verifier — produces the per-table T_lookup_out values that
+    // the in-circuit M.6 verifier MUST match scalar-for-scalar.
+    let public_bundles_native = vec![
+      LookupPayloadPublicMultiTable::<E> {
+        table_id: 0,
+        comm_L: bundle_1.payload.comm_L,
+        comm_values: bundle_1.payload.comm_values.clone(),
+        comm_ts: bundle_1.payload.comm_ts,
+      },
+      LookupPayloadPublicMultiTable::<E> {
+        table_id: 1,
+        comm_L: bundle_2.payload.comm_L,
+        comm_values: bundle_2.payload.comm_values.clone(),
+        comm_ts: bundle_2.payload.comm_ts,
+      },
+    ];
+    let _verified_U_native = nifs
+      .verify_with_multi_table_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &running_U,
+        &U2,
+        &public_bundles_native,
+      )
+      .expect("k=2 native multi-table verify must succeed");
+
+    // --- Replay the FS transcript using the in-circuit's single-IO U2
+    // absorption pattern (same caveat as the Stage G / I-pri tests:
+    // augmented circuit absorbs only U2.X[0], whereas native R1CSInstance
+    // absorbs ALL X). The in-circuit verifier's transcript thus matches
+    // a "single-IO native replay" rather than the production
+    // verify_with_multi_table_lookup's transcript directly. This is the
+    // pin §2.4 byte-equivalence layer: scalar-sequence equality across
+    // the in-circuit-aligned native replay. ---
+    use crate::{
+      constants::NUM_CHALLENGE_BITS,
+      neutron::lookup_sumcheck::lookup_running_claims_from,
+      spartan::polys::univariate::UniPoly,
+      traits::{AbsorbInRO2Trait, ROTrait},
+    };
+
+    let comm_inv_w_vec = nifs.comm_inv_w.as_ref().unwrap();
+    let comm_inv_t_vec = nifs.comm_inv_t.as_ref().unwrap();
+    let poly_lookup_vec = nifs.poly_lookup.as_ref().unwrap();
+    assert_eq!(comm_inv_w_vec.len(), 2);
+    assert_eq!(comm_inv_t_vec.len(), 2);
+    assert_eq!(poly_lookup_vec.len(), 2);
+
+    let mut ro = <E as Engine>::RO2::new(ro_consts.clone());
+    ro.absorb(pp_digest);
+    U2.comm_W.absorb_in_ro2(&mut ro);
+    ro.absorb(U2.X[0]);
+    // Step 2: per-table commitments BEFORE tau, in `table_id`-ascending
+    // order per pin §2.2.
+    for b in &public_bundles_native {
+      b.comm_L.absorb_in_ro2(&mut ro);
+      for cv in &b.comm_values {
+        cv.absorb_in_ro2(&mut ro);
+      }
+      b.comm_ts.absorb_in_ro2(&mut ro);
+    }
+    // Step 3: tau.
+    let _tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    nifs.comm_E.absorb_in_ro2(&mut ro);
+    // Step 4: rho.
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    // Step 5a: per-table alpha (gated on c_j > 0). Both tables have one
+    // value column, so both squeezes fire.
+    for b in &public_bundles_native {
+      if !b.comm_values.is_empty() {
+        let _alpha_j = ro.squeeze(NUM_CHALLENGE_BITS, false);
+      }
+    }
+    // Step 5b: per-table r_logup.
+    for _ in 0..2 {
+      let _r_logup_j = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    }
+    // Step 6: per-table inverse-witness commitments (batched).
+    for c in comm_inv_w_vec {
+      c.absorb_in_ro2(&mut ro);
+    }
+    for c in comm_inv_t_vec {
+      c.absorb_in_ro2(&mut ro);
+    }
+    // Step 7: R1CS-side poly absorb.
+    <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&nifs.poly, &mut ro);
+    // Step 8: per-table poly_lookup absorb.
+    for poly_lookup_j in poly_lookup_vec {
+      <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup_j, &mut ro);
+    }
+    // Step 9: r_b.
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // Compute the per-table T_lookup_out_j natively from the same
+    // transcript replay (per pin §1.3 VECTOR composition). Outer base
+    // → all per-table running scalars are zero.
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(&running_U);
+    assert!(
+      t_lookup_running_vec.is_empty(),
+      "outer base running U must have empty per-table vector"
+    );
+    let native_t_lookup_out_per_table: Vec<Scalar> = (0..2)
+      .map(|j| {
+        let t_lookup_running_j = t_lookup_running_vec
+          .get(j)
+          .copied()
+          .unwrap_or(Scalar::ZERO);
+        LookupSumcheckInstance::<E>::verify_step(
+          &rho,
+          &r_b,
+          &poly_lookup_vec[j],
+          &t_lookup_running_j,
+        )
+        .expect("native verify_step per table must succeed")
+      })
+      .collect();
+
+    // --- In-circuit verify_with_multi_table_lookup ---
+    let mut cs = TestConstraintSystem::<Scalar>::new();
+    let pp_digest_alloc =
+      AllocatedNum::alloc(cs.namespace(|| "pp_digest"), || Ok(pp_digest)).unwrap();
+    let U1_alloc =
+      AllocatedFoldedInstance::<E>::alloc(cs.namespace(|| "U1"), Some(&running_U)).unwrap();
+    let U2_alloc =
+      AllocatedNonnativeR1CSInstance::<E>::alloc(cs.namespace(|| "U2"), Some(&U2)).unwrap();
+    let allocated_nifs =
+      AllocatedNIFS::<E>::alloc(cs.namespace(|| "allocate nifs"), Some(&nifs), 5).unwrap();
+    let allocated_lookups = AllocatedLookupNIFSMultiTable::<E>::alloc(
+      cs.namespace(|| "allocate multi-table lookup nifs"),
+      Some(&nifs),
+      2,
+    )
+    .unwrap();
+
+    // Build per-table public bundles (allocated form).
+    let mk_public_bundle = |cs: &mut TestConstraintSystem<Scalar>,
+                            tag: &str,
+                            payload: &LookupPayload<E>|
+     -> AllocatedLookupPayloadPublicMultiTable<E> {
+      let comm_L = AllocatedNonnativePoint::<E>::alloc(
+        cs.namespace(|| format!("{tag} comm_L pub")),
+        Some(payload.comm_L.to_coordinates()),
+      )
+      .unwrap();
+      let comm_values: Vec<_> = payload
+        .comm_values
+        .iter()
+        .enumerate()
+        .map(|(i, cv)| {
+          AllocatedNonnativePoint::<E>::alloc(
+            cs.namespace(|| format!("{tag} comm_values[{}] pub", i)),
+            Some(cv.to_coordinates()),
+          )
+          .unwrap()
+        })
+        .collect();
+      let comm_ts = AllocatedNonnativePoint::<E>::alloc(
+        cs.namespace(|| format!("{tag} comm_ts pub")),
+        Some(payload.comm_ts.to_coordinates()),
+      )
+      .unwrap();
+      AllocatedLookupPayloadPublicMultiTable {
+        comm_L,
+        comm_values,
+        comm_ts,
+      }
+    };
+    let public_bundle_1 = mk_public_bundle(&mut cs, "table[0]", &payload_1);
+    let public_bundle_2 = mk_public_bundle(&mut cs, "table[1]", &payload_2);
+    let public_bundles_alloc = vec![public_bundle_1, public_bundle_2];
+
+    // Per-table running-target allocations (outer base → zero per
+    // pin §1.3).
+    let t_lookup_running_alloc: Vec<_> = (0..2)
+      .map(|j| alloc_zero(cs.namespace(|| format!("t_lookup_running[{}]", j))))
+      .collect();
+
+    let comm_W_fold =
+      AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_W_fold")).unwrap();
+    let comm_E_fold =
+      AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold")).unwrap();
+
+    let out = allocated_nifs
+      .verify_with_multi_table_lookup(
+        cs.namespace(|| "in-circuit verify_with_multi_table_lookup"),
+        &pp_digest_alloc,
+        &U1_alloc,
+        &U2_alloc,
+        &allocated_lookups,
+        &public_bundles_alloc,
+        &t_lookup_running_alloc,
+        &comm_W_fold,
+        &comm_E_fold,
+        ro_consts_circuit,
+      )
+      .expect("in-circuit multi-table verify must synthesise cleanly");
+
+    assert!(
+      cs.is_satisfied(),
+      "in-circuit multi-table verify must produce a satisfied constraint \
+       system; first unsatisfied: {:?}",
+      cs.which_is_unsatisfied()
+    );
+
+    assert_eq!(
+      out.T_lookup_out_per_table.len(),
+      2,
+      "M.6 in-circuit output must carry one T_lookup_out per registered table"
+    );
+
+    // Pin §2.4 / dispatch §3 gating assertion: in-circuit per-table
+    // T_lookup_out_j MUST equal the native per-table values computed
+    // from the equivalent (in-circuit-aligned) FS transcript replay.
+    for (j, native_v) in native_t_lookup_out_per_table.iter().enumerate() {
+      let circuit_v = out.T_lookup_out_per_table[j]
+        .get_value()
+        .unwrap_or_else(|| panic!("T_lookup_out[{}] witness must be assigned", j));
+      assert_eq!(
+        circuit_v, *native_v,
+        "M.6 FS-rebinding (k=2): in-circuit T_lookup_out[{}] must equal \
+         native verify_step output",
+        j
+      );
+    }
+
+    // Pin §1.3 VECTOR composition: per-table independent threading.
+    // With distinct query indices per table (queries_t1 ≠ queries_t2)
+    // and random table contents, the two per-table T_lookup_out values
+    // are overwhelmingly distinct. A buggy implementation that aliased
+    // per-table state would fail this.
+    assert_ne!(
+      native_t_lookup_out_per_table[0], native_t_lookup_out_per_table[1],
+      "per-table T_lookup_out values must thread independently"
     );
   }
 }
