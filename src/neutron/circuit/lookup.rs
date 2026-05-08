@@ -1378,4 +1378,543 @@ mod tests {
       "per-table T_lookup_out values must thread independently"
     );
   }
+
+  /// GH-#2 M.6.5 (Finding 1 discharge): in-circuit twin of the M.4 native
+  /// `m4_per_table_c_binding_hard_rejects_corrupted_t_lookup` regression
+  /// (`vendor/nova/src/neutron/nifs.rs:4650-5008`).
+  ///
+  /// **What this binds.** The §1.3 VECTOR (C)-invariant: for the multi-
+  /// table fold, the per-table running-claim binding
+  /// `poly_lookup_j(0) + poly_lookup_j(1) == t_lookup_running_j` MUST be
+  /// enforced **per-table inside the j loop** in the in-circuit verifier
+  /// (`circuit/nifs.rs:797-815`), NOT as a sum-aggregate across tables.
+  /// A sum-aggregate would admit cross-table cancellation forgery — table
+  /// 0 over-claims by `+Δ` while table 1 under-claims by `−Δ`. Per-table
+  /// in-circuit synthesis closes this STRUCTURALLY: a single-table
+  /// corruption is enough to sink the whole fold step regardless of any
+  /// hypothetical sum-cancellation arithmetic.
+  ///
+  /// **Construction (and the M.4 ↔ M.6 surface asymmetry).** The M.4
+  /// reference does TWO honest fold steps via the native multi-table
+  /// prover, then corrupts `folded_U_s1.T_lookup[1] += offset` in the
+  /// post-step-1 running U, and feeds the corrupt running U into the
+  /// step-2 native verifier. That construction does NOT translate
+  /// cleanly to the in-circuit surface, because:
+  ///
+  /// 1. The M.6 in-circuit verifier takes `t_lookup_running_per_table`
+  ///    as a SEPARATE parameter from `U1_alloc` (see
+  ///    `circuit/nifs.rs:660`); it does not extract the running scalars
+  ///    from the allocated folded instance. So the in-circuit corruption
+  ///    point is the allocation of `t_lookup_running_per_table`, not the
+  ///    `U1_alloc.T_lookup` field (which doesn't exist).
+  /// 2. The M.6 in-circuit verifier squeezes its FS challenges from a
+  ///    SINGLE-IO `U2` absorption pattern (it absorbs `U2.X[0]` only, not
+  ///    all `U2.X`; see the M.6 happy-path test commentary at lines
+  ///    1156-1163). This means in-circuit `rho` ≠ prover-native `rho`,
+  ///    so the R1CS-side (C)-binding `nifs.poly(0) + nifs.poly(1) ==
+  ///    (1−rho_v) * U1.T` is satisfied if and only if `U1.T == 0` (where
+  ///    both sides reduce to zero independently of `rho_v`). After a
+  ///    non-outer-base fold step the R1CS-side running scalar is in
+  ///    general non-zero, so a "step-1-then-corrupt-step-2" fixture
+  ///    fails the R1CS-side (C)-binding for an unrelated reason — the
+  ///    failing constraint is `R1CS poly(0)+poly(1) = T/eval at 0 + eval
+  ///    at 1 = c`, not the j=1 lookup-side (C)-binding. The test then
+  ///    cannot bind the §1.3 invariant via `cs.which_is_unsatisfied()`.
+  ///
+  /// The in-circuit-shaped equivalent is to build the SAME corruption
+  /// pattern at the OUTER-BASE layer: a single honest native multi-
+  /// table prove with `running_U = FoldedInstance::default()`, which
+  /// gives honest per-table `poly_lookup_j` values bound to per-table
+  /// running claims of zero (the outer-base running scalars). The
+  /// corrupt fixture allocates `t_lookup_running_per_table =
+  /// [Scalar::ZERO, offset]` (j=1 perturbed by `offset ≠ 0`), feeds it
+  /// into the in-circuit verifier, and observes the j=1 (C)-binding
+  /// constraint `poly_lookup_1(0) + poly_lookup_1(1) == 0` violated by
+  /// an exact `−offset`. The R1CS-side (C)-binding remains satisfied
+  /// because at outer base `U1.T = 0 ⇒ T_target = 0` regardless of
+  /// `rho_v`, so the single-IO mismatch is invisible there.
+  ///
+  /// This is structurally faithful to the M.4 corruption pattern: the
+  /// load-bearing piece is "k=2, perturb the j=1 running scalar by
+  /// `offset`, observe the j=1 (C)-binding rejects". The M.4 native
+  /// test's two-honest-fold-steps depth is instrumentation that the
+  /// native verifier supports but the in-circuit verifier doesn't —
+  /// without it, the test still binds the SAME §1.3 invariant.
+  ///
+  /// **Location-assertion shape.** Asserts BOTH `!cs.is_satisfied()`
+  /// AND that `cs.which_is_unsatisfied()` returns a path containing the
+  /// structural substrings
+  /// (a) `"lookup poly(0)+poly(1) = t_lookup_running[1]"` — the j=1
+  /// namespace at `circuit/nifs.rs:806`, AND
+  /// (b) `"eval at 0 + eval at 1 = c"` — the constraint name at
+  /// `circuit/univariate.rs:34-56`'s `check_poly_zero_poly_one_with`.
+  /// The two-substring form survives constraint-system reordering,
+  /// namespace-prefix renames, and Extract-Method refactors of
+  /// `verify_with_multi_table_lookup` — both substrings name structural
+  /// sites tied to the §1.3 (C)-binding invariant. Without the location
+  /// assertion the test could pass for the wrong reason (a downstream
+  /// consistency check catching the corruption indirectly), and would
+  /// not bind the §1.3 invariant.
+  ///
+  /// **Why this is not redundant with the M.4 native test.** The M.4
+  /// test exercises the native verifier path (`nifs.rs:1987-1990` per-
+  /// table (C)-binding check). The M.6 in-circuit verifier synthesises
+  /// an INDEPENDENT R1CS constraint via `check_poly_zero_poly_one_with`
+  /// (`circuit/nifs.rs:805-808` per j), and that R1CS constraint is
+  /// what the audit-firm engagement reviews for the in-circuit half of
+  /// the (C)-binding contract. The native test does not exercise the
+  /// in-circuit constraint allocator at all.
+  #[test]
+  fn m6_in_circuit_per_table_c_binding_hard_rejects_corrupted_t_lookup() {
+    use super::AllocatedLookupNIFSMultiTable;
+    use crate::neutron::circuit::lookup::AllocatedLookupPayloadPublicMultiTable;
+    use crate::neutron::nifs::PerTableBundle;
+    use crate::neutron::relation::LookupPayload;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1B2_F006_6500_C065);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // R1CS shape (mirrors the M.6 happy-path k=2 fixture).
+    let num_cons: usize = 32;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut shape_cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut shape_cs);
+    let shape = shape_cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // k = 2 homogeneous-size random tables: n_1 = n_2 = 16, each with 1
+    // value column.
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let t1_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+    let t2_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+
+    let identity: Vec<Scalar> = (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm_t1 = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+    let identity_comm_t2 = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![
+        LookupTableHandle {
+          table_id: 0,
+          size: table_size,
+          commitment: identity_comm_t1,
+        },
+        LookupTableHandle {
+          table_id: 1,
+          size: table_size,
+          commitment: identity_comm_t2,
+        },
+      ],
+      multi_column_tables: vec![
+        MultiColumnLookupTable {
+          table_id: 0,
+          size: table_size,
+          columns: vec![t1_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t1_col0, &Scalar::ZERO)],
+        },
+        MultiColumnLookupTable {
+          table_id: 1,
+          size: table_size,
+          columns: vec![t2_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t2_col0, &Scalar::ZERO)],
+        },
+      ],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: table_log2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // Satisfying R1CS instance for the (single) honest fold step.
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut sat_cs = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut sat_cs);
+    let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2 = W2.pad(&shape);
+
+    // Outer-base running state — both per-table running scalars are zero
+    // (per pin §1.3). Per the surface-asymmetry note in the doc-comment,
+    // the M.4 reference's "two honest fold steps" is instrumentation
+    // that the in-circuit verifier cannot sustain (single-IO U2
+    // absorption mismatch breaks the R1CS-side (C)-binding when
+    // `U1.T ≠ 0`); the §1.3 invariant is bound at the outer-base layer
+    // by perturbing the j=1 running scalar via the corrupt allocation.
+    let running_W = FoldedWitness::default(&str_local);
+    let running_U = FoldedInstance::default(&str_local);
+
+    let build_satisfying_witness =
+      |table: &[Scalar], query_indices: &[usize]| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let mut witness_addr = vec![Scalar::ZERO; table_size];
+        let mut witness_v0 = vec![Scalar::ZERO; table_size];
+        let mut multiplicities = vec![Scalar::ZERO; table_size];
+        for (i, &idx) in query_indices.iter().enumerate() {
+          witness_addr[i] = Scalar::from(idx as u64);
+          witness_v0[i] = table[idx];
+          multiplicities[idx] += Scalar::ONE;
+        }
+        for i in query_indices.len()..table_size {
+          witness_addr[i] = Scalar::from(0u64);
+          witness_v0[i] = table[0];
+          multiplicities[0] += Scalar::ONE;
+        }
+        (witness_addr, witness_v0, multiplicities)
+      };
+
+    // Distinct query indices per table, per the M.4 reference's
+    // queries_t1_step1 / queries_t2_step1 pattern. With distinct
+    // queries and random table contents, the per-table `poly_lookup_j`
+    // polynomials are genuinely independent — a buggy in-circuit
+    // verifier that aliased per-table state would surface here.
+    let queries_t1 = [1usize, 4, 9, 15];
+    let queries_t2 = [2usize, 5, 11, 14];
+    let (wa_1, wv_1, m_1) = build_satisfying_witness(&t1_col0, &queries_t1);
+    let (wa_2, wv_2, m_2) = build_satisfying_witness(&t2_col0, &queries_t2);
+
+    let comm_addr_1 = <E as Engine>::CE::commit(&ck, &wa_1, &Scalar::ZERO);
+    let comm_v0_1 = <E as Engine>::CE::commit(&ck, &wv_1, &Scalar::ZERO);
+    let comm_ts_1 = <E as Engine>::CE::commit(&ck, &m_1, &Scalar::ZERO);
+    let comm_addr_2 = <E as Engine>::CE::commit(&ck, &wa_2, &Scalar::ZERO);
+    let comm_v0_2 = <E as Engine>::CE::commit(&ck, &wv_2, &Scalar::ZERO);
+    let comm_ts_2 = <E as Engine>::CE::commit(&ck, &m_2, &Scalar::ZERO);
+
+    let payload_1 = LookupPayload::<E> {
+      comm_L: comm_addr_1,
+      comm_ts: comm_ts_1,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v0_1],
+    };
+    let payload_2 = LookupPayload::<E> {
+      comm_L: comm_addr_2,
+      comm_ts: comm_ts_2,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v0_2],
+    };
+
+    // Per-table eq polynomials (matches the M.6 happy-path layout).
+    let per_table_log2 = table_log2;
+    let ell1 = per_table_log2.div_ceil(2);
+    let ell2 = per_table_log2 / 2;
+    let per_table_w_left = 1usize << ell1;
+    let per_table_w_right = 1usize << ell2;
+    let per_table_t_left = per_table_w_left;
+    let per_table_t_right = per_table_w_right;
+
+    let mk_eqs =
+      |rng: &mut ChaCha20Rng| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let tau_w = Scalar::random(&mut *rng);
+        let pow_w = PowPolynomial::new(&tau_w, per_table_log2);
+        let combined_w = pow_w.split_evals(per_table_w_left, per_table_w_right);
+        let (eq_w_left, eq_w_right) = combined_w.split_at(per_table_w_left);
+        let tau_t = Scalar::random(&mut *rng);
+        let pow_t = PowPolynomial::new(&tau_t, per_table_log2);
+        let combined_t_eq = pow_t.split_evals(per_table_t_left, per_table_t_right);
+        let (eq_t_left, eq_t_right) = combined_t_eq.split_at(per_table_t_left);
+        (
+          eq_w_left.to_vec(),
+          eq_w_right.to_vec(),
+          eq_t_left.to_vec(),
+          eq_t_right.to_vec(),
+        )
+      };
+    let (eq_w1l, eq_w1r, eq_t1l, eq_t1r) = mk_eqs(&mut rng);
+    let (eq_w2l, eq_w2r, eq_t2l, eq_t2r) = mk_eqs(&mut rng);
+
+    let mk_running_lw = || LookupRunningWitness::<E> {
+      witness: vec![Scalar::ZERO; table_size],
+      inv_w: vec![Scalar::ZERO; table_size],
+      table: vec![Scalar::ZERO; table_size],
+      multiplicities: vec![Scalar::ZERO; table_size],
+      inv_t: vec![Scalar::ZERO; table_size],
+      eq_w_left: vec![Scalar::ZERO; per_table_w_left],
+      eq_w_right: vec![Scalar::ZERO; per_table_w_right],
+      eq_t_left: vec![Scalar::ZERO; per_table_t_left],
+      eq_t_right: vec![Scalar::ZERO; per_table_t_right],
+    };
+
+    let bundle_1 = PerTableBundle::<E> {
+      table_id: 0,
+      payload: payload_1.clone(),
+      fresh_witness_address: wa_1,
+      fresh_witness_value_columns: vec![wv_1],
+      fresh_multiplicities: m_1,
+      fresh_eq_w_left: eq_w1l,
+      fresh_eq_w_right: eq_w1r,
+      fresh_eq_t_left: eq_t1l,
+      fresh_eq_t_right: eq_t1r,
+      running_lw: mk_running_lw(),
+    };
+    let bundle_2 = PerTableBundle::<E> {
+      table_id: 1,
+      payload: payload_2.clone(),
+      fresh_witness_address: wa_2,
+      fresh_witness_value_columns: vec![wv_2],
+      fresh_multiplicities: m_2,
+      fresh_eq_w_left: eq_w2l,
+      fresh_eq_w_right: eq_w2r,
+      fresh_eq_t_left: eq_t2l,
+      fresh_eq_t_right: eq_t2r,
+      running_lw: mk_running_lw(),
+    };
+
+    // Honest k=2 multi-table prover. At outer base, the per-table
+    // `poly_lookup_j` polynomials are bound to per-table running
+    // scalars of zero — so honestly `poly_lookup_j(0) + poly_lookup_j(1)
+    // == 0` for j ∈ {0, 1}.
+    let (nifs, _, _) = NIFS::<E>::prove_with_multi_table_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str_local,
+      &running_U,
+      &running_W,
+      &U2,
+      &W2,
+      &[bundle_1, bundle_2],
+    )
+    .expect("k=2 multi-table prove must succeed");
+
+    // Closure to allocate per-table public bundles into a CS.
+    let mk_public_bundle =
+      |cs: &mut TestConstraintSystem<Scalar>,
+       tag: &str,
+       payload: &LookupPayload<E>|
+       -> AllocatedLookupPayloadPublicMultiTable<E> {
+        let comm_L = AllocatedNonnativePoint::<E>::alloc(
+          cs.namespace(|| format!("{tag} comm_L pub")),
+          Some(payload.comm_L.to_coordinates()),
+        )
+        .unwrap();
+        let comm_values: Vec<_> = payload
+          .comm_values
+          .iter()
+          .enumerate()
+          .map(|(i, cv)| {
+            AllocatedNonnativePoint::<E>::alloc(
+              cs.namespace(|| format!("{tag} comm_values[{}] pub", i)),
+              Some(cv.to_coordinates()),
+            )
+            .unwrap()
+          })
+          .collect();
+        let comm_ts = AllocatedNonnativePoint::<E>::alloc(
+          cs.namespace(|| format!("{tag} comm_ts pub")),
+          Some(payload.comm_ts.to_coordinates()),
+        )
+        .unwrap();
+        AllocatedLookupPayloadPublicMultiTable {
+          comm_L,
+          comm_values,
+          comm_ts,
+        }
+      };
+
+    // === Sanity: HONEST t_lookup_running = [0, 0] produces a SATISFIED CS ===
+    //
+    // Guards the test against constraint-system bugs in the in-circuit
+    // verifier itself: if synthesis is unsatisfied even on the honest
+    // input, the corrupt-input case would (vacuously) also be unsatisfied
+    // for the wrong reason, and the test would not bind the §1.3
+    // (C)-invariant. This is the same guard pattern as the M.4 native
+    // test's "Sanity: with the HONEST running U1, step-2 verify must
+    // accept" (`nifs.rs:4961-4972`).
+    {
+      let mut cs = TestConstraintSystem::<Scalar>::new();
+      let pp_digest_alloc =
+        AllocatedNum::alloc(cs.namespace(|| "pp_digest"), || Ok(pp_digest)).unwrap();
+      let U1_alloc =
+        AllocatedFoldedInstance::<E>::alloc(cs.namespace(|| "U1"), Some(&running_U)).unwrap();
+      let U2_alloc =
+        AllocatedNonnativeR1CSInstance::<E>::alloc(cs.namespace(|| "U2"), Some(&U2)).unwrap();
+      let allocated_nifs =
+        AllocatedNIFS::<E>::alloc(cs.namespace(|| "allocate nifs"), Some(&nifs), 5).unwrap();
+      let allocated_lookups = AllocatedLookupNIFSMultiTable::<E>::alloc(
+        cs.namespace(|| "allocate multi-table lookup nifs"),
+        Some(&nifs),
+        2,
+      )
+      .unwrap();
+
+      let public_bundle_1 = mk_public_bundle(&mut cs, "table[0]", &payload_1);
+      let public_bundle_2 = mk_public_bundle(&mut cs, "table[1]", &payload_2);
+      let public_bundles_alloc = vec![public_bundle_1, public_bundle_2];
+
+      // Honest outer-base per-table running = [0, 0].
+      let t_lookup_running_alloc: Vec<_> = (0..2)
+        .map(|j| alloc_zero(cs.namespace(|| format!("t_lookup_running[{}]", j))))
+        .collect();
+
+      let comm_W_fold =
+        AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_W_fold")).unwrap();
+      let comm_E_fold =
+        AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold")).unwrap();
+
+      // Single-entry shape registry pinning `pp_digest` (matches the
+      // M.6 happy-path's M.7 wire-in). Non-load-bearing for THIS test —
+      // the failure must localise to the j=1 (C)-binding constraint,
+      // not the M.7 assertion.
+      let chunk_index_alloc =
+        AllocatedNum::alloc(cs.namespace(|| "chunk_index_in_z"), || Ok(Scalar::ZERO))
+          .unwrap();
+      let shape_registry_alloc = vec![
+        AllocatedNum::alloc(cs.namespace(|| "shape_registry[0]"), || Ok(pp_digest))
+          .unwrap(),
+      ];
+
+      let _out = allocated_nifs
+        .verify_with_multi_table_lookup(
+          cs.namespace(|| "in-circuit verify_with_multi_table_lookup"),
+          &pp_digest_alloc,
+          &chunk_index_alloc,
+          &shape_registry_alloc,
+          /* index_n_bits = */ 1,
+          &U1_alloc,
+          &U2_alloc,
+          &allocated_lookups,
+          &public_bundles_alloc,
+          &t_lookup_running_alloc,
+          &comm_W_fold,
+          &comm_E_fold,
+          ro_consts_circuit.clone(),
+        )
+        .expect("honest in-circuit verify must synthesise cleanly");
+
+      assert!(
+        cs.is_satisfied(),
+        "sanity: honest k=2 in-circuit verify against outer-base running U \
+         (per-table running = [0, 0]) must produce a SATISFIED constraint \
+         system; first unsatisfied: {:?}",
+        cs.which_is_unsatisfied()
+      );
+    }
+
+    // === Hard-reject: corrupt t_lookup_running_per_table[1] = offset ≠ 0 ===
+    //
+    // The honest prover built `nifs.poly_lookup[1]` such that
+    // `poly_lookup_1(0) + poly_lookup_1(1) == 0`. The corrupt input
+    // claims the running scalar is `offset` instead. The j=1 (C)-binding
+    // constraint `poly_lookup_1(0) + poly_lookup_1(1) == offset` is then
+    // violated by exactly `−offset`. The j=0 (C)-binding remains
+    // satisfied (`poly_lookup_0(0) + poly_lookup_0(1) == 0` and the j=0
+    // running input is still zero). The R1CS-side (C)-binding is
+    // satisfied independently of `rho_v` because `U1.T = 0` (outer
+    // base).
+    let offset = {
+      let mut o = Scalar::random(&mut rng);
+      while o == Scalar::ZERO {
+        o = Scalar::random(&mut rng);
+      }
+      o
+    };
+
+    let mut cs = TestConstraintSystem::<Scalar>::new();
+    let pp_digest_alloc =
+      AllocatedNum::alloc(cs.namespace(|| "pp_digest"), || Ok(pp_digest)).unwrap();
+    let U1_alloc =
+      AllocatedFoldedInstance::<E>::alloc(cs.namespace(|| "U1"), Some(&running_U)).unwrap();
+    let U2_alloc =
+      AllocatedNonnativeR1CSInstance::<E>::alloc(cs.namespace(|| "U2"), Some(&U2)).unwrap();
+    let allocated_nifs =
+      AllocatedNIFS::<E>::alloc(cs.namespace(|| "allocate nifs"), Some(&nifs), 5).unwrap();
+    let allocated_lookups = AllocatedLookupNIFSMultiTable::<E>::alloc(
+      cs.namespace(|| "allocate multi-table lookup nifs"),
+      Some(&nifs),
+      2,
+    )
+    .unwrap();
+
+    let public_bundle_1 = mk_public_bundle(&mut cs, "table[0]", &payload_1);
+    let public_bundle_2 = mk_public_bundle(&mut cs, "table[1]", &payload_2);
+    let public_bundles_alloc = vec![public_bundle_1, public_bundle_2];
+
+    // Corrupt allocation: j=0 honest (zero), j=1 perturbed by `offset`.
+    // Mirrors the M.4 reference's `folded_U_s1.T_lookup[1] += offset`,
+    // transposed to the in-circuit `t_lookup_running_per_table` input
+    // surface (see doc-comment for the asymmetry rationale).
+    let t_lookup_running_alloc: Vec<AllocatedNum<Scalar>> = vec![
+      AllocatedNum::alloc(cs.namespace(|| "t_lookup_running[0]"), || Ok(Scalar::ZERO))
+        .unwrap(),
+      AllocatedNum::alloc(cs.namespace(|| "t_lookup_running[1]"), || Ok(offset)).unwrap(),
+    ];
+
+    let comm_W_fold =
+      AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_W_fold")).unwrap();
+    let comm_E_fold =
+      AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold")).unwrap();
+
+    let chunk_index_alloc =
+      AllocatedNum::alloc(cs.namespace(|| "chunk_index_in_z"), || Ok(Scalar::ZERO)).unwrap();
+    let shape_registry_alloc = vec![
+      AllocatedNum::alloc(cs.namespace(|| "shape_registry[0]"), || Ok(pp_digest)).unwrap(),
+    ];
+
+    // Synthesis itself does NOT error — `check_poly_zero_poly_one_with`
+    // emits a constraint regardless of witness values; the violation
+    // surfaces as `!cs.is_satisfied()`, NOT as `Err(SynthesisError)`.
+    let _out = allocated_nifs
+      .verify_with_multi_table_lookup(
+        cs.namespace(|| "in-circuit verify_with_multi_table_lookup"),
+        &pp_digest_alloc,
+        &chunk_index_alloc,
+        &shape_registry_alloc,
+        /* index_n_bits = */ 1,
+        &U1_alloc,
+        &U2_alloc,
+        &allocated_lookups,
+        &public_bundles_alloc,
+        &t_lookup_running_alloc,
+        &comm_W_fold,
+        &comm_E_fold,
+        ro_consts_circuit,
+      )
+      .expect("synthesis itself must not error; the (C)-binding violation \
+               must surface as cs.is_satisfied() == false, not as Err");
+
+    assert!(
+      !cs.is_satisfied(),
+      "verify with corrupt t_lookup_running[1] = offset (offset ≠ 0) MUST \
+       produce an UNSATISFIED constraint system; the per-table (C)-binding \
+       for j=1 is the §1.3 VECTOR invariant"
+    );
+
+    // Pin §1.3 VECTOR (C)-invariant location-assertion. The j=1
+    // (C)-binding constraint lives at namespace path
+    // `…/in-circuit verify_with_multi_table_lookup/lookup poly(0)+poly(1)
+    //   = t_lookup_running[1]/eval at 0 + eval at 1 = c`
+    // (synthesised by `circuit/nifs.rs:805-808` invoking
+    // `circuit/univariate.rs:34-56`'s `check_poly_zero_poly_one_with`,
+    // whose constraint name is "eval at 0 + eval at 1 = c"). Asserting
+    // BOTH structural substrings localises the failure to that
+    // constraint specifically — without this assertion, the test could
+    // pass for the wrong reason (a downstream consistency check
+    // catching the corruption indirectly), and the test would not bind
+    // the §1.3 (C)-invariant.
+    let unsat_path = cs
+      .which_is_unsatisfied()
+      .expect("which_is_unsatisfied must report a failing constraint when \
+               cs.is_satisfied() == false");
+    assert!(
+      unsat_path.contains("lookup poly(0)+poly(1) = t_lookup_running[1]"),
+      "the failing constraint MUST live in the j=1 per-table (C)-binding \
+       namespace `lookup poly(0)+poly(1) = t_lookup_running[1]` (per pin \
+       §1.3); got path: {unsat_path:?}"
+    );
+    assert!(
+      unsat_path.contains("eval at 0 + eval at 1 = c"),
+      "the failing constraint MUST be the `check_poly_zero_poly_one_with` \
+       constraint named \"eval at 0 + eval at 1 = c\" (per \
+       circuit/univariate.rs:34-56); got path: {unsat_path:?}"
+    );
+  }
 }
