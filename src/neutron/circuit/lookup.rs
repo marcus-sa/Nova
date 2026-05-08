@@ -1309,10 +1309,26 @@ mod tests {
     let comm_E_fold =
       AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold")).unwrap();
 
+    // M.7 wire-in: single-entry shape-registry containing
+    // `pp_digest` itself (Scalar::ZERO at this M.6 fixture layer),
+    // selected by `chunk_index = 0`. The M.7 assertion is therefore
+    // trivially satisfied here — the M.7 cross-position negative
+    // path is exercised by the dedicated M.7 regression test
+    // (`m7_shape_registry_assertion_*`), not by this M.6 fixture.
+    let chunk_index_alloc =
+      AllocatedNum::alloc(cs.namespace(|| "chunk_index_in_z"), || Ok(Scalar::ZERO)).unwrap();
+    let shape_registry_alloc =
+      vec![
+        AllocatedNum::alloc(cs.namespace(|| "shape_registry[0]"), || Ok(pp_digest)).unwrap(),
+      ];
+
     let out = allocated_nifs
       .verify_with_multi_table_lookup(
         cs.namespace(|| "in-circuit verify_with_multi_table_lookup"),
         &pp_digest_alloc,
+        &chunk_index_alloc,
+        &shape_registry_alloc,
+        /* index_n_bits = */ 1,
         &U1_alloc,
         &U2_alloc,
         &allocated_lookups,

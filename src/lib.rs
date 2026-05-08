@@ -22,6 +22,13 @@ pub mod neutron;
 #[cfg(feature = "lookup-fold")]
 pub mod lookup;
 
+/// Per-position shape-registry assertion gadget (in-circuit + off-circuit
+/// pair). GH-#2 M.7 + M.7.5 of the C1-β multi-table lookup-fold
+/// extension; closes the cross-position witness substitution attack
+/// per the design pin §3.
+#[cfg(feature = "lookup-fold")]
+pub mod shape_registry;
+
 // public modules
 pub mod constants;
 pub mod digest;

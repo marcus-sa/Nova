@@ -622,11 +622,37 @@ mod lookup_verify {
     /// pinned `multi_column_tables[j].columns.len()` — the caller is
     /// responsible for that allocation; this method does not
     /// branch on the size (it simply iterates the supplied slice).
+    ///
+    /// **GH-#2 M.7 / pin §3.2 + §3.3 wire-in.** Before
+    /// `pp_digest.absorb(ro)` (which seeds the FS transcript), this
+    /// method invokes
+    /// [`crate::shape_registry::assert_pp_digest_matches_registry`]
+    /// to enforce the per-position binding `pp_digest_in ==
+    /// shape_registry[chunk_index_in_z]`. This closes the cross-
+    /// position witness substitution attack (pin §3.4) by reducing
+    /// any cross-position forgery to a `pp_digest` collision under
+    /// the underlying `RO2` instance. Inputs:
+    ///
+    /// - `chunk_index_in_z` — the augmented circuit's running-instance
+    ///   chunk-position index, carried in public IO `X` per ADR-0021.
+    /// - `shape_registry` — the per-position list of
+    ///   per-`Structure<E>` `pp_digest`s in chunk-position-canonical
+    ///   order (NOT `table_id` order — pin §3.1). Construction lives
+    ///   in `inumbra-spend-circuits` public-params per pin §6.4; this
+    ///   method is the consumption site.
+    /// - `index_n_bits` — the bit-width used for the range-check on
+    ///   `chunk_index_in_z`. Must be ≥ `ceil(log2(shape_registry.len()))`.
+    ///   At production arity (`shape_registry.len() ≤ 30`) this is `5`;
+    ///   the M.6 k=2 regression test passes `4` (16-entry main-loop
+    ///   subset).
     #[allow(clippy::too_many_arguments)]
     pub fn verify_with_multi_table_lookup<CS: ConstraintSystem<E::Scalar>>(
       &self,
       mut cs: CS,
       pp_digest: &AllocatedNum<E::Scalar>,
+      chunk_index_in_z: &AllocatedNum<E::Scalar>,
+      shape_registry: &[AllocatedNum<E::Scalar>],
+      index_n_bits: usize,
       U1: &AllocatedFoldedInstance<E>,
       U2: &AllocatedNonnativeR1CSInstance<E>,
       lookups: &AllocatedLookupNIFSMultiTable<E>,
@@ -652,6 +678,21 @@ mod lookup_verify {
           lookups.comm_inv_t.len(),
         )));
       }
+
+      // --- M.7 / pin §3.2 + §3.3: per-position shape-registry assertion ---
+      //
+      // Sited BEFORE the `pp_digest.absorb(ro)` step: if `pp_digest`
+      // is a wrong value (cross-position witness substitution), the
+      // FS transcript would diverge from the prover's at byte 0,
+      // making every downstream squeeze meaningless. Asserting the
+      // shape-registry binding here fails fast and cleanly.
+      crate::shape_registry::assert_pp_digest_matches_registry::<E, _>(
+        cs.namespace(|| "M.7 shape-registry assertion"),
+        pp_digest,
+        chunk_index_in_z,
+        shape_registry,
+        index_n_bits,
+      )?;
 
       let mut ro = E::RO2Circuit::new(ro_consts);
       ro.absorb(pp_digest);
