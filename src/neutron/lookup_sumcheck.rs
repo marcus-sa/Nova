@@ -611,7 +611,7 @@ impl<E: Engine> LookupSumcheckInstance<E> {
 /// `verify_with_lookup`, `verify_with_multi_column_lookup`) read entry
 /// `[0]` (or `Scalar::ZERO` on empty Vec) to preserve byte-equivalence
 /// with the pre-#2 single-table FS transcript.
-pub(crate) fn lookup_running_claims_from<E: Engine>(U1: &FoldedInstance<E>) -> Vec<E::Scalar> {
+pub fn lookup_running_claims_from<E: Engine>(U1: &FoldedInstance<E>) -> Vec<E::Scalar> {
   U1.T_lookup.clone().unwrap_or_default()
 }
 

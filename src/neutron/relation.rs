@@ -637,6 +637,24 @@ impl<E: Engine> FoldedInstance<E> {
     }
   }
 
+  /// Per-table running lookup-claim accumulator, exposed for differential
+  /// harnesses that need to compare against an off-circuit reference.
+  ///
+  /// Returns `None` at outer base (no lookup payload has been folded in
+  /// yet) and `Some(&[E::Scalar])` after the first fold step with a
+  /// lookup payload. The returned slice has one entry per table in the
+  /// canonical sort order (`sort_by_key(|t| t.table_id)` per
+  /// `relation.rs:482`).
+  ///
+  /// GH-#2 M.11 enabler: the inumbra-side fold-of-four absent-table
+  /// differential needs this projection to assert the running-scalar
+  /// pipeline equals the off-circuit `fold_lookup_running_claim_naive`
+  /// reference at every step (cryptographer review §D.2 / §D.4 #2).
+  #[cfg(feature = "lookup-fold")]
+  pub fn t_lookup(&self) -> Option<&[E::Scalar]> {
+    self.T_lookup.as_deref()
+  }
+
   /// Fold the instance with another instance
   pub fn fold(
     &self,
