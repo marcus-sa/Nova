@@ -5006,6 +5006,570 @@ mod tests {
       result.err()
     );
   }
+
+  // =========================================================================
+  // GH-#2 M.12: per-table Lagrange interpolation manual check (pin §5.2 #3)
+  //
+  // Run with:
+  //   cargo test --release -p nova-snark --features lookup-fold m12_
+  //
+  // Per-table extension of the single-table 10-point random differential at
+  // `lookup_sumcheck.rs:1106` (`prove_step_differential_against_naive`).
+  // For each table j ∈ [0..k), this re-derives `rho` and `r_logup_j` from
+  // the FS transcript (mirroring the Step 0/2/3/4/5a/5b schedule of
+  // `prove_with_multi_table_lookup_inner`), recomputes the (A)+(B)+(C)
+  // sub-claim summation off-circuit at 10 fresh `Scalar::random` points,
+  // and asserts equality against `nifs.poly_lookup[j].evaluate(&p)`.
+  //
+  // Per pin §6 #4: this should never fire because the multi-table
+  // extension is structural-only, not algebraic. If it fires, halt and
+  // surface — the per-table degree-5 algebra has been corrupted.
+  //
+  // The (A)+(B)+(C) algebra below is lifted **verbatim** from
+  // `lookup_sumcheck.rs:1141-1191` and indexed by table j. The bf
+  // linear-blend `(1-p)·v_running + p·v_fresh` is the spec; do not
+  // reinvent.
+  //
+  // No public-API expansion: all required state is reachable via
+  // `pub(crate)` (NIFS::poly_lookup), `pub` (LookupRunningWitness fields,
+  // PerTableBundle fields, Structure::{ell,left,right}), or in-vendor
+  // helpers (`combine_columns_witness`, `combine_columns_table`,
+  // `crate::spartan::logup_inverses::batch_invert_plus_r`).
+
+  /// Per-table fixture descriptor for the M.12 helper.
+  ///
+  /// The pin §5.2 #3 obligation is breadth across k ∈ {1,2,3} with at
+  /// least one heterogeneous-size fixture covering n_1 = 64 and n_2 =
+  /// 65_536 (matching ADR-0021 / pin §5.1's chunk-step table sizes).
+  /// Other k=3 sizes can be smaller because the obligation is the
+  /// structural per-table parallel, not full-size stress.
+  #[cfg(feature = "lookup-fold")]
+  struct M12TableSpec {
+    /// Per-table size n_j. Must be a power of two.
+    size: usize,
+    /// log2(size) — pre-computed because LookupShape::witness_split is
+    /// shape-level, but per-table eq vectors are sized to n_j (mirrors
+    /// the M.4 k=2 per-table eq construction at nifs.rs:4498-4504).
+    log2: usize,
+    /// Distinct query indices into the table; the rest of the witness
+    /// is padded with index 0 (multiplicity accumulates), matching
+    /// M.4's `build_satisfying_witness` shape.
+    queries: Vec<usize>,
+  }
+
+  /// Per-table 10-point Lagrange manual check.
+  ///
+  /// Builds a satisfying multi-table fixture per `specs`, drives
+  /// `prove_with_multi_table_lookup_inner` with a pinned `r_E`,
+  /// re-derives `rho` and per-table `r_logup_j` by mirroring the prove
+  /// path's FS schedule, and runs the per-table (A)+(B)+(C) naive
+  /// summation against `nifs.poly_lookup[j].evaluate(&p)` at 10 fresh
+  /// random points per table.
+  ///
+  /// Halts on the first (j, p) that fails per pin §6 #4 (soundness-
+  /// class falsifier) — the assert_eq! panic IS the halt signal.
+  #[cfg(feature = "lookup-fold")]
+  fn run_m12_lagrange_manual_check(seed: u64, specs: &[M12TableSpec]) {
+    use crate::neutron::relation::{
+      LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle, MultiColumnLookupTable,
+    };
+    use crate::spartan::polys::power::PowPolynomial;
+    use crate::traits::commitment::CommitmentEngineTrait;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let k = specs.len();
+    assert!((1..=3).contains(&k), "pin §5.2 #3 covers k ∈ {{1,2,3}}");
+    for spec in specs {
+      assert_eq!(
+        1usize << spec.log2,
+        spec.size,
+        "M12TableSpec.size must equal 2^log2"
+      );
+    }
+
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // R1CS shape (kept small — the M.12 obligation is on the lookup-side
+    // poly_lookup_j, not the R1CS sumcheck).
+    let num_cons = 32usize;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+
+    // Commitment key must be sized for the largest per-table n_j, since
+    // `prove_with_multi_table_lookup_inner` commits inverse-witness
+    // vectors of length n_j against this single ck.
+    let max_n = specs.iter().map(|s| s.size).max().unwrap();
+    let ck_floor = S::ck_floor();
+    let max_n_hint: Box<dyn Fn(&R1CSShape<E>) -> usize> = Box::new(move |_: &R1CSShape<E>| max_n);
+    let shapes: Vec<&R1CSShape<E>> = vec![&shape, &shape];
+    let hints: Vec<&dyn Fn(&R1CSShape<E>) -> usize> = vec![&*ck_floor, &*max_n_hint];
+    let ck = R1CSShape::commitment_key(&shapes, &hints).unwrap();
+
+    // Build per-table tables (random contents, deterministic seed).
+    let tables: Vec<Vec<Scalar>> = specs
+      .iter()
+      .map(|s| (0..s.size).map(|_| Scalar::random(&mut rng)).collect())
+      .collect();
+
+    // Build the LookupShape with k registered tables. `tables[j]` is
+    // committed twice — once for the legacy single-column handle and
+    // once for the multi_column_table value-column commitment — both
+    // under zero blinding.
+    let lookup_shape = LookupShape::<E> {
+      tables: tables
+        .iter()
+        .enumerate()
+        .map(|(j, t)| LookupTableHandle {
+          table_id: j as u64,
+          size: specs[j].size,
+          commitment: <E as Engine>::CE::commit(&ck, t, &Scalar::ZERO),
+        })
+        .collect(),
+      multi_column_tables: tables
+        .iter()
+        .enumerate()
+        .map(|(j, t)| MultiColumnLookupTable {
+          table_id: j as u64,
+          size: specs[j].size,
+          columns: vec![t.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, t, &Scalar::ZERO)],
+        })
+        .collect(),
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      // `witness_ell_cached` is shape-level; the per-table eqs below
+      // are sized per-table, so this value is not consumed by the M.12
+      // path. Use the largest log2 to keep `LookupShape::default` /
+      // `running_lw_default` pathways consistent if accessed.
+      witness_ell_cached: specs.iter().map(|s| s.log2).max().unwrap(),
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape_padded = str_local.S.clone();
+
+    // Fresh R1CS instance — exercises the R1CS sumcheck in the prove
+    // path (we don't assert on poly, only on poly_lookup_j).
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs2 = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut cs2);
+    let (u_r1cs, w_r1cs) = cs2.r1cs_instance_and_witness(&shape_padded, &ck).unwrap();
+    let w_r1cs = w_r1cs.pad(&shape_padded);
+
+    let running_W = FoldedWitness::default(&str_local);
+    let running_U = FoldedInstance::default(&str_local);
+
+    // Build per-table satisfying witnesses + per-table eq vectors.
+    // Pattern lifted from M.4's `build_satisfying_witness` and `mk_eqs`
+    // (nifs.rs:4443-4459, 4506-4522). Each table's witness is
+    // size-n_j (padded with index 0).
+    let mut bundles: Vec<PerTableBundle<E>> = Vec::with_capacity(k);
+    for (j, spec) in specs.iter().enumerate() {
+      let table = &tables[j];
+      let n = spec.size;
+
+      let mut wa = vec![Scalar::ZERO; n];
+      let mut wv = vec![Scalar::ZERO; n];
+      let mut mult = vec![Scalar::ZERO; n];
+      for (i, &idx) in spec.queries.iter().enumerate() {
+        wa[i] = Scalar::from(idx as u64);
+        wv[i] = table[idx];
+        mult[idx] += Scalar::ONE;
+      }
+      for i in spec.queries.len()..n {
+        wa[i] = Scalar::from(0u64);
+        wv[i] = table[0];
+        mult[0] += Scalar::ONE;
+      }
+
+      let comm_addr = <E as Engine>::CE::commit(&ck, &wa, &Scalar::ZERO);
+      let comm_v0 = <E as Engine>::CE::commit(&ck, &wv, &Scalar::ZERO);
+      let comm_ts = <E as Engine>::CE::commit(&ck, &mult, &Scalar::ZERO);
+
+      let payload = LookupPayload::<E> {
+        comm_L: comm_addr,
+        comm_ts,
+        comm_inv_w: Commitment::<E>::default(),
+        comm_inv_t: Commitment::<E>::default(),
+        T2_lookup: Scalar::ZERO,
+        comm_values: vec![comm_v0],
+      };
+
+      // Per-table eq vectors sized to n_j (NOT shape-level). Per pin
+      // §1.2 each LookupSumcheckInstance is its own hypercube of size
+      // n_j, so eqs are per-table.
+      let ell1 = spec.log2.div_ceil(2);
+      let ell2 = spec.log2 / 2;
+      let w_left = 1usize << ell1;
+      let w_right = 1usize << ell2;
+      let t_left = w_left;
+      let t_right = w_right;
+      let tau_w = Scalar::random(&mut rng);
+      let pow_w = PowPolynomial::new(&tau_w, spec.log2);
+      let combined_w = pow_w.split_evals(w_left, w_right);
+      let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+      let tau_t = Scalar::random(&mut rng);
+      let pow_t = PowPolynomial::new(&tau_t, spec.log2);
+      let combined_t = pow_t.split_evals(t_left, t_right);
+      let (eq_t_left, eq_t_right) = combined_t.split_at(t_left);
+
+      // Outer-base running_lw (zeros) sized to n_j.
+      let running_lw = LookupRunningWitness::<E> {
+        witness: vec![Scalar::ZERO; n],
+        inv_w: vec![Scalar::ZERO; n],
+        table: vec![Scalar::ZERO; n],
+        multiplicities: vec![Scalar::ZERO; n],
+        inv_t: vec![Scalar::ZERO; n],
+        eq_w_left: vec![Scalar::ZERO; w_left],
+        eq_w_right: vec![Scalar::ZERO; w_right],
+        eq_t_left: vec![Scalar::ZERO; t_left],
+        eq_t_right: vec![Scalar::ZERO; t_right],
+      };
+
+      bundles.push(PerTableBundle::<E> {
+        table_id: j as u64,
+        payload,
+        fresh_witness_address: wa,
+        fresh_witness_value_columns: vec![wv],
+        fresh_multiplicities: mult,
+        fresh_eq_w_left: eq_w_left.to_vec(),
+        fresh_eq_w_right: eq_w_right.to_vec(),
+        fresh_eq_t_left: eq_t_left.to_vec(),
+        fresh_eq_t_right: eq_t_right.to_vec(),
+        running_lw,
+      });
+    }
+
+    // Pin r_E so the FS schedule is fully deterministic across the
+    // prove call and our re-derivation below.
+    let r_E_pinned = Scalar::random(&mut rng);
+
+    let (nifs, _folded, _folded_lw_per_table) = NIFS::<E>::prove_with_multi_table_lookup_inner(
+      &ck, &ro_consts, &pp_digest, &str_local, &running_U, &running_W, &u_r1cs, &w_r1cs, &bundles,
+      r_E_pinned,
+    )
+    .expect("multi-table prove must succeed on satisfying witnesses");
+
+    let poly_lookup_vec = nifs
+      .poly_lookup
+      .as_ref()
+      .expect("multi-table NIFS must carry poly_lookup");
+    assert_eq!(
+      poly_lookup_vec.len(),
+      k,
+      "poly_lookup Vec length must equal k"
+    );
+
+    // ---------------------------------------------------------------------
+    // Re-derive `rho` and per-table `r_logup_j` by mirroring the FS
+    // schedule in `prove_with_multi_table_lookup_inner` (steps 0, 2, 3,
+    // 4, 5a, 5b). The schedule is fully deterministic given inputs +
+    // the pinned `r_E`.
+    // ---------------------------------------------------------------------
+    let mut ro = <E as Engine>::RO2::new(ro_consts.clone());
+    // Step 0
+    ro.absorb(pp_digest);
+    u_r1cs.absorb_in_ro2(&mut ro);
+    // Step 2: per-bundle commitments (comm_L, comm_values[*], comm_ts)
+    for b in &bundles {
+      b.payload.comm_L.absorb_in_ro2(&mut ro);
+      for cv in &b.payload.comm_values {
+        cv.absorb_in_ro2(&mut ro);
+      }
+      b.payload.comm_ts.absorb_in_ro2(&mut ro);
+    }
+    // Step 3: tau, then comm_E (depends on r_E_pinned)
+    let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    let e_eq = PowPolynomial::new(&tau, str_local.ell).split_evals(str_local.left, str_local.right);
+    let comm_e = <E as Engine>::CE::commit(&ck, &e_eq, &r_E_pinned);
+    comm_e.absorb_in_ro2(&mut ro);
+    // Step 4: rho
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    // Step 5a: per-bundle alpha (gated)
+    let mut alpha_vec: Vec<Scalar> = Vec::with_capacity(k);
+    for b in &bundles {
+      let a = if b.payload.comm_values.is_empty() {
+        Scalar::ZERO
+      } else {
+        ro.squeeze(NUM_CHALLENGE_BITS, false)
+      };
+      alpha_vec.push(a);
+    }
+    // Step 5b: per-bundle r_logup_j (sequenced)
+    let mut r_logup_vec: Vec<Scalar> = Vec::with_capacity(k);
+    for _ in 0..k {
+      r_logup_vec.push(ro.squeeze(NUM_CHALLENGE_BITS, false));
+    }
+
+    // Sanity: poly_lookup_j(0) + poly_lookup_j(1) == T_lookup_running_j
+    // = 0 (outer base). This is the (C)-binding mirror — if it fails,
+    // halt before the manual check (it would be a different bug).
+    for (j, poly_j) in poly_lookup_vec.iter().enumerate() {
+      assert_eq!(
+        poly_j.eval_at_zero() + poly_j.eval_at_one(),
+        Scalar::ZERO,
+        "j={}: outer-base (C)-binding poly_lookup_j(0)+poly_lookup_j(1) must equal T_lookup_running_j=0",
+        j,
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-table 10-point Lagrange manual check (pin §5.2 #3).
+    //
+    // Algebra lifted verbatim from lookup_sumcheck.rs:1141-1191 and
+    // indexed by table j. Running side reads from `bundles[j].running_lw`
+    // (all zero at outer base); fresh side reads from the combined
+    // witness/table per j and the freshly computed `inv_w_2_j`/
+    // `inv_t_2_j`.
+    // ---------------------------------------------------------------------
+    let bf = |v1: Scalar, v2: Scalar, p: Scalar| -> Scalar { (Scalar::ONE - p) * v1 + p * v2 };
+
+    for (j, spec) in specs.iter().enumerate() {
+      let r_logup_j = r_logup_vec[j];
+      let alpha_j = alpha_vec[j];
+
+      // Fresh side: combined witness/table for table j.
+      let combined_w = combine_columns_witness::<E>(
+        &bundles[j].fresh_witness_address,
+        &bundles[j].fresh_witness_value_columns,
+        &alpha_j,
+      );
+      let combined_t = combine_columns_table::<E>(
+        spec.size,
+        &str_local.lookups.as_ref().unwrap().multi_column_tables[j].columns,
+        &alpha_j,
+      );
+
+      // Fresh inverses: inv_w_2 = 1/(combined_w + r_logup_j); inv_t_2
+      // = ts_2/(combined_t + r_logup_j). Mirror of new() at
+      // lookup_sumcheck.rs:182-190.
+      let inv_w_2 = crate::spartan::logup_inverses::batch_invert_plus_r(&combined_w, &r_logup_j)
+        .expect("inv_w_2 must invert");
+      let inv_t_2_raw =
+        crate::spartan::logup_inverses::batch_invert_plus_r(&combined_t, &r_logup_j)
+          .expect("inv_t_2 must invert");
+      let mult_j = &bundles[j].fresh_multiplicities;
+      let inv_t_2: Vec<Scalar> = inv_t_2_raw
+        .iter()
+        .zip(mult_j.iter())
+        .map(|(inv, ts)| *inv * *ts)
+        .collect();
+
+      // Running side data (outer base at this M.12 fixture: all zeros).
+      let lw = &bundles[j].running_lw;
+
+      let eq_w1l = &lw.eq_w_left;
+      let eq_w1r = &lw.eq_w_right;
+      let eq_t1l = &lw.eq_t_left;
+      let eq_t1r = &lw.eq_t_right;
+      let eq_w2l = &bundles[j].fresh_eq_w_left;
+      let eq_w2r = &bundles[j].fresh_eq_w_right;
+      let eq_t2l = &bundles[j].fresh_eq_t_left;
+      let eq_t2r = &bundles[j].fresh_eq_t_right;
+
+      let w1 = &lw.witness;
+      let w2 = &combined_w;
+      let inv_w1 = &lw.inv_w;
+      let inv_w2 = &inv_w_2;
+      let t1 = &lw.table;
+      let t2 = &combined_t;
+      let ts1 = &lw.multiplicities;
+      let ts2 = &bundles[j].fresh_multiplicities;
+      let inv_t1 = &lw.inv_t;
+      let inv_t2_ref = &inv_t_2;
+
+      // Sanity on shapes (mirrors LookupSumcheckInstance::new
+      // debug_asserts). If any of these fire it's a fixture-construction
+      // bug, not an algebra bug — halt early with a clear message.
+      let n = spec.size;
+      assert_eq!(
+        eq_w1l.len() * eq_w1r.len(),
+        n,
+        "j={}: running eq_w shape",
+        j
+      );
+      assert_eq!(
+        eq_t1l.len() * eq_t1r.len(),
+        n,
+        "j={}: running eq_t shape",
+        j
+      );
+      assert_eq!(eq_w2l.len() * eq_w2r.len(), n, "j={}: fresh eq_w shape", j);
+      assert_eq!(eq_t2l.len() * eq_t2r.len(), n, "j={}: fresh eq_t shape", j);
+      assert_eq!(w1.len(), n, "j={}: running witness shape", j);
+      assert_eq!(w2.len(), n, "j={}: fresh combined witness shape", j);
+      assert_eq!(t1.len(), n, "j={}: running table shape", j);
+      assert_eq!(t2.len(), n, "j={}: fresh combined table shape", j);
+
+      let poly_j = &poly_lookup_vec[j];
+
+      for iter in 0..10 {
+        let p = Scalar::random(&mut rng);
+        let eq_rho_p = (Scalar::ONE - rho) * (Scalar::ONE - p) + rho * p;
+
+        // Sub-claim (A): sum eq_w(p,*) * (inv_w(p,*) * (w(p,*) + r) - 1)
+        // where each polynomial is interpolated between running (_1)
+        // and fresh (_2) sides via bf.
+        let left_w = eq_w1l.len();
+        let right_w = eq_w1r.len();
+        let mut sum_a = Scalar::ZERO;
+        for ii in 0..right_w {
+          let eq_r = bf(eq_w1r[ii], eq_w2r[ii], p);
+          for jj in 0..left_w {
+            let kk = ii * left_w + jj;
+            let eq_l = bf(eq_w1l[jj], eq_w2l[jj], p);
+            let inv_w = bf(inv_w1[kk], inv_w2[kk], p);
+            let w_plus_r = bf(w1[kk] + r_logup_j, w2[kk] + r_logup_j, p);
+            sum_a += eq_r * eq_l * (inv_w * w_plus_r - Scalar::ONE);
+          }
+        }
+
+        // Sub-claim (B): sum eq_t(p,*) * (inv_t(p,*) * (T(p,*) + r) - ts(p,*))
+        let left_t = eq_t1l.len();
+        let right_t = eq_t1r.len();
+        let mut sum_b = Scalar::ZERO;
+        for ii in 0..right_t {
+          let eq_r = bf(eq_t1r[ii], eq_t2r[ii], p);
+          for jj in 0..left_t {
+            let kk = ii * left_t + jj;
+            let eq_l = bf(eq_t1l[jj], eq_t2l[jj], p);
+            let inv_t = bf(inv_t1[kk], inv_t2_ref[kk], p);
+            let t_plus_r = bf(t1[kk] + r_logup_j, t2[kk] + r_logup_j, p);
+            let ts = bf(ts1[kk], ts2[kk], p);
+            sum_b += eq_r * eq_l * (inv_t * t_plus_r - ts);
+          }
+        }
+
+        // Sub-claim (C): sum inv_w(p,*) - sum inv_t(p,*)
+        let sum_inv_w: Scalar = inv_w1
+          .iter()
+          .zip(inv_w2.iter())
+          .map(|(v1, v2)| bf(*v1, *v2, p))
+          .sum();
+        let sum_inv_t: Scalar = inv_t1
+          .iter()
+          .zip(inv_t2_ref.iter())
+          .map(|(v1, v2)| bf(*v1, *v2, p))
+          .sum();
+        let sum_c = sum_inv_w - sum_inv_t;
+
+        let expected = eq_rho_p * (sum_a + sum_b + sum_c);
+        let actual = poly_j.evaluate(&p);
+
+        // Pin §6 #4 falsifier: a failure here is a soundness-class
+        // halt. The assert_eq! panic IS the halt signal — the per-table
+        // degree-5 algebra has been corrupted by the multi-table
+        // extension.
+        assert_eq!(
+          actual, expected,
+          "M.12 (pin §5.2 #3) FALSIFIER: per-table Lagrange manual check failed at \
+           (j={}, iter={}, p={:?}): \
+           sum_a={:?}, sum_b={:?}, sum_c={:?}, eq_rho_p={:?}, expected={:?}, actual={:?}. \
+           HALT — per pin §6 #4, the multi-table extension is structural-only; \
+           if this fires, the per-table degree-5 algebra has been corrupted.",
+          j, iter, p, sum_a, sum_b, sum_c, eq_rho_p, expected, actual,
+        );
+      }
+    }
+  }
+
+  /// GH-#2 M.12: pin §5.2 #3 — k=1 regression vs. single-table Stage B.
+  ///
+  /// At k=1 the per-table check degenerates to the existing single-table
+  /// 10-point random differential at `lookup_sumcheck.rs:1106`, modulo
+  /// the FS-transcript context (multi-table prove path). Establishes
+  /// the regression baseline before exercising k≥2.
+  ///
+  /// Seed: 0xC1BE_1A6E ("Lagrange").
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn m12_lagrange_manual_check_k1_regression() {
+    run_m12_lagrange_manual_check(
+      0xC1BE_1A6E,
+      &[M12TableSpec {
+        size: 64,
+        log2: 6,
+        queries: vec![1, 4, 9, 16, 25, 36, 49, 60],
+      }],
+    );
+  }
+
+  /// GH-#2 M.12: pin §5.2 #3 — k=2 heterogeneous (n_1=64, n_2=65_536).
+  ///
+  /// The pin-mandated heterogeneous fixture (per ADR-0021 / pin §5.1
+  /// chunk-step table sizes). n_2 = 65_536 is the chunk-lookup identity
+  /// table; n_1 = 64 is the merged window table. This is the
+  /// load-bearing M.12 case — k=1 is a regression sanity, k=3 is
+  /// breadth, and this fixture validates the algebra under the
+  /// production-shape table sizing.
+  ///
+  /// Seed: 0xC1BE_1A6F ("Lagrange + 1").
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn m12_lagrange_manual_check_k2_heterogeneous() {
+    run_m12_lagrange_manual_check(
+      0xC1BE_1A6F,
+      &[
+        M12TableSpec {
+          size: 64,
+          log2: 6,
+          queries: vec![2, 5, 11, 22, 33, 44, 55, 63],
+        },
+        M12TableSpec {
+          size: 65_536,
+          log2: 16,
+          // Distinct query indices spread across n_2's address range.
+          // Padding logic in run_m12_lagrange_manual_check fills the
+          // remaining n_2 - len() witness slots with index 0.
+          queries: vec![1, 257, 1024, 8192, 16384, 32768, 49152, 65535],
+        },
+      ],
+    );
+  }
+
+  /// GH-#2 M.12: pin §5.2 #3 — k=3 broad coverage.
+  ///
+  /// k=3 covers the broadest VECTOR composition. Sizes kept small per
+  /// the brief ("Other sizes can be smaller for k=3 if 65,536-sized
+  /// tables make the test slow"). Heterogeneous-distinct sizes
+  /// (32/64/128) ensure no per-table aliasing at the eq-vector
+  /// dimension level.
+  ///
+  /// Seed: 0xC1BE_1A70.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn m12_lagrange_manual_check_k3_broad() {
+    run_m12_lagrange_manual_check(
+      0xC1BE_1A70,
+      &[
+        M12TableSpec {
+          size: 32,
+          log2: 5,
+          queries: vec![0, 7, 13, 31],
+        },
+        M12TableSpec {
+          size: 64,
+          log2: 6,
+          queries: vec![3, 14, 28, 49, 60],
+        },
+        M12TableSpec {
+          size: 128,
+          log2: 7,
+          queries: vec![5, 17, 41, 73, 99, 127],
+        },
+      ],
+    );
+  }
 }
 
 #[cfg(test)]
