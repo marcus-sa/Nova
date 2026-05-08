@@ -598,13 +598,21 @@ impl<E: Engine> LookupSumcheckInstance<E> {
   }
 }
 
-/// Project the lookup-side running-claim scalar from a [`FoldedInstance`].
+/// Project the lookup-side running-claim VECTOR from a [`FoldedInstance`].
 ///
-/// Returns the single `T_lookup` scalar that `prove_step` reads to
-/// reconstruct eval@1. At outer base, `U1.T_lookup` is `None`
-/// and this returns `ZERO`.
-pub(crate) fn lookup_running_claims_from<E: Engine>(U1: &FoldedInstance<E>) -> E::Scalar {
-  U1.T_lookup.unwrap_or(E::Scalar::ZERO)
+/// Returns the per-table `T_lookup_j` scalars in `table_id`-canonical
+/// order (matching `LookupShape::multi_column_tables.sort_by_key(|t|
+/// t.table_id)` at `relation.rs:482`). At outer base, `U1.T_lookup` is
+/// `None` and this returns an empty `Vec`.
+///
+/// Multi-table extension (GH-#2, design pin §5.1): widened from a single
+/// `E::Scalar` return to `Vec<E::Scalar>`. Single-table callers
+/// (`prove_with_lookup`, `prove_with_multi_column_lookup`,
+/// `verify_with_lookup`, `verify_with_multi_column_lookup`) read entry
+/// `[0]` (or `Scalar::ZERO` on empty Vec) to preserve byte-equivalence
+/// with the pre-#2 single-table FS transcript.
+pub(crate) fn lookup_running_claims_from<E: Engine>(U1: &FoldedInstance<E>) -> Vec<E::Scalar> {
+  U1.T_lookup.clone().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1083,7 +1091,12 @@ mod tests {
     let u1 = FoldedInstance::default(&s);
 
     assert!(u1.T_lookup.is_none());
-    assert_eq!(lookup_running_claims_from::<E>(&u1), Scalar::ZERO);
+    // Multi-table extension (GH-#2, design pin §5.1): the Vec-typed return
+    // distinguishes "no lookup running yet" (empty Vec) from "running with k
+    // tables, all currently zero" (Vec of length k filled with ZERO). At
+    // outer base, the running instance has no `T_lookup` populated yet, so
+    // the Vec is empty.
+    assert!(lookup_running_claims_from::<E>(&u1).is_empty());
   }
 
   /// Differential test: verify the polynomial evaluations match between

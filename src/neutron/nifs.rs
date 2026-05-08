@@ -186,12 +186,20 @@ pub struct NIFS<E: Engine> {
 
   /// Lookup-fold extension fields (Stage C, C1-beta).
   /// Present only when a lookup payload was supplied to the fold step.
+  ///
+  /// Multi-table extension (GH-#2, design pin §5.1): widened from
+  /// `Option<UniPoly<…>>` / `Option<Commitment<E>>` to `Option<Vec<…>>` so
+  /// the multi-table prove path can carry one polynomial / commitment per
+  /// registered table in `table_id`-canonical order. Single-table use
+  /// (`prove_with_lookup`, `prove_with_multi_column_lookup`) populates a
+  /// one-element Vec — the FS transcript byte stream remains identical to
+  /// pre-#2 by §5.2 #2.
   #[cfg(feature = "lookup-fold")]
-  pub(crate) poly_lookup: Option<UniPoly<E::Scalar>>,
+  pub(crate) poly_lookup: Option<Vec<UniPoly<E::Scalar>>>,
   #[cfg(feature = "lookup-fold")]
-  pub(crate) comm_inv_w: Option<Commitment<E>>,
+  pub(crate) comm_inv_w: Option<Vec<Commitment<E>>>,
   #[cfg(feature = "lookup-fold")]
-  pub(crate) comm_inv_t: Option<Commitment<E>>,
+  pub(crate) comm_inv_t: Option<Vec<Commitment<E>>>,
 }
 
 impl<E: Engine> NIFS<E> {
@@ -671,7 +679,15 @@ impl<E: Engine> NIFS<E> {
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
 
     // --- Step (7): lookup sumcheck ---
-    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+    // Multi-table extension (GH-#2, design pin §5.1): `lookup_running_claims_from`
+    // returns `Vec<E::Scalar>`. Single-table (`prove_with_lookup`) reads
+    // entry [0]; outer-base empty Vec falls back to ZERO. FS transcript
+    // unchanged (§5.2 #2).
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(U1);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(E::Scalar::ZERO);
     let poly_lookup = lookup_inst.prove_step(&rho, &t_lookup_running);
 
     // absorb lookup poly AFTER R1CS poly
@@ -729,12 +745,17 @@ impl<E: Engine> NIFS<E> {
     };
     let folded_lw = running_lw.fold(&fresh_lw, &r_b);
 
+    // Multi-table extension (GH-#2, design pin §5.1): `poly_lookup`,
+    // `comm_inv_w`, `comm_inv_t` are now `Option<Vec<…>>`. Single-table
+    // (`prove_with_lookup`) wraps the single value in a one-element Vec.
+    // FS transcript byte stream is unchanged — only the in-memory NIFS
+    // envelope grows by a Vec length prefix.
     let nifs = NIFS {
       comm_E,
       poly,
-      poly_lookup: Some(poly_lookup),
-      comm_inv_w: Some(comm_inv_w2),
-      comm_inv_t: Some(comm_inv_t2),
+      poly_lookup: Some(vec![poly_lookup]),
+      comm_inv_w: Some(vec![comm_inv_w2]),
+      comm_inv_t: Some(vec![comm_inv_t2]),
     };
 
     Ok((nifs, (U, W), folded_lw))
@@ -993,7 +1014,14 @@ impl<E: Engine> NIFS<E> {
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
 
     // Lookup sumcheck
-    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+    // Multi-table extension (GH-#2, design pin §5.1): `lookup_running_claims_from`
+    // returns `Vec<E::Scalar>`. Single-table (`prove_with_multi_column_lookup`)
+    // reads entry [0]; outer-base empty Vec falls back to ZERO.
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(U1);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(E::Scalar::ZERO);
     let poly_lookup = lookup_inst.prove_step(&rho, &t_lookup_running);
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_lookup, &mut ro);
 
@@ -1040,12 +1068,16 @@ impl<E: Engine> NIFS<E> {
     };
     let folded_lw = running_lw.fold(&fresh_lw, &r_b);
 
+    // Multi-table extension (GH-#2, design pin §5.1): single-table
+    // (`prove_with_multi_column_lookup`) wraps in a one-element Vec — see
+    // `prove_with_lookup` for the same pattern. The FS transcript byte
+    // stream is preserved (§5.2 #2).
     let nifs = NIFS {
       comm_E,
       poly,
-      poly_lookup: Some(poly_lookup),
-      comm_inv_w: Some(comm_inv_w2),
-      comm_inv_t: Some(comm_inv_t2),
+      poly_lookup: Some(vec![poly_lookup]),
+      comm_inv_w: Some(vec![comm_inv_w2]),
+      comm_inv_t: Some(vec![comm_inv_t2]),
     };
 
     Ok((nifs, (U, W), folded_lw))
@@ -1122,13 +1154,23 @@ impl<E: Engine> NIFS<E> {
 
     let _r_logup = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
-    let comm_inv_w = self
+    // Multi-table extension (GH-#2, design pin §5.1): single-table verify
+    // path reads entry [0] of the Vec-typed lookup fields. The FS transcript
+    // byte stream is preserved (§5.2 #2) — the absorb_in_ro2 call sees the
+    // single Commitment/UniPoly value, identical to the pre-#2 emission.
+    let comm_inv_w_vec = self
       .comm_inv_w
       .as_ref()
       .ok_or(NovaError::InvalidSumcheckProof)?;
-    let comm_inv_t = self
+    let comm_inv_t_vec = self
       .comm_inv_t
       .as_ref()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let comm_inv_w = comm_inv_w_vec
+      .first()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let comm_inv_t = comm_inv_t_vec
+      .first()
       .ok_or(NovaError::InvalidSumcheckProof)?;
     comm_inv_w.absorb_in_ro2(&mut ro);
     comm_inv_t.absorb_in_ro2(&mut ro);
@@ -1139,11 +1181,18 @@ impl<E: Engine> NIFS<E> {
     }
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly, &mut ro);
 
-    let poly_lookup = self
+    let poly_lookup_vec = self
       .poly_lookup
       .as_ref()
       .ok_or(NovaError::InvalidSumcheckProof)?;
-    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+    let poly_lookup = poly_lookup_vec
+      .first()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(U1);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(E::Scalar::ZERO);
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup, &mut ro);
 
     let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
@@ -1196,13 +1245,22 @@ impl<E: Engine> NIFS<E> {
     let _r_logup = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
     // --- Step (6): absorb inverse commitments ---
-    let comm_inv_w = self
+    // Multi-table extension (GH-#2, design pin §5.1): single-table verify
+    // path reads entry [0] of the now-Vec lookup fields. FS transcript
+    // unchanged (§5.2 #2).
+    let comm_inv_w_vec = self
       .comm_inv_w
       .as_ref()
       .ok_or(NovaError::InvalidSumcheckProof)?;
-    let comm_inv_t = self
+    let comm_inv_t_vec = self
       .comm_inv_t
       .as_ref()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let comm_inv_w = comm_inv_w_vec
+      .first()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+    let comm_inv_t = comm_inv_t_vec
+      .first()
       .ok_or(NovaError::InvalidSumcheckProof)?;
     comm_inv_w.absorb_in_ro2(&mut ro);
     comm_inv_t.absorb_in_ro2(&mut ro);
@@ -1218,12 +1276,19 @@ impl<E: Engine> NIFS<E> {
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&self.poly, &mut ro);
 
     // --- Step (7): lookup sumcheck verification ---
-    let poly_lookup = self
+    let poly_lookup_vec = self
       .poly_lookup
       .as_ref()
       .ok_or(NovaError::InvalidSumcheckProof)?;
+    let poly_lookup = poly_lookup_vec
+      .first()
+      .ok_or(NovaError::InvalidSumcheckProof)?;
 
-    let t_lookup_running = lookup_running_claims_from::<E>(U1);
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(U1);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(E::Scalar::ZERO);
 
     // absorb lookup poly AFTER R1CS poly
     <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup, &mut ro);
@@ -1633,8 +1698,10 @@ mod tests {
     let (nifs1, (folded_U1, folded_W1), folded_lw1) = res.unwrap();
 
     // Update payload with the computed inverse commitments for verify
-    payload1.comm_inv_w = nifs1.comm_inv_w.unwrap();
-    payload1.comm_inv_t = nifs1.comm_inv_t.unwrap();
+    // Multi-table extension (GH-#2): NIFS lookup commitments are now
+    // `Option<Vec<Commitment<E>>>`. Single-table tests project to entry [0].
+    payload1.comm_inv_w = nifs1.comm_inv_w.as_ref().unwrap()[0];
+    payload1.comm_inv_t = nifs1.comm_inv_t.as_ref().unwrap()[0];
 
     // Verify step 1
     let res = nifs1.verify_with_lookup(&ro_consts, &pp_digest, &running_U, &U1, &payload1);
@@ -1654,7 +1721,7 @@ mod tests {
     );
     println!(
       "Step 1: T_lookup = {:?}",
-      folded_U1.T_lookup.unwrap()
+      folded_U1.T_lookup.as_ref().unwrap()
     );
 
     // R1CS-side satisfiability check
@@ -1702,8 +1769,8 @@ mod tests {
     let (nifs2, (folded_U2, folded_W2), _folded_lw2) = res.unwrap();
 
     // Update payload with computed inverse commitments for verify
-    payload2.comm_inv_w = nifs2.comm_inv_w.unwrap();
-    payload2.comm_inv_t = nifs2.comm_inv_t.unwrap();
+    payload2.comm_inv_w = nifs2.comm_inv_w.as_ref().unwrap()[0];
+    payload2.comm_inv_t = nifs2.comm_inv_t.as_ref().unwrap()[0];
 
     // Verify step 2
     let res = nifs2.verify_with_lookup(&ro_consts, &pp_digest, &running_U, &U2, &payload2);
@@ -1723,7 +1790,7 @@ mod tests {
     );
     println!(
       "Step 2: T_lookup = {:?}",
-      folded_U2.T_lookup.unwrap()
+      folded_U2.T_lookup.as_ref().unwrap()
     );
 
     // R1CS-side satisfiability check
@@ -1949,11 +2016,12 @@ mod tests {
       .expect("prove_with_multi_column_lookup must succeed on satisfying witness");
 
     // Construct verify-side payload with the computed inverse commitments.
+    // Multi-table extension (GH-#2): NIFS lookup commitments are now Vec.
     let payload_for_verify = LookupPayload::<E> {
       comm_L: payload.comm_L,
       comm_ts: payload.comm_ts,
-      comm_inv_w: nifs.comm_inv_w.unwrap(),
-      comm_inv_t: nifs.comm_inv_t.unwrap(),
+      comm_inv_w: nifs.comm_inv_w.as_ref().unwrap()[0],
+      comm_inv_t: nifs.comm_inv_t.as_ref().unwrap()[0],
       T2_lookup: Scalar::ZERO,
       comm_values: payload.comm_values.clone(),
     };
@@ -2132,11 +2200,12 @@ mod tests {
       .expect("prove still produces a NIFS for malicious witness — soundness is in the running target divergence");
 
     // Verify completes without error (per-step (C)-binding holds).
+    // Multi-table extension (GH-#2): NIFS lookup commitments are now Vec.
     let payload_for_verify = LookupPayload::<E> {
       comm_L: payload.comm_L,
       comm_ts: payload.comm_ts,
-      comm_inv_w: nifs.comm_inv_w.unwrap(),
-      comm_inv_t: nifs.comm_inv_t.unwrap(),
+      comm_inv_w: nifs.comm_inv_w.as_ref().unwrap()[0],
+      comm_inv_t: nifs.comm_inv_t.as_ref().unwrap()[0],
       T2_lookup: Scalar::ZERO,
       comm_values: payload.comm_values.clone(),
     };
@@ -2155,9 +2224,12 @@ mod tests {
     // Both prover and verifier produce the same folded instance, but
     // its `T_lookup` is non-zero, signaling the off-table query.
     assert_eq!(folded_U, verified_U);
+    // Multi-table extension (GH-#2): `T_lookup` is now `Option<Vec<E::Scalar>>`.
+    // For single-table tests we read entry [0].
     let t_lookup = folded_U
       .T_lookup
-      .expect("T_lookup must be populated after multi-column fold step");
+      .as_ref()
+      .expect("T_lookup must be populated after multi-column fold step")[0];
     assert_ne!(
       t_lookup,
       Scalar::ZERO,
@@ -2346,8 +2418,8 @@ mod tests {
         eq_t1r,
       )
       .expect("step 1 prove must succeed");
-    payload1.comm_inv_w = nifs1.comm_inv_w.unwrap();
-    payload1.comm_inv_t = nifs1.comm_inv_t.unwrap();
+    payload1.comm_inv_w = nifs1.comm_inv_w.as_ref().unwrap()[0];
+    payload1.comm_inv_t = nifs1.comm_inv_t.as_ref().unwrap()[0];
     let verified1 = nifs1
       .verify_with_multi_column_lookup(
         &ro_consts,
@@ -2402,8 +2474,8 @@ mod tests {
         eq_t2r,
       )
       .expect("step 2 prove must succeed");
-    payload2.comm_inv_w = nifs2.comm_inv_w.unwrap();
-    payload2.comm_inv_t = nifs2.comm_inv_t.unwrap();
+    payload2.comm_inv_w = nifs2.comm_inv_w.as_ref().unwrap()[0];
+    payload2.comm_inv_t = nifs2.comm_inv_t.as_ref().unwrap()[0];
     let verified2 = nifs2
       .verify_with_multi_column_lookup(
         &ro_consts,
@@ -2839,8 +2911,8 @@ mod tests {
         e1tr,
       )
       .expect("step 1 (sub-table 0) prove must succeed");
-    p1.comm_inv_w = nifs1.comm_inv_w.unwrap();
-    p1.comm_inv_t = nifs1.comm_inv_t.unwrap();
+    p1.comm_inv_w = nifs1.comm_inv_w.as_ref().unwrap()[0];
+    p1.comm_inv_t = nifs1.comm_inv_t.as_ref().unwrap()[0];
     let v1 = nifs1
       .verify_with_multi_column_lookup(
         &ro_consts,
@@ -2883,8 +2955,8 @@ mod tests {
         e2tr,
       )
       .expect("step 2 (sub-table 1) prove must succeed");
-    p2.comm_inv_w = nifs2.comm_inv_w.unwrap();
-    p2.comm_inv_t = nifs2.comm_inv_t.unwrap();
+    p2.comm_inv_w = nifs2.comm_inv_w.as_ref().unwrap()[0];
+    p2.comm_inv_t = nifs2.comm_inv_t.as_ref().unwrap()[0];
     let v2 = nifs2
       .verify_with_multi_column_lookup(
         &ro_consts,

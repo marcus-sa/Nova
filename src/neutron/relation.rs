@@ -255,8 +255,14 @@ pub struct FoldedInstance<E: Engine> {
   pub(crate) comm_inv_t: Option<Commitment<E>>,
   /// Running target for the lookup-zero side. Mirrors the existing `T` for
   /// the R1CS-zero side (§A.2.1).
+  ///
+  /// Multi-table extension (GH-#2, design pin §1.3): widened from
+  /// `Option<E::Scalar>` to `Option<Vec<E::Scalar>>`. Each entry is the
+  /// per-table running scalar `T_lookup_j` indexed by `table_id`-canonical
+  /// position in `LookupShape::multi_column_tables`. Single-table use
+  /// degenerates cleanly to a one-element Vec.
   #[cfg(feature = "lookup-fold")]
-  pub(crate) T_lookup: Option<E::Scalar>,
+  pub(crate) T_lookup: Option<Vec<E::Scalar>>,
 }
 
 /// Verifier-side projection of [`LookupPayload`] carried as a public input
@@ -631,8 +637,11 @@ impl<E: Engine> FoldedInstance<E> {
       comm_inv_w: self.comm_inv_w,
       #[cfg(feature = "lookup-fold")]
       comm_inv_t: self.comm_inv_t,
+      // Multi-table extension (GH-#2, design pin §5.1): `T_lookup` is now
+      // `Option<Vec<E::Scalar>>`; passthrough needs `.clone()` since Vec is
+      // not `Copy`.
       #[cfg(feature = "lookup-fold")]
-      T_lookup: self.T_lookup,
+      T_lookup: self.T_lookup.clone(),
     })
   }
 
@@ -673,6 +682,15 @@ impl<E: Engine> FoldedInstance<E> {
     // Lookup-zero side: fold each commitment independently under the SAME r_b
     // (the common Fiat-Shamir challenge — Path β, addendum §A.2.4). Default
     // (`None`) running commitments contribute zero to the (1 - r_b) weight.
+    //
+    // Multi-table extension (GH-#2, design pin §5.1): only `T_lookup` is
+    // widened to `Option<Vec<…>>` at the `FoldedInstance` level (single
+    // running scalar per table for the per-table (C)-binding). The four
+    // running commitments (`comm_L`, `comm_ts`, `comm_inv_w`, `comm_inv_t`)
+    // remain `Option<Commitment<E>>` per the pin's explicit listing — the
+    // single-table fold path here stores them unchanged. M.2's multi-table
+    // fold variant is a separate question; its FoldedInstance shape will
+    // be re-pinned at M.2 time.
     let one_minus_rb = E::Scalar::ONE - r_b;
     let zero = Commitment::<E>::default();
     let fold_one = |running: Option<Commitment<E>>, fresh: Commitment<E>| -> Commitment<E> {
@@ -694,7 +712,10 @@ impl<E: Engine> FoldedInstance<E> {
       comm_ts: Some(comm_ts_new),
       comm_inv_w: Some(comm_inv_w_new),
       comm_inv_t: Some(comm_inv_t_new),
-      T_lookup: Some(*T_lookup_out),
+      // Multi-table extension (GH-#2, design pin §5.1): only `T_lookup` is
+      // Vec-typed at the FoldedInstance level. Single-table use wraps the
+      // folded running scalar in a one-element Vec.
+      T_lookup: Some(vec![*T_lookup_out]),
     })
   }
 }

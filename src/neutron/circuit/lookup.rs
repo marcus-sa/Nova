@@ -61,16 +61,22 @@ impl<E: Engine> AllocatedLookupNIFS<E> {
     mut cs: CS,
     nifs: Option<&NIFS<E>>,
   ) -> Result<Self, SynthesisError> {
+    // Multi-table extension (GH-#2, design pin §5.1): `poly_lookup`,
+    // `comm_inv_w`, `comm_inv_t` on `NIFS<E>` are now `Option<Vec<…>>`.
+    // The single-table in-circuit allocation projects to entry [0]; the
+    // multi-table in-circuit allocation (M.6) is a separate type
+    // (`AllocatedLookupNIFSMultiTable`) introduced at that stage.
     let poly_lookup = AllocatedUniPoly::alloc(
       cs.namespace(|| "allocate poly_lookup"),
       LOOKUP_POLY_DEGREE,
-      nifs.and_then(|n| n.poly_lookup.as_ref()),
+      nifs.and_then(|n| n.poly_lookup.as_ref()).and_then(|v| v.first()),
     )?;
 
     let comm_inv_w = AllocatedNonnativePoint::alloc(
       cs.namespace(|| "allocate comm_inv_w"),
       nifs
         .and_then(|n| n.comm_inv_w.as_ref())
+        .and_then(|v| v.first())
         .map(|c| c.to_coordinates()),
     )?;
 
@@ -78,6 +84,7 @@ impl<E: Engine> AllocatedLookupNIFS<E> {
       cs.namespace(|| "allocate comm_inv_t"),
       nifs
         .and_then(|n| n.comm_inv_t.as_ref())
+        .and_then(|v| v.first())
         .map(|c| c.to_coordinates()),
     )?;
 
@@ -350,12 +357,18 @@ mod tests {
     // The payload's inverse commitments are filled in by prove_with_lookup
     // via the NIFS struct; for the in-circuit verifier we use the NIFS
     // commitments directly (the native verifier does the same).
+    //
+    // Multi-table extension (GH-#2, design pin §5.1): NIFS lookup
+    // commitments are now `Option<Vec<Commitment<E>>>`. Single-table tests
+    // project to entry [0].
     let comm_inv_w = nifs
       .comm_inv_w
-      .expect("prove_with_lookup must populate comm_inv_w");
+      .as_ref()
+      .expect("prove_with_lookup must populate comm_inv_w")[0];
     let comm_inv_t = nifs
       .comm_inv_t
-      .expect("prove_with_lookup must populate comm_inv_t");
+      .as_ref()
+      .expect("prove_with_lookup must populate comm_inv_t")[0];
 
     // Native verify_with_lookup — the in-circuit must match this.
     let payload_for_verify = LookupPayload::<E> {
@@ -402,11 +415,17 @@ mod tests {
     comm_inv_w.absorb_in_ro2(&mut ro);
     comm_inv_t.absorb_in_ro2(&mut ro);
     <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&nifs.poly, &mut ro);
-    let poly_lookup_ref = nifs.poly_lookup.as_ref().unwrap();
+    let poly_lookup_ref = &nifs.poly_lookup.as_ref().unwrap()[0];
     <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup_ref, &mut ro);
     let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
-    let t_lookup_running = lookup_running_claims_from::<E>(&running_U);
+    // Multi-table extension (GH-#2): `lookup_running_claims_from` returns
+    // `Vec<E::Scalar>`. Single-table tests project to entry [0].
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(&running_U);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(Scalar::ZERO);
     let native_t_lookup_out = LookupSumcheckInstance::<E>::verify_step(
       &rho,
       &r_b,
@@ -628,8 +647,9 @@ mod tests {
     )
     .expect("prove_with_multi_column_lookup must succeed");
 
-    let comm_inv_w = nifs.comm_inv_w.unwrap();
-    let comm_inv_t = nifs.comm_inv_t.unwrap();
+    // Multi-table extension (GH-#2): NIFS lookup commitments are now Vec.
+    let comm_inv_w = nifs.comm_inv_w.as_ref().unwrap()[0];
+    let comm_inv_t = nifs.comm_inv_t.as_ref().unwrap()[0];
 
     // Native verify_with_multi_column_lookup.
     let payload_for_verify = LookupPayload::<E> {
@@ -678,11 +698,16 @@ mod tests {
     comm_inv_w.absorb_in_ro2(&mut ro);
     comm_inv_t.absorb_in_ro2(&mut ro);
     <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&nifs.poly, &mut ro);
-    let poly_lookup_ref = nifs.poly_lookup.as_ref().unwrap();
+    let poly_lookup_ref = &nifs.poly_lookup.as_ref().unwrap()[0];
     <UniPoly<Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(poly_lookup_ref, &mut ro);
     let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
 
-    let t_lookup_running = lookup_running_claims_from::<E>(&running_U);
+    // Multi-table extension (GH-#2): `lookup_running_claims_from` returns Vec.
+    let t_lookup_running_vec = lookup_running_claims_from::<E>(&running_U);
+    let t_lookup_running = t_lookup_running_vec
+      .first()
+      .copied()
+      .unwrap_or(Scalar::ZERO);
     let native_t_lookup_out = LookupSumcheckInstance::<E>::verify_step(
       &rho,
       &r_b,
