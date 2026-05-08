@@ -5570,6 +5570,600 @@ mod tests {
       ],
     );
   }
+
+  // =========================================================================
+  // GH-#2 M.14: cross-table cancellation hard-reject (pin §5.2 #6)
+  //
+  // Run with:
+  //   cargo test --release -p nova-snark --features lookup-fold m14_
+  //
+  // Pin §5.2 #6 obligation (verbatim, design pin
+  // `c1-beta-multi-table-fold-design-pin-2026-05-08.md` line 561):
+  //
+  // > Cross-table cancellation negative test (hard-reject contract):
+  // > synthesise a multi-table fold step where the prover supplies bundles
+  // > for T_1 and T_2 with deliberately-corrupted witnesses such that the
+  // > **per-table** (C)-binding for each table individually fails (e.g.,
+  // > T_1's `Σ inv_w_1 − Σ inv_t_1 = +Δ`, T_2's `Σ inv_w_2 − Σ inv_t_2 =
+  // > −Δ`), but a hypothetical SUM-aggregate (C)-binding `Σ_j (poly_j(0) +
+  // > poly_j(1)) == Σ_j T_running_j` would succeed by cancellation. Assert
+  // > `verify_with_multi_table_lookup` REJECTS at the per-table (C)-binding
+  // > for T_1 (and would also reject for T_2). This is the canonical
+  // > regression check that the VECTOR composition closes the §1.3 forgery
+  // > vector; per the cryptography rule the obligation is on the
+  // > differential harness, not just on the soundness sketch.
+  //
+  // Pin §1.3 forgery vector (verbatim, design pin line 90):
+  //
+  // > If we sum running claims across heterogeneous tables `Σ_j T_lookup_j`,
+  // > a malicious prover can offset `T_lookup_1 = +Δ`, `T_lookup_2 = −Δ`
+  // > with internally-inconsistent witnesses for both tables, and the
+  // > sum-of-claims (C)-binding `Σ_j (poly_j(0) + poly_j(1)) == Σ_j
+  // > T_running_j` still holds. The per-table LogUp identity is broken; the
+  // > sum-aggregate identity is preserved by cancellation. **This is a
+  // > forgery vector** — the chunk-step's window-table query and chunk-
+  // > lookup query are semantically distinct (one looks up an EC-point
+  // > coordinate, one range-checks a 16-bit chunk); cross-table
+  // > cancellation would let a prover assert false range-checks while
+  // > compensating in the window-table claim.
+  //
+  // VECTOR composition closure (pin §3 / §1.3): the verifier's per-table
+  // (C)-binding loop at `vendor/nova/src/neutron/nifs.rs:1977-1990` checks
+  // `poly_lookup_j(0) + poly_lookup_j(1) == T_lookup_running_j` per j and
+  // returns `Err(NovaError::InvalidSumcheckProof)` on the first failure
+  // (j=0 in our k=2 fixture). Because the check is per-j, no cross-table
+  // cancellation can satisfy it: even if `T_1's offset = +Δ` and
+  // `T_2's offset = −Δ` produce a vanishing aggregate sum, the per-table
+  // check sees `+Δ` at j=0 and rejects before reaching j=1. The (M.4)
+  // sibling test `m4_per_table_c_binding_hard_rejects_corrupted_t_lookup`
+  // covers single-table corruption (Δ on T_2 alone, T_1 honest); this
+  // M.14 test covers the symmetric cancellation pattern that pin §1.3
+  // names as the load-bearing forgery vector. M.4 closes "single-table
+  // corruption is caught"; M.14 closes "cross-table cancellation does not
+  // bypass the per-table check".
+  //
+  // ## Test shape (mirrors M.4's two-step pattern)
+  //
+  // 1. Setup k=2 lookup shape (n_1 = n_2 = 64, single value column each).
+  //    Heterogeneous sizes are acceptable per the brief but homogeneous
+  //    n_1 = n_2 keeps the fixture narrative-aligned with M.4 (the
+  //    cancellation property is size-independent — both `T_lookup_j`
+  //    accumulate as `Scalar` regardless of `n_j`).
+  // 2. Honest step 1 prove + verify → produces honest `folded_U_s1`
+  //    carrying `T_lookup = [t1_HONEST, t2_HONEST]`.
+  // 3. Honest step 2 prove (using HONEST `folded_U_s1`) → produces `nifs2`
+  //    whose `poly_lookup[j]` satisfies the (C)-binding for j ∈ {0, 1}
+  //    against the HONEST running scalars.
+  // 4. Sanity: honest step-2 verify accepts (positive control).
+  // 5. **Direction A — forward cancellation** (`+Δ` on T_1, `−Δ` on T_2):
+  //    pre-step-2-verify, mutate the running `folded_U_s1.T_lookup` to
+  //    `[t1_HONEST + Δ, t2_HONEST − Δ]`. The aggregate `(t1+Δ) + (t2−Δ)
+  //    = t1 + t2` is preserved (a hypothetical SUM-aggregate (C)-binding
+  //    would still hold). The per-table check for j=0 sees a mismatch
+  //    of magnitude Δ and rejects.
+  // 6. **Direction B — reverse cancellation** (`−Δ'` on T_1, `+Δ'` on T_2):
+  //    sign-swap symmetry control. Per the brief: "Both directions confirm
+  //    the per-table check is independent of which table's sign is
+  //    flipped." Different Δ' deterministic seed → different reject
+  //    payload, but the same `Err(InvalidSumcheckProof)` outcome.
+  //
+  // The error variant is `NovaError::InvalidSumcheckProof` returned at
+  // `vendor/nova/src/neutron/nifs.rs:1989` (the per-j (C)-binding inside
+  // the `for j in 0..k` loop at line 1977-1993). The first-fire is j=0
+  // because the loop is j-ascending; the j=1 check is unreachable in the
+  // forward-cancellation case but would also reject if reached (its
+  // `poly_lookup_2(0) + poly_lookup_2(1) == t2_HONEST` would mismatch
+  // `t2_HONEST − Δ`).
+  //
+  // ## Determinism
+  //
+  // Seed `0xC1BE_CA1E` ("cancellation"). Both Δ values are derived from
+  // this single seed; `assert_ne!(delta, Scalar::ZERO)` ensures the
+  // corruption is non-vacuous (a `Δ = 0` would not corrupt). Per
+  // `.claude/rules/cryptography.md` the harness is deterministic via
+  // `ChaCha20Rng::seed_from_u64`.
+  //
+  // ## Halt-and-ask trigger (per dispatch brief)
+  //
+  // If `verify_with_multi_table_lookup` ACCEPTS either corrupted bundle
+  // pair (i.e. the per-table (C)-binding gets bypassed by the cancellation
+  // pattern), this is a **soundness-class incident** — pin §1.3's forgery
+  // vector is open at vendor HEAD. The crafter MUST halt, file a halt
+  // report, and NOT commit. The `assert!(matches!(... Err(...)))` panic
+  // IS the halt signal.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn m14_cross_table_cancellation_hard_rejects() {
+    use crate::neutron::relation::{
+      LookupPayload, LookupPayloadPublicMultiTable, LookupRunningWitness, LookupShape,
+      LookupTableHandle, MultiColumnLookupTable,
+    };
+    use crate::spartan::polys::power::PowPolynomial;
+    use crate::traits::commitment::CommitmentEngineTrait;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1BE_CA1E);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    let num_cons = 32usize;
+    let circuit_shape: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit_shape.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // k=2 homogeneous-size random tables (narrative-aligned with M.4;
+    // cancellation property is size-independent per pin §1.3).
+    let table_size = 64usize;
+    let table_log2 = 6usize;
+    let t1_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+    let t2_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+    let identity: Vec<Scalar> = (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![
+        LookupTableHandle {
+          table_id: 0,
+          size: table_size,
+          commitment: <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO),
+        },
+        LookupTableHandle {
+          table_id: 1,
+          size: table_size,
+          commitment: <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO),
+        },
+      ],
+      multi_column_tables: vec![
+        MultiColumnLookupTable {
+          table_id: 0,
+          size: table_size,
+          columns: vec![t1_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t1_col0, &Scalar::ZERO)],
+        },
+        MultiColumnLookupTable {
+          table_id: 1,
+          size: table_size,
+          columns: vec![t2_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(&ck, &t2_col0, &Scalar::ZERO)],
+        },
+      ],
+      num_addr_columns: 1,
+      num_witness_columns: 2,
+      witness_ell_cached: table_log2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // Two distinct R1CS pairs for the two fold steps.
+    let make_r1cs = |seed: u64| {
+      let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+        Some(vec![Scalar::from(seed)]),
+        NonTrivialCircuit::<Scalar>::new(num_cons),
+      );
+      let mut cs = SatisfyingAssignment::<E>::new();
+      let _ = circuit.synthesize(&mut cs);
+      let (u, w) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+      (u, w.pad(&shape))
+    };
+    let (u_step1, w_step1) = make_r1cs(2);
+    let (u_step2, w_step2) = make_r1cs(3);
+
+    // Build a satisfying single-column witness for a given table (mirrors
+    // M.4's `build_satisfying_witness`).
+    let build_satisfying_witness =
+      |table: &[Scalar], query_indices: &[usize]| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let mut witness_addr = vec![Scalar::ZERO; table_size];
+        let mut witness_v0 = vec![Scalar::ZERO; table_size];
+        let mut multiplicities = vec![Scalar::ZERO; table_size];
+        for (i, &idx) in query_indices.iter().enumerate() {
+          witness_addr[i] = Scalar::from(idx as u64);
+          witness_v0[i] = table[idx];
+          multiplicities[idx] += Scalar::ONE;
+        }
+        for i in query_indices.len()..table_size {
+          witness_addr[i] = Scalar::from(0u64);
+          witness_v0[i] = table[0];
+          multiplicities[0] += Scalar::ONE;
+        }
+        (witness_addr, witness_v0, multiplicities)
+      };
+
+    // Per-table eq dimensions (mirrors M.4 at nifs.rs:4748-4755).
+    let per_table_log2 = table_log2;
+    let ell1 = per_table_log2.div_ceil(2);
+    let ell2 = per_table_log2 / 2;
+    let per_table_w_left = 1usize << ell1;
+    let per_table_w_right = 1usize << ell2;
+    let per_table_t_left = per_table_w_left;
+    let per_table_t_right = per_table_w_right;
+
+    let mk_eqs =
+      |rng: &mut ChaCha20Rng| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let tau_w = Scalar::random(&mut *rng);
+        let pow_w = PowPolynomial::new(&tau_w, per_table_log2);
+        let combined_w = pow_w.split_evals(per_table_w_left, per_table_w_right);
+        let (eq_w_left, eq_w_right) = combined_w.split_at(per_table_w_left);
+        let tau_t = Scalar::random(&mut *rng);
+        let pow_t = PowPolynomial::new(&tau_t, per_table_log2);
+        let combined_t_eq = pow_t.split_evals(per_table_t_left, per_table_t_right);
+        let (eq_t_left, eq_t_right) = combined_t_eq.split_at(per_table_t_left);
+        (
+          eq_w_left.to_vec(),
+          eq_w_right.to_vec(),
+          eq_t_left.to_vec(),
+          eq_t_right.to_vec(),
+        )
+      };
+
+    // Per-table running witness sized to n_j = table_size.
+    let mk_running_lw = || LookupRunningWitness::<E> {
+      witness: vec![Scalar::ZERO; table_size],
+      inv_w: vec![Scalar::ZERO; table_size],
+      table: vec![Scalar::ZERO; table_size],
+      multiplicities: vec![Scalar::ZERO; table_size],
+      inv_t: vec![Scalar::ZERO; table_size],
+      eq_w_left: vec![Scalar::ZERO; per_table_w_left],
+      eq_w_right: vec![Scalar::ZERO; per_table_w_right],
+      eq_t_left: vec![Scalar::ZERO; per_table_t_left],
+      eq_t_right: vec![Scalar::ZERO; per_table_t_right],
+    };
+
+    let mk_bundle =
+      |table_id: u64,
+       payload: LookupPayload<E>,
+       wa: Vec<Scalar>,
+       wv: Vec<Scalar>,
+       m: Vec<Scalar>,
+       eq_w_left: Vec<Scalar>,
+       eq_w_right: Vec<Scalar>,
+       eq_t_left: Vec<Scalar>,
+       eq_t_right: Vec<Scalar>,
+       running_lw: LookupRunningWitness<E>|
+       -> super::PerTableBundle<E> {
+        super::PerTableBundle::<E> {
+          table_id,
+          payload,
+          fresh_witness_address: wa,
+          fresh_witness_value_columns: vec![wv],
+          fresh_multiplicities: m,
+          fresh_eq_w_left: eq_w_left,
+          fresh_eq_w_right: eq_w_right,
+          fresh_eq_t_left: eq_t_left,
+          fresh_eq_t_right: eq_t_right,
+          running_lw,
+        }
+      };
+
+    // === Step 1: honest prove ===
+    // Distinct query indices per table — the per-table running scalars
+    // t1_HONEST and t2_HONEST emerge generically distinct (a buggy prover
+    // that aliased them would surface here as a step-2 verify failure
+    // even before corruption).
+    let queries_t1_step1 = [1usize, 4, 9, 16];
+    let queries_t2_step1 = [2usize, 5, 11, 22];
+    let (wa_1_s1, wv_1_s1, m_1_s1) = build_satisfying_witness(&t1_col0, &queries_t1_step1);
+    let (wa_2_s1, wv_2_s1, m_2_s1) = build_satisfying_witness(&t2_col0, &queries_t2_step1);
+
+    let payload_1_s1 = LookupPayload::<E> {
+      comm_L: <E as Engine>::CE::commit(&ck, &wa_1_s1, &Scalar::ZERO),
+      comm_ts: <E as Engine>::CE::commit(&ck, &m_1_s1, &Scalar::ZERO),
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![<E as Engine>::CE::commit(&ck, &wv_1_s1, &Scalar::ZERO)],
+    };
+    let payload_2_s1 = LookupPayload::<E> {
+      comm_L: <E as Engine>::CE::commit(&ck, &wa_2_s1, &Scalar::ZERO),
+      comm_ts: <E as Engine>::CE::commit(&ck, &m_2_s1, &Scalar::ZERO),
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![<E as Engine>::CE::commit(&ck, &wv_2_s1, &Scalar::ZERO)],
+    };
+
+    let (eq_w1l_s1, eq_w1r_s1, eq_t1l_s1, eq_t1r_s1) = mk_eqs(&mut rng);
+    let (eq_w2l_s1, eq_w2r_s1, eq_t2l_s1, eq_t2r_s1) = mk_eqs(&mut rng);
+
+    let running_W = FoldedWitness::default(&str_local);
+    let running_U = FoldedInstance::default(&str_local);
+    let bundle_1_s1 = mk_bundle(
+      0,
+      payload_1_s1.clone(),
+      wa_1_s1,
+      wv_1_s1,
+      m_1_s1,
+      eq_w1l_s1,
+      eq_w1r_s1,
+      eq_t1l_s1,
+      eq_t1r_s1,
+      mk_running_lw(),
+    );
+    let bundle_2_s1 = mk_bundle(
+      1,
+      payload_2_s1.clone(),
+      wa_2_s1,
+      wv_2_s1,
+      m_2_s1,
+      eq_w2l_s1,
+      eq_w2r_s1,
+      eq_t2l_s1,
+      eq_t2r_s1,
+      mk_running_lw(),
+    );
+
+    let (_nifs1, (folded_U_s1, folded_W_s1), folded_lw_s1) =
+      NIFS::<E>::prove_with_multi_table_lookup(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &running_U,
+        &running_W,
+        &u_step1,
+        &w_step1,
+        &[bundle_1_s1, bundle_2_s1],
+      )
+      .expect("step 1 prove must succeed");
+
+    // Snapshot HONEST per-table running scalars (these are what step 2's
+    // poly_lookup_j is committed to via the (C)-binding).
+    let t_lookup_honest = folded_U_s1
+      .T_lookup
+      .as_ref()
+      .expect("step-1 fold must populate T_lookup")
+      .clone();
+    assert_eq!(t_lookup_honest.len(), 2, "k=2: T_lookup must have length 2");
+    assert_ne!(
+      t_lookup_honest[0], t_lookup_honest[1],
+      "per-table running scalars must thread independently (sanity for the \
+       corruption-observability check below)"
+    );
+
+    // === Step 2: honest prove using HONEST step-1 folded state ===
+    let queries_t1_step2 = [3usize, 7, 13, 25];
+    let queries_t2_step2 = [4usize, 8, 17, 33];
+    let (wa_1_s2, wv_1_s2, m_1_s2) = build_satisfying_witness(&t1_col0, &queries_t1_step2);
+    let (wa_2_s2, wv_2_s2, m_2_s2) = build_satisfying_witness(&t2_col0, &queries_t2_step2);
+
+    let payload_1_s2 = LookupPayload::<E> {
+      comm_L: <E as Engine>::CE::commit(&ck, &wa_1_s2, &Scalar::ZERO),
+      comm_ts: <E as Engine>::CE::commit(&ck, &m_1_s2, &Scalar::ZERO),
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![<E as Engine>::CE::commit(&ck, &wv_1_s2, &Scalar::ZERO)],
+    };
+    let payload_2_s2 = LookupPayload::<E> {
+      comm_L: <E as Engine>::CE::commit(&ck, &wa_2_s2, &Scalar::ZERO),
+      comm_ts: <E as Engine>::CE::commit(&ck, &m_2_s2, &Scalar::ZERO),
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![<E as Engine>::CE::commit(&ck, &wv_2_s2, &Scalar::ZERO)],
+    };
+
+    let (eq_w1l_s2, eq_w1r_s2, eq_t1l_s2, eq_t1r_s2) = mk_eqs(&mut rng);
+    let (eq_w2l_s2, eq_w2r_s2, eq_t2l_s2, eq_t2r_s2) = mk_eqs(&mut rng);
+
+    let bundle_1_s2 = mk_bundle(
+      0,
+      payload_1_s2.clone(),
+      wa_1_s2,
+      wv_1_s2,
+      m_1_s2,
+      eq_w1l_s2,
+      eq_w1r_s2,
+      eq_t1l_s2,
+      eq_t1r_s2,
+      folded_lw_s1[0].clone(),
+    );
+    let bundle_2_s2 = mk_bundle(
+      1,
+      payload_2_s2.clone(),
+      wa_2_s2,
+      wv_2_s2,
+      m_2_s2,
+      eq_w2l_s2,
+      eq_w2r_s2,
+      eq_t2l_s2,
+      eq_t2r_s2,
+      folded_lw_s1[1].clone(),
+    );
+
+    let (nifs2, (_folded_U_s2, _folded_W_s2), _folded_lw_s2) =
+      NIFS::<E>::prove_with_multi_table_lookup(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &folded_U_s1,
+        &folded_W_s1,
+        &u_step2,
+        &w_step2,
+        &[bundle_1_s2, bundle_2_s2],
+      )
+      .expect("step 2 prove must succeed");
+
+    let public_bundles_s2 = vec![
+      LookupPayloadPublicMultiTable::<E> {
+        table_id: 0,
+        comm_L: payload_1_s2.comm_L,
+        comm_values: payload_1_s2.comm_values.clone(),
+        comm_ts: payload_1_s2.comm_ts,
+      },
+      LookupPayloadPublicMultiTable::<E> {
+        table_id: 1,
+        comm_L: payload_2_s2.comm_L,
+        comm_values: payload_2_s2.comm_values.clone(),
+        comm_ts: payload_2_s2.comm_ts,
+      },
+    ];
+
+    // === Sanity: honest step-2 verify must accept (positive control). ===
+    // If this fires, the corruption-observability arms below are
+    // meaningless; halt and surface BEFORE blaming the per-table check.
+    let _accepted = nifs2
+      .verify_with_multi_table_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &folded_U_s1,
+        &u_step2,
+        &public_bundles_s2,
+      )
+      .expect(
+        "M.14 positive control: honest step-2 verify must accept against the \
+         honest folded_U_s1. If this fires, the test fixture is broken — halt \
+         and surface BEFORE blaming the cross-table cancellation argument.",
+      );
+
+    // === Direction A — forward cancellation (+Δ on T_1, −Δ on T_2). ===
+    //
+    // Mutate `folded_U_s1.T_lookup` to `[t1_HONEST + Δ, t2_HONEST − Δ]`.
+    // The aggregate `(t1+Δ) + (t2−Δ) = t1 + t2` is preserved by
+    // construction → a hypothetical SUM-aggregate (C)-binding `Σ_j
+    // (poly_j(0) + poly_j(1)) == Σ_j T_running_j` would still hold (the
+    // step-2 prover committed `poly_lookup_j` against the HONEST running
+    // scalars, so `poly_j(0) + poly_j(1) = t_j_HONEST` per the (C)-
+    // binding tautology, and `Σ_j t_j_HONEST = (t1_HONEST + Δ) +
+    // (t2_HONEST − Δ) = t1_HONEST + t2_HONEST`). The per-table check at
+    // `nifs.rs:1987` rejects at j=0 because `poly_lookup_0(0) +
+    // poly_lookup_0(1) = t1_HONEST ≠ t1_HONEST + Δ`.
+    let delta_a = Scalar::random(&mut rng);
+    assert_ne!(
+      delta_a,
+      Scalar::ZERO,
+      "non-zero Δ_A is required for the corruption to be observable; if this \
+       fires, the seed `0xC1BE_CA1E` produced an unlucky zero — pick a \
+       different seed family per `.claude/rules/cryptography.md` ChaCha20Rng \
+       discipline"
+    );
+
+    let mut folded_U_s1_corrupt_a = folded_U_s1.clone();
+    {
+      let t_lookup_corrupt = folded_U_s1_corrupt_a
+        .T_lookup
+        .as_mut()
+        .expect("step-1 fold must have populated T_lookup");
+      assert_eq!(
+        t_lookup_corrupt.len(),
+        2,
+        "k=2: T_lookup must have length 2 for the cancellation pattern"
+      );
+      t_lookup_corrupt[0] += delta_a;
+      t_lookup_corrupt[1] -= delta_a;
+    }
+
+    // Aggregate-preservation invariant (the structural property pin §1.3
+    // calls out as the forgery condition). This `assert_eq!` makes
+    // explicit that the cancellation pattern *would* satisfy a
+    // hypothetical SUM-aggregate (C)-binding — and therefore that the
+    // per-table reject below proves the VECTOR composition is what
+    // closes the forgery, not aggregate arithmetic.
+    let aggregate_honest = t_lookup_honest[0] + t_lookup_honest[1];
+    let aggregate_corrupt_a = folded_U_s1_corrupt_a
+      .T_lookup
+      .as_ref()
+      .expect("populated above")[0]
+      + folded_U_s1_corrupt_a
+        .T_lookup
+        .as_ref()
+        .expect("populated above")[1];
+    assert_eq!(
+      aggregate_honest, aggregate_corrupt_a,
+      "Direction A cancellation invariant: the forward-cancellation \
+       corruption must preserve `Σ_j T_lookup_j` (this is the structural \
+       property pin §1.3 names as the forgery condition that a hypothetical \
+       SUM-aggregate (C)-binding would NOT detect; only the VECTOR per-table \
+       check catches it)"
+    );
+
+    let result_a = nifs2.verify_with_multi_table_lookup(
+      &ro_consts,
+      &pp_digest,
+      &str_local,
+      &folded_U_s1_corrupt_a,
+      &u_step2,
+      &public_bundles_s2,
+    );
+    assert!(
+      matches!(result_a, Err(NovaError::InvalidSumcheckProof)),
+      "M.14 Direction A: verify_with_multi_table_lookup must REJECT the \
+       forward-cancellation pattern (+Δ on T_1, −Δ on T_2) at the per-table \
+       (C)-binding for T_1 (first-fire at j=0 in the loop at \
+       `vendor/nova/src/neutron/nifs.rs:1977-1990`, returning \
+       `NovaError::InvalidSumcheckProof` from line 1989). This is the \
+       canonical regression check that the VECTOR composition closes pin \
+       §1.3's forgery vector. If this fires, the per-table check has been \
+       weakened to a SUM-aggregate — soundness-class incident, halt. Got: {:?}",
+      result_a.err()
+    );
+
+    // === Direction B — reverse cancellation (−Δ' on T_1, +Δ' on T_2). ===
+    //
+    // Sign-swap symmetry control. Per the brief: "Both directions confirm
+    // the per-table check is independent of which table's sign is
+    // flipped." Different Δ' (drawn from the same ChaCha20Rng stream, so
+    // also non-zero with overwhelming probability) → distinct corruption
+    // payload, but the same per-table check semantics. Like Direction A,
+    // the per-table check rejects at j=0 because `poly_lookup_0(0) +
+    // poly_lookup_0(1) = t1_HONEST ≠ t1_HONEST − Δ'`.
+    let delta_b = Scalar::random(&mut rng);
+    assert_ne!(
+      delta_b,
+      Scalar::ZERO,
+      "non-zero Δ_B is required for the corruption to be observable"
+    );
+
+    let mut folded_U_s1_corrupt_b = folded_U_s1.clone();
+    {
+      let t_lookup_corrupt = folded_U_s1_corrupt_b
+        .T_lookup
+        .as_mut()
+        .expect("step-1 fold must have populated T_lookup");
+      t_lookup_corrupt[0] -= delta_b;
+      t_lookup_corrupt[1] += delta_b;
+    }
+
+    // Aggregate-preservation invariant (Direction B mirrors Direction A).
+    let aggregate_corrupt_b = folded_U_s1_corrupt_b
+      .T_lookup
+      .as_ref()
+      .expect("populated above")[0]
+      + folded_U_s1_corrupt_b
+        .T_lookup
+        .as_ref()
+        .expect("populated above")[1];
+    assert_eq!(
+      aggregate_honest, aggregate_corrupt_b,
+      "Direction B cancellation invariant: reverse-cancellation must also \
+       preserve `Σ_j T_lookup_j` (sign-swap symmetry control)"
+    );
+
+    let result_b = nifs2.verify_with_multi_table_lookup(
+      &ro_consts,
+      &pp_digest,
+      &str_local,
+      &folded_U_s1_corrupt_b,
+      &u_step2,
+      &public_bundles_s2,
+    );
+    assert!(
+      matches!(result_b, Err(NovaError::InvalidSumcheckProof)),
+      "M.14 Direction B: verify_with_multi_table_lookup must REJECT the \
+       reverse-cancellation pattern (−Δ' on T_1, +Δ' on T_2) at the \
+       per-table (C)-binding for T_1. The sign-swap symmetry control \
+       confirms the per-table check is independent of which table's sign \
+       is flipped. Got: {:?}",
+      result_b.err()
+    );
+  }
 }
 
 #[cfg(test)]
