@@ -176,6 +176,54 @@ pub(crate) fn combine_columns_table<E: Engine>(
   out
 }
 
+/// Prover-side per-table bundle for the multi-table fold path
+/// (GH-#2 M.3, design pin §5.1).
+///
+/// One entry per table registered in
+/// `Structure::lookups.multi_column_tables`, in `table_id`-canonical
+/// order. The prover supplies the bundles in that order; the
+/// `prove_with_multi_table_lookup` inner debug-asserts both the count
+/// and the ordering.
+///
+/// For "absent" tables at a given fold step (queries did not touch the
+/// table this step), the bundle carries:
+/// - `payload`: zero-payload commitments per pin §1.5.3
+///   (`comm_L = commit(&[0; n_j], 0)`, `comm_values[i] = commit(&[0; n_j], 0)`,
+///   `comm_ts = commit(&[0; n_j], 0)`).
+/// - `fresh_witness_address`, `fresh_witness_value_columns[*]`,
+///   `fresh_multiplicities`: all-zero vectors of length `n_j`.
+/// - `fresh_eq_w_*`, `fresh_eq_t_*`: derived from the step's tau (the
+///   step has SOME R1CS witness regardless of whether T_j is queried).
+/// - `running_lw`: the per-table running witness; at outer base this is
+///   `LookupRunningWitness::default(...)`, mid-fold it's the prior
+///   step's folded running witness for table T_j.
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug)]
+pub struct PerTableBundle<E: Engine> {
+  /// Stable identifier for the table (must match the corresponding
+  /// `MultiColumnLookupTable::table_id` registered in the structure).
+  pub table_id: u64,
+  /// Per-step lookup-side commitment payload for this table.
+  pub payload: LookupPayload<E>,
+  /// Per-step fresh witness address column for this table (length `n_j`).
+  pub fresh_witness_address: Vec<E::Scalar>,
+  /// Per-step fresh witness value columns for this table (parallel to
+  /// `payload.comm_values`; each of length `n_j`).
+  pub fresh_witness_value_columns: Vec<Vec<E::Scalar>>,
+  /// Per-step fresh multiplicities for this table (length `n_j`).
+  pub fresh_multiplicities: Vec<E::Scalar>,
+  /// Per-step witness-side eq vector, left half (split-tensor form).
+  pub fresh_eq_w_left: Vec<E::Scalar>,
+  /// Per-step witness-side eq vector, right half.
+  pub fresh_eq_w_right: Vec<E::Scalar>,
+  /// Per-step table-side eq vector, left half.
+  pub fresh_eq_t_left: Vec<E::Scalar>,
+  /// Per-step table-side eq vector, right half.
+  pub fresh_eq_t_right: Vec<E::Scalar>,
+  /// Per-table running lookup witness (carried across fold steps).
+  pub running_lw: LookupRunningWitness<E>,
+}
+
 /// An NIFS message from NeutronNova's folding scheme
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -847,6 +895,70 @@ impl<E: Engine> NIFS<E> {
     ),
     NovaError,
   > {
+    // GH-#2 M.3: thin wrapper that draws the eq-polynomial blinding `r_E`
+    // from `OsRng` and delegates to the deterministic-`r_E` inner. The
+    // inner is also called directly by the M.3 byte-equivalence regression
+    // test (pin §5.2 #2) under a seeded `r_E` so the multi-column k=1 and
+    // multi-table k=1 paths can be compared at FS-transcript layer with
+    // matching commitment outputs.
+    let r_E = E::Scalar::random(&mut OsRng);
+    Self::prove_with_multi_column_lookup_inner(
+      ck,
+      ro_consts,
+      pp_digest,
+      S,
+      U1,
+      W1,
+      U2,
+      W2,
+      payload,
+      running_lw,
+      table_id,
+      fresh_witness_address,
+      fresh_witness_value_columns,
+      fresh_multiplicities,
+      fresh_eq_w_left,
+      fresh_eq_w_right,
+      fresh_eq_t_left,
+      fresh_eq_t_right,
+      r_E,
+    )
+  }
+
+  /// Inner of [`Self::prove_with_multi_column_lookup`]: takes the
+  /// eq-polynomial blinding scalar `r_E` as an explicit parameter so a
+  /// test can pin determinism. Production callers should use the public
+  /// wrapper, which sources `r_E` from `OsRng`.
+  #[cfg(feature = "lookup-fold")]
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn prove_with_multi_column_lookup_inner(
+    ck: &CommitmentKey<E>,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    S: &Structure<E>,
+    U1: &FoldedInstance<E>,
+    W1: &FoldedWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+    payload: &LookupPayload<E>,
+    running_lw: &LookupRunningWitness<E>,
+    table_id: u64,
+    fresh_witness_address: &[E::Scalar],
+    fresh_witness_value_columns: &[Vec<E::Scalar>],
+    fresh_multiplicities: &[E::Scalar],
+    fresh_eq_w_left: Vec<E::Scalar>,
+    fresh_eq_w_right: Vec<E::Scalar>,
+    fresh_eq_t_left: Vec<E::Scalar>,
+    fresh_eq_t_right: Vec<E::Scalar>,
+    r_E: E::Scalar,
+  ) -> Result<
+    (
+      NIFS<E>,
+      (FoldedInstance<E>, FoldedWitness<E>),
+      LookupRunningWitness<E>,
+    ),
+    NovaError,
+  > {
     // Stage I-app.2: resolve the multi-column table from the structure-side
     // registry. The table contents are pinned by `pp_digest` (via serde on
     // `Structure → LookupShape → multi_column_tables`), so the table
@@ -929,7 +1041,11 @@ impl<E: Engine> NIFS<E> {
     // tau / comm_E / rho
     let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
     let E = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
-    let r_E = E::Scalar::random(&mut OsRng);
+    // GH-#2 M.3: `r_E` arrives via the inner-function parameter so the
+    // M.3 byte-equivalence regression test (pin §5.2 #2) can pin a
+    // deterministic value across the multi-column and multi-table paths.
+    // Production callers reach this via the public wrapper which sources
+    // `r_E` from `OsRng`.
     let comm_E = CE::<E>::commit(ck, &E, &r_E);
     comm_E.absorb_in_ro2(&mut ro);
     let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
@@ -1100,6 +1216,486 @@ impl<E: Engine> NIFS<E> {
     };
 
     Ok((nifs, (U, W), folded_lw))
+  }
+
+  /// Prove a fold step with **multi-table** lookup data (GH-#2 M.3).
+  ///
+  /// Multi-table extension per design pin §5.1 (API surface) / §2.2
+  /// (transcript schedule) / §1.3 (VECTOR (C)-invariant).
+  ///
+  /// Iterates the existing single-table multi-column structural template
+  /// once per registered table in `table_id`-canonical order. The k tables
+  /// are resolved from `S.lookups.multi_column_tables` (which has been
+  /// canonicalised by ascending `table_id` via
+  /// `Structure::new_with_lookups` at `relation.rs:488`); the caller
+  /// supplies one [`PerTableBundle`] per registered table in the same
+  /// order (debug-asserted).
+  ///
+  /// Per pin §2.2:
+  /// - Step 0: pp_digest + R1CS instance (UNCHANGED).
+  /// - Step 2: per-table commitments BEFORE tau, outer loop over j ascending.
+  ///   Order: ALL tables' `comm_L` → ALL tables' value columns
+  ///   (intra-table order preserved) → ALL tables' `comm_ts`.
+  /// - Step 3: tau (UNCHANGED — single tau for R1CS side).
+  /// - Step 4: rho (UNCHANGED — single rho across all instances).
+  /// - Step 5a: per-table alpha, ascending; tables with empty value
+  ///   columns skip the squeeze (preserves single-table c=0 byte-equivalence).
+  /// - Step 5b: per-table `r_logup_j`, ascending. Each `r_logup_j` is
+  ///   sequentially derived; structural sequencing IS domain separation
+  ///   per §2.3 (no per-table domain-separator scalar absorbed).
+  /// - Step 6: per-table inverse-witness commitments. Order: ALL tables'
+  ///   `comm_inv_w` → ALL tables' `comm_inv_t` (NOT interleaved per-table
+  ///   per §2.2 step 6 commentary).
+  /// - Step 7: R1CS-side prove + absorb poly (UNCHANGED).
+  /// - Step 8: per-table lookup-side prove + absorb `poly_lookup_j`,
+  ///   ascending.
+  /// - Step 9: r_b (UNCHANGED — single fold randomness shared across ALL
+  ///   instances).
+  ///
+  /// Per pin §1.3, the running-claim invariant is a VECTOR
+  /// `T_lookup ∈ E::Scalar^k`. The per-table (C)-binding
+  /// `∀ j: poly_lookup_j(0) + poly_lookup_j(1) == T_lookup_running_j` is
+  /// enforced at verify time (M.4), NOT here — `prove` threads the
+  /// running scalars but does not re-check the binding (mirrors
+  /// `fold_with_lookup`'s discipline per `relation.rs:675`).
+  ///
+  /// Single-table degeneration (k=1) is byte-identical at the
+  /// FS-transcript layer to the existing
+  /// [`Self::prove_with_multi_column_lookup`] path per pin §5.2 #2 — the
+  /// per-table loops collapse to single iterations and the absorb / squeeze
+  /// order matches `prove_with_multi_column_lookup` exactly. This is the
+  /// load-bearing regression check landed by the M.3 byte-equivalence test
+  /// (see `m3_byte_equivalence_k1_multi_table_matches_multi_column` in the
+  /// `tests` module). The serialised `NIFS<E>` envelope differs at k=1 by
+  /// design (Vec-of-1 vs `Option<UniPoly>` per pin §5.2 #2 reword) — only
+  /// the FS-transcript layer is byte-identical.
+  ///
+  /// Returns `(nifs, (folded_U, folded_W), folded_lw_per_table)`. The
+  /// per-table folded running witness is a `Vec<LookupRunningWitness<E>>`
+  /// of length k in `table_id`-canonical order, suitable for use as the
+  /// `bundles[j].running_lw` input on the next fold step.
+  ///
+  /// ## Errors
+  ///
+  /// Returns [`NovaError::InvalidStructure`] if the structure has no
+  /// `LookupShape` attached, or if `bundles.len()` does not match
+  /// `multi_column_tables.len()`, or if any bundle's `table_id` does not
+  /// match the structure-registered table at the same position. Returns
+  /// [`NovaError::UnSat`] if any per-bundle column-count or length
+  /// invariant is violated.
+  #[cfg(feature = "lookup-fold")]
+  pub fn prove_with_multi_table_lookup(
+    ck: &CommitmentKey<E>,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    S: &Structure<E>,
+    U1: &FoldedInstance<E>,
+    W1: &FoldedWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+    bundles: &[PerTableBundle<E>],
+  ) -> Result<
+    (
+      NIFS<E>,
+      (FoldedInstance<E>, FoldedWitness<E>),
+      Vec<LookupRunningWitness<E>>,
+    ),
+    NovaError,
+  > {
+    let r_E = E::Scalar::random(&mut OsRng);
+    Self::prove_with_multi_table_lookup_inner(
+      ck, ro_consts, pp_digest, S, U1, W1, U2, W2, bundles, r_E,
+    )
+  }
+
+  /// Inner of [`Self::prove_with_multi_table_lookup`] — see that function
+  /// for the contract. Takes `r_E: E::Scalar` (the eq-polynomial blinding)
+  /// as an explicit parameter so the M.3 byte-equivalence regression test
+  /// (pin §5.2 #2) can pin a deterministic value across the multi-column
+  /// k=1 and multi-table k=1 paths. Production callers should use the
+  /// public wrapper, which sources `r_E` from `OsRng`.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) fn prove_with_multi_table_lookup_inner(
+    ck: &CommitmentKey<E>,
+    ro_consts: &RO2Constants<E>,
+    pp_digest: &E::Scalar,
+    S: &Structure<E>,
+    U1: &FoldedInstance<E>,
+    W1: &FoldedWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+    bundles: &[PerTableBundle<E>],
+    r_E: E::Scalar,
+  ) -> Result<
+    (
+      NIFS<E>,
+      (FoldedInstance<E>, FoldedWitness<E>),
+      Vec<LookupRunningWitness<E>>,
+    ),
+    NovaError,
+  > {
+    // --- Resolve registry from structure ---
+    let lookup_shape = S.lookups.as_ref().ok_or(NovaError::InvalidStructure)?;
+    let multi_tables = &lookup_shape.multi_column_tables;
+    let k = multi_tables.len();
+    if bundles.len() != k {
+      return Err(NovaError::InvalidStructure);
+    }
+    // Pin §5.1: bundles MUST be in ascending `table_id` order matching
+    // `multi_column_tables`. Debug-assert ordering and per-position id
+    // match; downgrade to InvalidStructure error in release builds when
+    // the id mismatch surfaces.
+    for (j, b) in bundles.iter().enumerate() {
+      debug_assert_eq!(
+        b.table_id, multi_tables[j].table_id,
+        "PerTableBundle[{}].table_id ({}) must equal multi_column_tables[{}].table_id ({})",
+        j, b.table_id, j, multi_tables[j].table_id,
+      );
+      if b.table_id != multi_tables[j].table_id {
+        return Err(NovaError::InvalidStructure);
+      }
+    }
+    // Per-bundle column-count and length invariants (mirrors the
+    // single-table inner at `prove_with_multi_column_lookup_inner`).
+    for (j, b) in bundles.iter().enumerate() {
+      let multi_table = &multi_tables[j];
+      let c_j = b.payload.comm_values.len();
+      if b.fresh_witness_value_columns.len() != c_j {
+        return Err(NovaError::UnSat {
+          reason: format!(
+            "prove_with_multi_table_lookup: bundle[{}] witness column count ({}) \
+             differs from payload.comm_values ({})",
+            j,
+            b.fresh_witness_value_columns.len(),
+            c_j,
+          ),
+        });
+      }
+      if multi_table.columns.len() != c_j {
+        return Err(NovaError::UnSat {
+          reason: format!(
+            "prove_with_multi_table_lookup: bundle[{}] structure-registered table \
+             column count ({}) differs from payload.comm_values ({})",
+            j,
+            multi_table.columns.len(),
+            c_j,
+          ),
+        });
+      }
+      let w_len = b.fresh_witness_address.len();
+      for (i, col) in b.fresh_witness_value_columns.iter().enumerate() {
+        if col.len() != w_len {
+          return Err(NovaError::UnSat {
+            reason: format!(
+              "prove_with_multi_table_lookup: bundle[{}] witness value column {} \
+               length ({}) differs from address column ({})",
+              j,
+              i,
+              col.len(),
+              w_len,
+            ),
+          });
+        }
+      }
+      for (i, col) in multi_table.columns.iter().enumerate() {
+        if col.len() != multi_table.size {
+          return Err(NovaError::UnSat {
+            reason: format!(
+              "prove_with_multi_table_lookup: bundle[{}] structure-registered table \
+               value column {} length ({}) differs from registered size ({})",
+              j,
+              i,
+              col.len(),
+              multi_table.size,
+            ),
+          });
+        }
+      }
+    }
+
+    // --- Step 0: pp_digest + R1CS instance ---
+    let mut ro = E::RO2::new(ro_consts.clone());
+    ro.absorb(*pp_digest);
+    U2.absorb_in_ro2(&mut ro);
+
+    // --- Step 2: per-table commitments BEFORE tau ---
+    // Order per pin §2.2: ALL tables' comm_L → ALL tables' value columns
+    // (intra-table order preserved) → ALL tables' comm_ts. Outer loop
+    // over j (table-id ascending).
+    for b in bundles {
+      b.payload.comm_L.absorb_in_ro2(&mut ro);
+      for cv in &b.payload.comm_values {
+        cv.absorb_in_ro2(&mut ro);
+      }
+      b.payload.comm_ts.absorb_in_ro2(&mut ro);
+    }
+
+    // --- Step 3: tau ---
+    let tau = ro.squeeze(NUM_CHALLENGE_BITS, false);
+    let E_eq = PowPolynomial::new(&tau, S.ell).split_evals(S.left, S.right);
+    let comm_E = CE::<E>::commit(ck, &E_eq, &r_E);
+    comm_E.absorb_in_ro2(&mut ro);
+
+    // --- Step 4: rho ---
+    let rho = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Step 5a: per-table alpha (gated on c_j > 0) ---
+    // Order: ascending table_id; tables with empty value columns skip the
+    // squeeze per pin §2.2 step 5a empty-skip rule. This preserves the
+    // single-table c=0 byte-equivalence pin per-table.
+    let mut alpha_vec: Vec<E::Scalar> = Vec::with_capacity(k);
+    for b in bundles {
+      let alpha_j = if b.payload.comm_values.is_empty() {
+        E::Scalar::ZERO
+      } else {
+        ro.squeeze(NUM_CHALLENGE_BITS, false)
+      };
+      alpha_vec.push(alpha_j);
+    }
+
+    // --- Step 5b: per-table r_logup ---
+    // Order: ascending table_id. Each r_logup_j is sequentially derived
+    // from the running transcript whose state at squeeze-j includes ALL
+    // prior table commitments (Step 2 sweep) and ALL prior r_logup_i
+    // squeezes (i < j). This sequencing IS domain separation per pin §2.3
+    // — no explicit per-table domain-separator scalar is absorbed.
+    let mut r_logup_vec: Vec<E::Scalar> = Vec::with_capacity(k);
+    for _ in 0..k {
+      r_logup_vec.push(ro.squeeze(NUM_CHALLENGE_BITS, false));
+    }
+
+    // --- Combine off-circuit (per-table) and construct LookupSumcheckInstance ---
+    // For each table, compute the combined witness/table per Lasso §6.2
+    // and instantiate a LookupSumcheckInstance under the corresponding
+    // r_logup_j.
+    let mut lookup_insts: Vec<LookupSumcheckInstance<E>> = Vec::with_capacity(k);
+    let mut comm_inv_w_vec: Vec<Commitment<E>> = Vec::with_capacity(k);
+    let mut comm_inv_t_vec: Vec<Commitment<E>> = Vec::with_capacity(k);
+    let mut combined_witness_per_table: Vec<Vec<E::Scalar>> = Vec::with_capacity(k);
+    let mut combined_table_per_table: Vec<Vec<E::Scalar>> = Vec::with_capacity(k);
+    for (j, b) in bundles.iter().enumerate() {
+      let multi_table = &multi_tables[j];
+      let alpha_j = alpha_vec[j];
+      let r_logup_j = r_logup_vec[j];
+
+      let combined_witness = combine_columns_witness::<E>(
+        &b.fresh_witness_address,
+        &b.fresh_witness_value_columns,
+        &alpha_j,
+      );
+      let combined_table =
+        combine_columns_table::<E>(multi_table.size, &multi_table.columns, &alpha_j);
+
+      let (lookup_inst, comm_inv_w_j, comm_inv_t_j) = LookupSumcheckInstance::<E>::new(
+        ck,
+        // U1 (running) data — per-table running witness.
+        &b.running_lw.witness,
+        &b.running_lw.inv_w,
+        &b.running_lw.table,
+        &b.running_lw.multiplicities,
+        &b.running_lw.inv_t,
+        b.running_lw.eq_w_left.clone(),
+        b.running_lw.eq_w_right.clone(),
+        b.running_lw.eq_t_left.clone(),
+        b.running_lw.eq_t_right.clone(),
+        // U2 (fresh) data — combined witness/table for this table.
+        &combined_witness,
+        &combined_table,
+        &b.fresh_multiplicities,
+        b.fresh_eq_w_left.clone(),
+        b.fresh_eq_w_right.clone(),
+        b.fresh_eq_t_left.clone(),
+        b.fresh_eq_t_right.clone(),
+        r_logup_j,
+      )?;
+
+      lookup_insts.push(lookup_inst);
+      comm_inv_w_vec.push(comm_inv_w_j);
+      comm_inv_t_vec.push(comm_inv_t_j);
+      combined_witness_per_table.push(combined_witness);
+      combined_table_per_table.push(combined_table);
+    }
+
+    // --- Step 6: per-table inverse-witness commitments ---
+    // Order: ALL tables' comm_inv_w → ALL tables' comm_inv_t (NOT
+    // interleaved per-table per pin §2.2 step 6 commentary; matches the
+    // `(comm_inv_w2; comm_inv_t2)` pair-grouping at the single-table
+    // multi-column path lifted to k tables).
+    for c in &comm_inv_w_vec {
+      c.absorb_in_ro2(&mut ro);
+    }
+    for c in &comm_inv_t_vec {
+      c.absorb_in_ro2(&mut ro);
+    }
+
+    // --- Step 7: R1CS-side sumcheck (UNCHANGED — single R1CS instance) ---
+    let T = (E::Scalar::ONE - rho) * U1.T;
+    let (res1, res2) = rayon::join(
+      || {
+        let z1 = [W1.W.clone(), vec![U1.u], U1.X.clone()].concat();
+        S.S.multiply_vec(&z1)
+      },
+      || {
+        let z2 = [W2.W.clone(), vec![E::Scalar::ONE], U2.X.clone()].concat();
+        S.S.multiply_vec(&z2)
+      },
+    );
+    let (Az1, Bz1, Cz1) = res1?;
+    let (Az2, Bz2, Cz2) = res2?;
+    let (eval_point_0, eval_point_2, eval_point_3, eval_point_4, eval_point_5) =
+      Self::prove_helper(
+        &rho,
+        (S.left, S.right),
+        &W1.E,
+        &Az1,
+        &Bz1,
+        &Cz1,
+        &E_eq,
+        &Az2,
+        &Bz2,
+        &Cz2,
+      );
+    let evals = vec![
+      eval_point_0,
+      T - eval_point_0,
+      eval_point_2,
+      eval_point_3,
+      eval_point_4,
+      eval_point_5,
+    ];
+    let poly = UniPoly::<E::Scalar>::from_evals(&evals);
+    <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly, &mut ro);
+
+    // --- Step 8: per-table lookup-side prove + absorb poly_lookup_j ---
+    // Per-table running scalars from U1.T_lookup (VECTOR per pin §1.3).
+    // Single-table degeneration: when k=1, the loop runs once and the
+    // running-scalar lookup matches `prove_with_multi_column_lookup_inner`
+    // by reading entry [0] / fallback to ZERO on outer-base empty Vec.
+    let t_lookup_running_full = lookup_running_claims_from::<E>(U1);
+    let mut poly_lookup_vec: Vec<UniPoly<E::Scalar>> = Vec::with_capacity(k);
+    let mut t_lookup_running_per_table: Vec<E::Scalar> = Vec::with_capacity(k);
+    for (j, lookup_inst) in lookup_insts.iter().enumerate() {
+      // Outer base: U1.T_lookup is None → empty Vec → all per-table
+      // running scalars are ZERO. Mid-fold: per-table entry [j] in
+      // `table_id`-canonical order.
+      let t_lookup_running_j = t_lookup_running_full
+        .get(j)
+        .copied()
+        .unwrap_or(E::Scalar::ZERO);
+      t_lookup_running_per_table.push(t_lookup_running_j);
+      let poly_lookup_j = lookup_inst.prove_step(&rho, &t_lookup_running_j);
+      <UniPoly<E::Scalar> as AbsorbInRO2Trait<E>>::absorb_in_ro2(&poly_lookup_j, &mut ro);
+      poly_lookup_vec.push(poly_lookup_j);
+    }
+
+    // --- Step 9: r_b (UNCHANGED — shared across ALL instances) ---
+    let r_b = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // --- Compute R1CS T_out (UNCHANGED) ---
+    let eq_rho_r_b = (E::Scalar::ONE - rho) * (E::Scalar::ONE - r_b) + rho * r_b;
+    let T_out = poly.evaluate(&r_b) * eq_rho_r_b.invert().unwrap();
+
+    // --- Compute per-table T_lookup_out_j (VECTOR per pin §1.3) ---
+    let mut t_lookup_out_per_table: Vec<E::Scalar> = Vec::with_capacity(k);
+    for (j, poly_lookup_j) in poly_lookup_vec.iter().enumerate() {
+      let t_lookup_running_j = t_lookup_running_per_table[j];
+      let t_lookup_out_j = LookupSumcheckInstance::<E>::verify_step(
+        &rho,
+        &r_b,
+        poly_lookup_j,
+        &t_lookup_running_j,
+      )?;
+      t_lookup_out_per_table.push(t_lookup_out_j);
+    }
+
+    // --- Fold the FoldedInstance ---
+    // Per pin §5.1 commentary on fold_with_lookup at relation.rs:677, the
+    // four `comm_*` fields on FoldedInstance remain
+    // `Option<Commitment<E>>` (single per-step value); `T_lookup` is
+    // VECTOR. M.2's existing fold_with_lookup signature (taking a
+    // per-table running-scalar slice) accommodates this directly.
+    //
+    // For the multi-table fold, the four single commitments folded into
+    // FoldedInstance are aggregated from the per-table bundles via
+    // sum-of-commitments (Pedersen homomorphism). Per pin §5.4 / spike
+    // conclusion, the multi-table FoldedInstance commitment shape is
+    // out-of-scope for M.3 — we use the table-0 (first registered)
+    // bundle's commitments as the canonical FoldedInstance position
+    // for k=1 byte-equivalence, mirroring how
+    // `prove_with_multi_column_lookup_inner` builds its
+    // `effective_payload`. M.2's fold_with_lookup takes a full
+    // LookupPayload<E>; for k≥2 the fold-shape question is deferred to
+    // a later milestone (the per-table comm_inv_w/comm_inv_t for tables
+    // j≥1 are still threaded into the NIFS struct's Vec fields and
+    // verified per-table at M.4).
+    //
+    // GH-#2 M.3 single-table-degeneration discipline: at k=1 the
+    // effective_payload below is byte-identical to the
+    // `prove_with_multi_column_lookup_inner` construction, preserving
+    // the byte-equivalence pin §5.2 #2.
+    let effective_payload = LookupPayload {
+      comm_L: bundles[0].payload.comm_L,
+      comm_ts: bundles[0].payload.comm_ts,
+      comm_inv_w: comm_inv_w_vec[0],
+      comm_inv_t: comm_inv_t_vec[0],
+      T2_lookup: bundles[0].payload.T2_lookup,
+      comm_values: bundles[0].payload.comm_values.clone(),
+    };
+    let U = U1.fold_with_lookup(
+      U2,
+      &comm_E,
+      &r_b,
+      &T_out,
+      &effective_payload,
+      &t_lookup_out_per_table,
+    )?;
+    let W = W1.fold(W2, &E_eq, &r_E, &r_b)?;
+
+    // --- Per-table folded running witness ---
+    // For each table, recompute the fresh inverse vectors (the
+    // LookupSumcheckInstance computed them internally; we redo to feed
+    // the LookupFreshWitness used in fold) and fold against the
+    // per-table running_lw under the shared r_b.
+    let mut folded_lw_per_table: Vec<LookupRunningWitness<E>> = Vec::with_capacity(k);
+    for (j, b) in bundles.iter().enumerate() {
+      let r_logup_j = r_logup_vec[j];
+      let combined_witness = &combined_witness_per_table[j];
+      let combined_table = &combined_table_per_table[j];
+      let fresh_inv_w =
+        crate::spartan::logup_inverses::batch_invert_plus_r(combined_witness, &r_logup_j)?;
+      let fresh_inv_t_raw =
+        crate::spartan::logup_inverses::batch_invert_plus_r(combined_table, &r_logup_j)?;
+      let fresh_inv_t: Vec<E::Scalar> = fresh_inv_t_raw
+        .iter()
+        .zip(b.fresh_multiplicities.iter())
+        .map(|(inv, ts)| *inv * *ts)
+        .collect();
+      let fresh_lw = LookupFreshWitness {
+        witness: combined_witness.clone(),
+        inv_w: fresh_inv_w,
+        table: combined_table.clone(),
+        multiplicities: b.fresh_multiplicities.clone(),
+        inv_t: fresh_inv_t,
+        eq_w_left: b.fresh_eq_w_left.clone(),
+        eq_w_right: b.fresh_eq_w_right.clone(),
+        eq_t_left: b.fresh_eq_t_left.clone(),
+        eq_t_right: b.fresh_eq_t_right.clone(),
+      };
+      let folded_lw_j = b.running_lw.fold(&fresh_lw, &r_b);
+      folded_lw_per_table.push(folded_lw_j);
+    }
+
+    // Per-table NIFS extension fields. The Vec fields carry the full
+    // k-tuple; verifier reads them per-table at M.4.
+    let nifs = NIFS {
+      comm_E,
+      poly,
+      poly_lookup: Some(poly_lookup_vec),
+      comm_inv_w: Some(comm_inv_w_vec),
+      comm_inv_t: Some(comm_inv_t_vec),
+    };
+
+    Ok((nifs, (U, W), folded_lw_per_table))
   }
 
   /// Verify a fold step with **multi-column** lookup data (Stage I-pri).
@@ -3007,6 +3603,359 @@ mod tests {
       .expect("step 2 (sub-table 1) verify must succeed");
     assert_eq!(folded_U2, v2);
     str.is_sat(&ck, &folded_U2, &folded_W2).expect("step 2 R1CS sat");
+  }
+
+  /// GH-#2 M.3: design pin §5.2 #2 byte-equivalence regression check
+  /// at the FS-transcript layer.
+  ///
+  /// At k=1 the multi-table prove path
+  /// (`prove_with_multi_table_lookup_inner`) MUST produce a byte-identical
+  /// FS transcript to the existing single-table multi-column path
+  /// (`prove_with_multi_column_lookup_inner`). The pin is explicit that
+  /// the comparison is at the **FS-transcript layer**, NOT serialized
+  /// `NIFS<E>` bytes — the multi-table struct expansion (`Vec<UniPoly>`,
+  /// `Vec<Commitment>`) changes the bincode envelope by design at k=1.
+  ///
+  /// We verify byte-equivalence at the FS-transcript layer by asserting
+  /// that the tuple of values that flow through the transcript at every
+  /// absorb / squeeze step are equal across the two paths under
+  /// identical inputs and a pinned-deterministic `r_E`. Specifically:
+  ///
+  /// - `nifs.comm_E` (Step 3 absorb) — depends on `tau` (squeeze 0) and
+  ///   `r_E` (input).
+  /// - `nifs.poly` (Step 7 absorb) — depends on `tau`, `comm_E`, `rho`
+  ///   (squeeze 1), and the R1CS state.
+  /// - `nifs.poly_lookup[0]` (Step 8 absorb) — depends on the entire
+  ///   transcript prefix through `r_logup`.
+  /// - `nifs.comm_inv_w[0]` and `nifs.comm_inv_t[0]` (Step 6 absorb)
+  ///   — depend on `r_logup` (squeeze 4 in single-column).
+  /// - The final folded `U` — depends on `r_b` (Step 9 squeeze).
+  ///
+  /// Any divergence in transcript byte order between the two paths would
+  /// propagate Fiat-Shamir-deterministically to one of these values
+  /// breaking the equality assertion. The chain of squeezes (`tau`,
+  /// `rho`, `α` (gated), `r_logup`, `r_b`) is exhaustive — if all
+  /// post-squeeze values agree, every intermediate transcript byte
+  /// agreed too.
+  ///
+  /// This test deliberately uses `_inner` variants of both prove
+  /// functions so the eq-polynomial blinding `r_E` is pinned to a
+  /// `ChaCha20Rng`-derived deterministic scalar. Production-facing
+  /// (`prove_with_multi_*_lookup`) callers go through `OsRng` and never
+  /// expose this seam.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn m3_byte_equivalence_k1_multi_table_matches_multi_column() {
+    use crate::neutron::relation::{
+      LookupPayload, LookupRunningWitness, LookupShape, LookupTableHandle,
+      MultiColumnLookupTable,
+    };
+    use crate::spartan::polys::power::PowPolynomial;
+    use crate::traits::commitment::CommitmentEngineTrait;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E = Bn256EngineKZG;
+    type Scalar = <E as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E, HyperKZGEE<E>>;
+
+    // Pinned-seed RNG so the test is reviewer-reproducible per
+    // `.claude/rules/cryptography.md`'s determinism requirement.
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1B2_F003);
+    let ro_consts = RO2Constants::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // R1CS shape (mirrors `stage_i_pri_multi_column_round_trip`).
+    let num_cons = 32usize;
+    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // Single multi-column table (k = 1) — the regression target. 16
+    // entries, 2 value columns.
+    let table_size = 16usize;
+    let table_log2 = 4usize;
+    let t1: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 11 + 5) as u64))
+      .collect();
+    let t2: Vec<Scalar> = (0..table_size)
+      .map(|i| Scalar::from((i * 17 + 9) as u64))
+      .collect();
+    let identity: Vec<Scalar> = (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+    let identity_comm = <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO);
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: table_size,
+        commitment: identity_comm,
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: table_size,
+        columns: vec![t1.clone(), t2.clone()],
+        value_commitments: vec![
+          <E as Engine>::CE::commit(&ck, &t1, &Scalar::ZERO),
+          <E as Engine>::CE::commit(&ck, &t2, &Scalar::ZERO),
+        ],
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 3,
+      witness_ell_cached: table_log2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // Satisfying R1CS instance.
+    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+      Some(vec![Scalar::from(2)]),
+      NonTrivialCircuit::<Scalar>::new(num_cons),
+    );
+    let mut cs2 = SatisfyingAssignment::<E>::new();
+    let _ = circuit2.synthesize(&mut cs2);
+    let (U2, W2) = cs2.r1cs_instance_and_witness(&shape, &ck).unwrap();
+    let W2 = W2.pad(&shape);
+
+    // Outer-base running state.
+    let running_W = FoldedWitness::default(&str_local);
+    let running_U = FoldedInstance::default(&str_local);
+    let running_lw = LookupRunningWitness::default(&lookup_shape);
+
+    // Build a satisfying multi-column witness pool — 4 in-table queries
+    // padded to table_size.
+    let query_indices = [0usize, 3, 7, 15];
+    let mut witness_addr = vec![Scalar::ZERO; table_size];
+    let mut witness_v1 = vec![Scalar::ZERO; table_size];
+    let mut witness_v2 = vec![Scalar::ZERO; table_size];
+    let mut multiplicities = vec![Scalar::ZERO; table_size];
+    for (i, &idx) in query_indices.iter().enumerate() {
+      witness_addr[i] = Scalar::from(idx as u64);
+      witness_v1[i] = t1[idx];
+      witness_v2[i] = t2[idx];
+      multiplicities[idx] += Scalar::ONE;
+    }
+    for i in query_indices.len()..table_size {
+      witness_addr[i] = Scalar::from(0u64);
+      witness_v1[i] = t1[0];
+      witness_v2[i] = t2[0];
+      multiplicities[0] += Scalar::ONE;
+    }
+
+    let comm_addr = <E as Engine>::CE::commit(&ck, &witness_addr, &Scalar::ZERO);
+    let comm_v1 = <E as Engine>::CE::commit(&ck, &witness_v1, &Scalar::ZERO);
+    let comm_v2 = <E as Engine>::CE::commit(&ck, &witness_v2, &Scalar::ZERO);
+    let comm_ts = <E as Engine>::CE::commit(&ck, &multiplicities, &Scalar::ZERO);
+
+    let payload = LookupPayload::<E> {
+      comm_L: comm_addr,
+      comm_ts,
+      comm_inv_w: Commitment::<E>::default(),
+      comm_inv_t: Commitment::<E>::default(),
+      T2_lookup: Scalar::ZERO,
+      comm_values: vec![comm_v1, comm_v2],
+    };
+
+    // eq polynomials.
+    let tau_w = Scalar::random(&mut rng);
+    let pow_w = PowPolynomial::new(&tau_w, table_log2);
+    let (w_left, w_right) = lookup_shape.witness_split();
+    let combined_w = pow_w.split_evals(w_left, w_right);
+    let (eq_w_left, eq_w_right) = combined_w.split_at(w_left);
+
+    let tau_t = Scalar::random(&mut rng);
+    let pow_t = PowPolynomial::new(&tau_t, table_log2);
+    let (t_left, t_right) = lookup_shape.table_split();
+    let combined_t_eq = pow_t.split_evals(t_left, t_right);
+    let (eq_t_left, eq_t_right) = combined_t_eq.split_at(t_left);
+
+    // Pin the eq-polynomial blinding `r_E` deterministically — both
+    // paths receive the SAME scalar, so any FS-transcript divergence
+    // surfaces in the post-squeeze values rather than being masked by
+    // distinct OsRng draws.
+    let r_E_pinned = Scalar::random(&mut rng);
+
+    // --- Path A: existing single-table multi-column inner ---
+    let (nifs_single, (folded_U_single, folded_W_single), folded_lw_single) =
+      NIFS::<E>::prove_with_multi_column_lookup_inner(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &running_U,
+        &running_W,
+        &U2,
+        &W2,
+        &payload,
+        &running_lw,
+        0u64,
+        &witness_addr,
+        &[witness_v1.clone(), witness_v2.clone()],
+        &multiplicities,
+        eq_w_left.to_vec(),
+        eq_w_right.to_vec(),
+        eq_t_left.to_vec(),
+        eq_t_right.to_vec(),
+        r_E_pinned,
+      )
+      .expect("multi-column inner must succeed on satisfying witness");
+
+    // --- Path B: new multi-table inner (k=1) ---
+    let bundle = super::PerTableBundle::<E> {
+      table_id: 0,
+      payload: payload.clone(),
+      fresh_witness_address: witness_addr.clone(),
+      fresh_witness_value_columns: vec![witness_v1.clone(), witness_v2.clone()],
+      fresh_multiplicities: multiplicities.clone(),
+      fresh_eq_w_left: eq_w_left.to_vec(),
+      fresh_eq_w_right: eq_w_right.to_vec(),
+      fresh_eq_t_left: eq_t_left.to_vec(),
+      fresh_eq_t_right: eq_t_right.to_vec(),
+      running_lw: running_lw.clone(),
+    };
+    let (nifs_multi, (folded_U_multi, folded_W_multi), folded_lw_multi_per_table) =
+      NIFS::<E>::prove_with_multi_table_lookup_inner(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &running_U,
+        &running_W,
+        &U2,
+        &W2,
+        &[bundle],
+        r_E_pinned,
+      )
+      .expect("multi-table inner must succeed on satisfying witness at k=1");
+
+    // --- Pin §5.2 #2: FS-transcript layer byte-equivalence ---
+    //
+    // Each assertion is gated on a value that absorbs into / squeezes
+    // out of the transcript. Equality across all of them is sufficient
+    // and necessary for byte-equivalent FS transcripts at k=1.
+    //
+    // (Step 3) `comm_E` is the absorbed eq-commitment — equal here
+    // implies tau (squeeze 0) was equal, and `r_E` was equal (pinned).
+    assert_eq!(
+      nifs_multi.comm_E, nifs_single.comm_E,
+      "Step 3: comm_E must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // Pin §5.1: multi-table NIFS extends to Vec; at k=1 the Vec carries
+    // exactly one element which must equal the single-table singleton.
+    let multi_inv_w = nifs_multi
+      .comm_inv_w
+      .as_ref()
+      .expect("multi-table NIFS must carry comm_inv_w");
+    let single_inv_w = nifs_single
+      .comm_inv_w
+      .as_ref()
+      .expect("single-table NIFS must carry comm_inv_w");
+    assert_eq!(
+      multi_inv_w.len(),
+      1,
+      "Step 6: multi-table comm_inv_w Vec length must be 1 at k=1"
+    );
+    assert_eq!(
+      single_inv_w.len(),
+      1,
+      "Step 6: single-table comm_inv_w Vec length must be 1 (post-M.1)"
+    );
+    assert_eq!(
+      multi_inv_w[0], single_inv_w[0],
+      "Step 6: comm_inv_w[0] must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    let multi_inv_t = nifs_multi
+      .comm_inv_t
+      .as_ref()
+      .expect("multi-table NIFS must carry comm_inv_t");
+    let single_inv_t = nifs_single
+      .comm_inv_t
+      .as_ref()
+      .expect("single-table NIFS must carry comm_inv_t");
+    assert_eq!(
+      multi_inv_t[0], single_inv_t[0],
+      "Step 6: comm_inv_t[0] must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // (Step 7) `poly` is the absorbed R1CS sumcheck poly — equal here
+    // implies rho (squeeze 1) was equal AND alpha (squeeze 5a, gated)
+    // was equal — both sides squeeze alpha because comm_values is
+    // non-empty here.
+    assert_eq!(
+      nifs_multi.poly, nifs_single.poly,
+      "Step 7: R1CS sumcheck poly must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // (Step 8) `poly_lookup_j` for j=0 is the absorbed lookup sumcheck
+    // poly — equal here implies r_logup (squeeze 5b) and the running
+    // scalar threading at outer base agreed.
+    let multi_poly_lookup = nifs_multi
+      .poly_lookup
+      .as_ref()
+      .expect("multi-table NIFS must carry poly_lookup");
+    let single_poly_lookup = nifs_single
+      .poly_lookup
+      .as_ref()
+      .expect("single-table NIFS must carry poly_lookup");
+    assert_eq!(
+      multi_poly_lookup.len(),
+      1,
+      "Step 8: multi-table poly_lookup Vec length must be 1 at k=1"
+    );
+    assert_eq!(
+      single_poly_lookup.len(),
+      1,
+      "Step 8: single-table poly_lookup Vec length must be 1 (post-M.1)"
+    );
+    assert_eq!(
+      multi_poly_lookup[0], single_poly_lookup[0],
+      "Step 8: poly_lookup[0] must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // (Step 9) The folded FoldedInstance — depends on r_b (final
+    // squeeze). Equal folded U implies r_b agreed, AND every
+    // intermediate transcript prefix agreed.
+    assert_eq!(
+      folded_U_multi, folded_U_single,
+      "Step 9: folded U must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // The folded W must also agree (depends on the same r_b).
+    assert_eq!(
+      folded_W_multi, folded_W_single,
+      "Step 9: folded W must be byte-identical at k=1 (pin §5.2 #2)"
+    );
+
+    // The per-table running witness vector at k=1 carries one entry,
+    // which must equal the single-table folded running witness.
+    assert_eq!(
+      folded_lw_multi_per_table.len(),
+      1,
+      "M.3 contract: per-table folded running witness Vec length must be 1 at k=1"
+    );
+    assert_eq!(
+      folded_lw_multi_per_table[0], folded_lw_single,
+      "M.3 contract: folded running witness must be byte-identical at k=1"
+    );
+
+    // Sanity: T_lookup VECTOR is one-element at k=1 and matches the
+    // single-table M.1+M.2 storage shape.
+    let t_lookup_multi = folded_U_multi
+      .T_lookup
+      .as_ref()
+      .expect("k=1 multi-table fold must populate T_lookup");
+    let t_lookup_single = folded_U_single
+      .T_lookup
+      .as_ref()
+      .expect("k=1 single-table-multi-column fold must populate T_lookup");
+    assert_eq!(t_lookup_multi.len(), 1, "k=1: T_lookup must have length 1");
+    assert_eq!(t_lookup_single.len(), 1, "k=1: T_lookup must have length 1");
+    assert_eq!(
+      t_lookup_multi[0], t_lookup_single[0],
+      "k=1: per-table T_lookup_0 must be byte-identical (pin §5.2 #2)"
+    );
   }
 }
 

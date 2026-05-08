@@ -285,6 +285,39 @@ pub struct LookupPayloadPublic<E: Engine> {
   pub comm_ts: Commitment<E>,
 }
 
+/// Verifier-side per-table public projection of the multi-table lookup payload.
+///
+/// GH-#2 M.4 (design pin §5.1): the multi-table verifier consumes a slice of
+/// these — one entry per registered table in `table_id`-canonical order —
+/// instead of a single [`LookupPayload`]. Each entry carries the public
+/// commitments the verifier needs to absorb at FS-transcript step 2 (per pin
+/// §2.2): the address-column commitment `comm_L`, the per-column value
+/// commitments `comm_values` (Lasso §6.2 multi-column extension), and the
+/// multiplicity commitment `comm_ts`. The verifier never needs `comm_inv_w` /
+/// `comm_inv_t` (recovered from the [`NIFS`] message's per-table Vec fields)
+/// nor `T2_lookup` (per-table running scalar threading is via the
+/// `FoldedInstance::T_lookup` Vec, not this payload).
+///
+/// For "absent" tables at a fold step (queries did not touch the table this
+/// step), each commitment is the zero-payload commitment per pin §1.5.3
+/// ("zero-payload commitments, not skipped absorptions") — the FS transcript
+/// schedule is constant-shape across present/absent regardless.
+#[cfg(feature = "lookup-fold")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LookupPayloadPublicMultiTable<E: Engine> {
+  /// Stable identifier for the table this entry corresponds to.
+  pub table_id: u64,
+  /// Per-step lookup-witness commitment for the table's address column.
+  pub comm_L: Commitment<E>,
+  /// Per-step value-column commitments (Lasso §6.2). Empty for the
+  /// single-column degenerate path (pin §2.2 step 5a empty-skip rule).
+  #[serde(default = "Vec::new")]
+  pub comm_values: Vec<Commitment<E>>,
+  /// Per-step multiplicity-vector commitment.
+  pub comm_ts: Commitment<E>,
+}
+
 /// Per-step lookup-side payload delivered to [`NIFS::prove`] alongside the
 /// incoming [`R1CSInstance`].
 ///
