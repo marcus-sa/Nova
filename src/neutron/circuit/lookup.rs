@@ -307,6 +307,47 @@ pub struct AllocatedLookupPayloadPublicMultiTable<E: Engine> {
   pub comm_ts: AllocatedNonnativePoint<E>,
 }
 
+impl<E: Engine> AllocatedLookupPayloadPublicMultiTable<E> {
+  /// GH-#5 M.GH5.3: allocate from an optional native bundle.
+  ///
+  /// `num_value_columns` pins the per-table value-column count (matches
+  /// `LookupShape::multi_column_tables[j].columns.len()`). When `bundle`
+  /// is `None` (shape-derivation), all commitments default to identity.
+  /// When `Some`, the comm_L / comm_values / comm_ts fields are allocated
+  /// from the native bundle's coordinates.
+  ///
+  /// The augmented-circuit invokes this in `alloc_witness` when the
+  /// `lookup_fold_k > 0` path is active, allocating one bundle per
+  /// registered table in `table_id`-ascending order.
+  pub fn alloc<CS: ConstraintSystem<E::Scalar>>(
+    mut cs: CS,
+    bundle: Option<&crate::neutron::relation::LookupPayloadPublicMultiTable<E>>,
+    num_value_columns: usize,
+  ) -> Result<Self, SynthesisError> {
+    let comm_L = AllocatedNonnativePoint::alloc(
+      cs.namespace(|| "allocate comm_L"),
+      bundle.map(|b| b.comm_L.to_coordinates()),
+    )?;
+    let comm_values = (0..num_value_columns)
+      .map(|i| {
+        AllocatedNonnativePoint::alloc(
+          cs.namespace(|| format!("allocate comm_values[{}]", i)),
+          bundle.and_then(|b| b.comm_values.get(i).map(|cv| cv.to_coordinates())),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+    let comm_ts = AllocatedNonnativePoint::alloc(
+      cs.namespace(|| "allocate comm_ts"),
+      bundle.map(|b| b.comm_ts.to_coordinates()),
+    )?;
+    Ok(Self {
+      comm_L,
+      comm_values,
+      comm_ts,
+    })
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

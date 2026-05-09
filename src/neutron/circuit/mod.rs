@@ -21,7 +21,10 @@ use crate::{
   Commitment,
 };
 #[cfg(feature = "lookup-fold")]
-use crate::neutron::relation::LookupPayloadPublic;
+use crate::neutron::{
+  circuit::lookup::{AllocatedLookupNIFSMultiTable, AllocatedLookupPayloadPublicMultiTable},
+  relation::{LookupPayloadPublic, LookupPayloadPublicMultiTable},
+};
 use ff::Field;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +72,17 @@ pub struct NeutronAugmentedCircuitInputs<E: Engine> {
   /// Folded `comm_inv_t` hint.
   #[cfg(feature = "lookup-fold")]
   pub(crate) comm_inv_t_fold: Option<Commitment<E>>,
+
+  /// GH-#5 M.GH5.3 / pin §3.1: per-table public bundles for the multi-
+  /// table lookup-fold verifier. Length pinned by the
+  /// `LookupShape::multi_column_tables.len()` (= k = 2 production per
+  /// ADR-0021), in `table_id`-ascending order. `None` for non-lookup
+  /// steps and at outer base. Populated by inumbra-side `prove_step` when
+  /// the multi-table lookup-fold path is active (M.GH5.4+); `None` for
+  /// vendor-internal tests using `TrivialCircuit` / `CubicCircuit` and
+  /// for the non-lookup-fold-active build path.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) public_bundles_multi_table: Option<Vec<LookupPayloadPublicMultiTable<E>>>,
 }
 
 impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
@@ -108,7 +122,27 @@ impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
       comm_inv_w_fold: None,
       #[cfg(feature = "lookup-fold")]
       comm_inv_t_fold: None,
+      #[cfg(feature = "lookup-fold")]
+      public_bundles_multi_table: None,
     }
+  }
+
+  /// GH-#5 M.GH5.3: attach multi-table lookup-fold public bundles to an
+  /// existing `NeutronAugmentedCircuitInputs`. Builder-style so the legacy
+  /// `new` constructor stays signature-stable.
+  ///
+  /// `bundles` must have length equal to the structurally-pinned table
+  /// count (k=2 production per ADR-0021), in `table_id`-ascending order.
+  /// At outer base / non-lookup steps, leave the field as `None` (the
+  /// default from `new`).
+  #[cfg(feature = "lookup-fold")]
+  #[allow(dead_code)] // until M.GH5.4 wires inumbra-side prove_step through this builder
+  pub fn with_multi_table_bundles(
+    mut self,
+    bundles: Option<Vec<LookupPayloadPublicMultiTable<E>>>,
+  ) -> Self {
+    self.public_bundles_multi_table = bundles;
+    self
   }
 
   /// Attach lookup-side public payload + folded commitment hints to an
@@ -137,14 +171,60 @@ impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
 
 /// The augmented circuit F' in Neutron that includes a step circuit F
 /// and the circuit for the verifier in Neutron's non-interactive folding scheme
+///
+/// GH-#5 M.GH5.3: under `lookup-fold`, the augmented circuit carries a
+/// shape-registry attachment (`shape_registry`, `lookup_fold_k`,
+/// `index_n_bits`) that wires the multi-table lookup-fold verifier path
+/// at fold-depth ≥ 1. Set via [`Self::with_lookup_fold`]. Default state
+/// (`lookup_fold_k == 0`) preserves the upstream-tracking shape — the
+/// non-base-case path uses `nifs.verify` and the base case uses
+/// `default(cs, num_io)`. The vendor-internal tests using `TrivialCircuit`
+/// / `CubicCircuit` (`test_pp_digest`, `test_ivc_*`) operate in this
+/// default state and produce R1CS shapes byte-equivalent to pre-M.GH5.3
+/// (i.e. `pp_digest` baselines for those tests do NOT refresh).
+///
+/// At inumbra-side construction (M.GH5.4+), `with_lookup_fold(k,
+/// shape_registry, index_n_bits)` is called with the per-position
+/// `pp_digest` slice (length 16 production per ADR-0021) and `k=2`
+/// (uniform multi-column-table count per Auditor Obligation 10).
 pub struct NeutronAugmentedCircuit<'a, E: Engine, SC: StepCircuit<E::Scalar>> {
   ro_consts: RO2ConstantsCircuit<E>,
   inputs: Option<NeutronAugmentedCircuitInputs<E>>,
   step_circuit: &'a SC, // The function that is applied for each step
+
+  /// GH-#5 M.GH5.3 / pin §3.1: per-position shape registry of `pp_digest`
+  /// values (one per chunk position), in chunk-position-canonical order
+  /// (NOT `table_id` order). Empty slice ⇒ no lookup-fold path; the
+  /// augmented circuit falls back to `nifs.verify` in `synthesize_non_base_case`
+  /// and `default(cs, num_io)` in `synthesize_base_case`. Populated by
+  /// inumbra-side public-params at M.GH5.4 from GH-#3's per-position
+  /// `Structure<E>` extraction.
+  #[cfg(feature = "lookup-fold")]
+  shape_registry: &'a [E::Scalar],
+
+  /// GH-#5 M.GH5.3 / pin §3.1: structurally-pinned per-table count
+  /// (`LookupShape::multi_column_tables.len()`). Production: k=2 per
+  /// ADR-0021, uniform across all 16 chunked-Strauss-Shamir positions
+  /// (Auditor Obligation 10). Zero ⇒ no lookup-fold path.
+  #[cfg(feature = "lookup-fold")]
+  lookup_fold_k: usize,
+
+  /// GH-#5 M.GH5.3 / pin §3.1: bit-width for the `chunk_index_in_z` range-
+  /// check inside the M.7 shape-registry assertion. Must be
+  /// ≥ ceil(log2(shape_registry.len())). Production: 5 (≤ 30 positions);
+  /// M.GH5.0 STAGE 0 fixtures use 4 (16 positions).
+  #[cfg(feature = "lookup-fold")]
+  index_n_bits: usize,
 }
 
 impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, SC> {
-  /// Create a new verification circuit for the input relaxed r1cs instances
+  /// Create a new verification circuit for the input relaxed r1cs instances.
+  ///
+  /// This constructor produces a circuit in the non-lookup-fold default
+  /// state (under `lookup-fold` build, `lookup_fold_k == 0` and
+  /// `shape_registry == &[]`). Use [`Self::with_lookup_fold`] to attach
+  /// the per-position shape registry for the multi-table lookup-fold
+  /// verifier path (M.GH5.3+).
   pub const fn new(
     inputs: Option<NeutronAugmentedCircuitInputs<E>>,
     step_circuit: &'a SC,
@@ -154,7 +234,48 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       inputs,
       step_circuit,
       ro_consts,
+      #[cfg(feature = "lookup-fold")]
+      shape_registry: &[],
+      #[cfg(feature = "lookup-fold")]
+      lookup_fold_k: 0,
+      #[cfg(feature = "lookup-fold")]
+      index_n_bits: 0,
     }
+  }
+
+  /// GH-#5 M.GH5.3 / pin §3.1: attach the multi-table lookup-fold
+  /// configuration to a `NeutronAugmentedCircuit`. Builder-style so the
+  /// legacy `new` constructor stays signature-stable.
+  ///
+  /// Arguments:
+  /// - `lookup_fold_k`: structurally-pinned per-table count
+  ///   (`LookupShape::multi_column_tables.len()`). Production: k=2 per
+  ///   ADR-0021. `0` is treated as "no lookup-fold path" and the augmented
+  ///   circuit falls back to `nifs.verify` (vendor upstream-tracking path).
+  /// - `shape_registry`: per-position `pp_digest` slice. Length pinned by
+  ///   the inumbra-side public-params (length 16 production; ≤ 30 with
+  ///   chunk-band shapes).
+  /// - `index_n_bits`: bit-width for the M.7 shape-registry assertion's
+  ///   range-check on `chunk_index_in_z`. Must be ≥ ceil(log2(shape_registry.len()))
+  ///   and ≤ 31.
+  ///
+  /// Sanity checks (synthesis-time): when `lookup_fold_k > 0`,
+  /// `shape_registry` must be non-empty and `index_n_bits` must be ≥ 1.
+  /// These are enforced in `synthesize_non_base_case` via the
+  /// `verify_with_multi_table_lookup` invocation; the constructor itself
+  /// does not validate (no `Result` shape).
+  #[cfg(feature = "lookup-fold")]
+  #[allow(dead_code)] // until M.GH5.4 wires inumbra-side public-params through this builder
+  pub fn with_lookup_fold(
+    mut self,
+    lookup_fold_k: usize,
+    shape_registry: &'a [E::Scalar],
+    index_n_bits: usize,
+  ) -> Self {
+    self.lookup_fold_k = lookup_fold_k;
+    self.shape_registry = shape_registry;
+    self.index_n_bits = index_n_bits;
+    self
   }
 
   /// Allocate all witnesses and return
@@ -205,7 +326,20 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       })
       .collect::<Result<Vec<AllocatedNum<E::Scalar>>, _>>()?;
 
-    // Allocate the running instance
+    // Allocate the running instance.
+    //
+    // GH-#5 M.GH5.3: under `lookup-fold`, pass `self.lookup_fold_k` as the
+    // shape-derivation hint so the `inst == None` path (shape building
+    // via `inputs == None`) allocates `T_lookup_per_table = Some(vec![alloc; k])`
+    // matching the non-base-case shape produced by `verify_with_multi_table_lookup`.
+    // At `lookup_fold_k == 0` the hint is no-op (legacy `T_lookup_per_table = None`).
+    #[cfg(feature = "lookup-fold")]
+    let U: AllocatedFoldedInstance<E> = AllocatedFoldedInstance::alloc_with_k_hint(
+      cs.namespace(|| "Allocate U"),
+      self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
+      self.lookup_fold_k,
+    )?;
+    #[cfg(not(feature = "lookup-fold"))]
     let U: AllocatedFoldedInstance<E> = AllocatedFoldedInstance::alloc(
       cs.namespace(|| "Allocate U"),
       self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
@@ -271,8 +405,32 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
   ) -> Result<AllocatedFoldedInstance<E>, SynthesisError> {
     // In the base case, we simply return the default running instance.
     // Pin §1.4 Corrigendum #3: the augmented-circuit's R1CS shape has
-    // `num_io == 1` (single `hash.inputize` site at line 428 below), so
-    // the default running U1 carries a length-1 X Vec.
+    // `num_io == 1` (single `hash.inputize` site below), so the default
+    // running U1 carries a length-1 X Vec.
+    //
+    // GH-#5 M.GH5.3 / pin §3.1 + §5.1: under `lookup-fold` with an
+    // attached shape registry (`self.lookup_fold_k > 0`), allocate via
+    // `default_with_lookup_k(cs, num_io, k)` so the base-case instance
+    // carries a length-k `T_lookup_per_table` of `T_lookup_zero`-shared
+    // zero-bound variables (Corrigendum #6 Path Y extension). This is
+    // the shape-match invariant for `conditionally_select` (the base
+    // case's `Some(vec; k)` must match the non-base-case's
+    // `verify_with_multi_table_lookup` output's `Some(vec; k)`).
+    //
+    // At `lookup_fold_k == 0` (default state, vendor-internal tests with
+    // TrivialCircuit / CubicCircuit), the legacy `default(cs, 1)` path is
+    // preserved so the R1CS shape (and `pp_digest` baseline) is unchanged
+    // from pre-M.GH5.3.
+    #[cfg(feature = "lookup-fold")]
+    {
+      if self.lookup_fold_k > 0 {
+        return AllocatedFoldedInstance::default_with_lookup_k(
+          cs.namespace(|| "Allocate U_default (lookup-fold)"),
+          1,
+          self.lookup_fold_k,
+        );
+      }
+    }
     AllocatedFoldedInstance::default(cs.namespace(|| "Allocate U_default"), 1)
   }
 
@@ -313,7 +471,29 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       &hash,
     )?;
 
-    // Run NIFS Verifier
+    // GH-#5 M.GH5.3 / pin §5.1: under `lookup-fold` with an attached
+    // shape registry, route through `verify_with_multi_table_lookup`.
+    // Otherwise, fall back to the legacy `nifs.verify` (vendor upstream-
+    // tracking shape per ADR-0023). The cfg-gate is `lookup-fold`; the
+    // runtime-gate is `self.lookup_fold_k > 0` so that vendor-internal
+    // tests using `TrivialCircuit` / `CubicCircuit` (no lookup data)
+    // continue to typecheck and run with the upstream `nifs.verify` path
+    // even on a `--features lookup-fold` build.
+    #[cfg(feature = "lookup-fold")]
+    if self.lookup_fold_k > 0 {
+      return self.synthesize_non_base_case_lookup_fold(
+        cs.namespace(|| "synthesize non base case lookup-fold"),
+        pp_digest,
+        U,
+        u,
+        nifs,
+        comm_W_fold,
+        comm_E_fold,
+        check_pass,
+      );
+    }
+
+    // Run NIFS Verifier (legacy non-lookup-fold-active path)
     let U_fold = nifs.verify(
       cs.namespace(|| "compute fold of U and u"),
       pp_digest,
@@ -323,6 +503,175 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       comm_E_fold,
       self.ro_consts.clone(),
     )?;
+
+    Ok((U_fold, check_pass))
+  }
+
+  /// GH-#5 M.GH5.3 / pin §3.1 + §5.1: lookup-fold-active branch of
+  /// `synthesize_non_base_case`.
+  ///
+  /// Allocates the per-position `chunk_index_in_z` from `U.X[0]` (per
+  /// ADR-0021), the per-position shape registry as a slice of
+  /// `AllocatedNum`s, the multi-table NIFS message, and the per-table
+  /// public bundles. Then invokes `verify_with_multi_table_lookup`,
+  /// which internally fires the M.7 shape-registry assertion BEFORE
+  /// `pp_digest.absorb(ro)` (per pin §3.4 / vendor `nifs.rs:689-695`).
+  /// Finally re-binds the post-fold `T_lookup_per_table` from the
+  /// verifier's output via [`AllocatedFoldedInstance::from_lookup_fold_output`].
+  ///
+  /// Soundness anchors:
+  /// - `chunk_index_in_z = U.X[0]`: the augmented-circuit's running-instance
+  ///   chunk-position index is carried in public IO `X` (per ADR-0021 +
+  ///   pin §1.4 Corrigendum #3 single-IO invariant).
+  /// - `t_lookup_running_per_table = U.T_lookup_per_table.as_deref()`:
+  ///   per pin §3.3, the augmented circuit consumes the running U's
+  ///   per-table running scalars directly. The Phase-1 hash check above
+  ///   (via `U.absorb_in_ro`) binds these scalars to `u.X[0]`, closing
+  ///   the (W1) cross-step substitution attack.
+  /// - M.7 shape-registry assertion fires INTERNAL to
+  ///   `verify_with_multi_table_lookup` BEFORE `pp_digest.absorb` per pin
+  ///   §2.5 / §3.4 (vendor `nifs.rs:689-695` + line 698). The augmented-
+  ///   circuit caller does NOT fire it separately.
+  #[cfg(feature = "lookup-fold")]
+  #[allow(clippy::too_many_arguments)]
+  fn synthesize_non_base_case_lookup_fold<CS: ConstraintSystem<E::Scalar>>(
+    &self,
+    mut cs: CS,
+    pp_digest: &AllocatedNum<E::Scalar>,
+    U: &AllocatedFoldedInstance<E>,
+    u: &AllocatedNonnativeR1CSInstance<E>,
+    nifs: &AllocatedNIFS<E>,
+    comm_W_fold: &AllocatedNonnativePoint<E>,
+    comm_E_fold: &AllocatedNonnativePoint<E>,
+    check_pass: AllocatedBit,
+  ) -> Result<(AllocatedFoldedInstance<E>, AllocatedBit), SynthesisError> {
+    // Sanity: lookup-fold-active path requires non-empty shape registry
+    // and index_n_bits ≥ 1.
+    if self.shape_registry.is_empty() {
+      return Err(SynthesisError::Unsatisfiable(
+        "synthesize_non_base_case_lookup_fold: shape_registry is empty under \
+         lookup_fold_k > 0; attach via NeutronAugmentedCircuit::with_lookup_fold(...)"
+          .to_string(),
+      ));
+    }
+    if self.index_n_bits == 0 {
+      return Err(SynthesisError::Unsatisfiable(
+        "synthesize_non_base_case_lookup_fold: index_n_bits == 0 under \
+         lookup_fold_k > 0; attach via NeutronAugmentedCircuit::with_lookup_fold(...)"
+          .to_string(),
+      ));
+    }
+
+    // chunk_index_in_z := U.X[0] per ADR-0021 + pin §1.4 Corrigendum #3
+    // single-IO invariant. The augmented-circuit's `num_io == 1` is
+    // enforced by `AllocatedFoldedInstance::fold` (γ.1 fail-close at
+    // `relation.rs:354-364`); reading `U.X[0]` is well-defined.
+    if U.X.is_empty() {
+      return Err(SynthesisError::Unsatisfiable(
+        "synthesize_non_base_case_lookup_fold: U.X is empty (num_io == 0); \
+         augmented-circuit invariant requires num_io == 1 per pin §1.4 \
+         Corrigendum #3"
+          .to_string(),
+      ));
+    }
+    let chunk_index_in_z = &U.X[0];
+
+    // Allocate the per-position shape registry as in-circuit AllocatedNums.
+    // The `assert_pp_digest_matches_registry` consumer at `nifs.rs:689-695`
+    // expects `&[AllocatedNum]`. Each entry is a witness-allocated scalar
+    // tied to the lifetime-static slice `self.shape_registry`.
+    let shape_registry_alloc: Vec<AllocatedNum<E::Scalar>> = self
+      .shape_registry
+      .iter()
+      .enumerate()
+      .map(|(idx, scalar)| {
+        AllocatedNum::alloc(
+          cs.namespace(|| format!("shape_registry[{idx}]")),
+          || Ok(*scalar),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    // Allocate the multi-table NIFS message (lookup-side per-table fields).
+    let lookups = AllocatedLookupNIFSMultiTable::<E>::alloc(
+      cs.namespace(|| "allocate AllocatedLookupNIFSMultiTable"),
+      self.inputs.as_ref().and_then(|inputs| inputs.nifs.as_ref()),
+      self.lookup_fold_k,
+    )?;
+
+    // Allocate the per-table public bundles.
+    //
+    // For M.GH5.3 the per-table value-column count `num_value_columns` is
+    // sourced from the supplied bundle when present, defaulting to 1 for
+    // shape derivation (matches the production single-value-column shape
+    // per ADR-0021's chunked-Strauss-Shamir tables). M.GH5.4 will pin
+    // `num_value_columns` from the inumbra-side `LookupShape::multi_column_tables[j].columns.len()`.
+    let public_bundles_native: Option<&Vec<LookupPayloadPublicMultiTable<E>>> = self
+      .inputs
+      .as_ref()
+      .and_then(|inputs| inputs.public_bundles_multi_table.as_ref());
+    let public_bundles_alloc: Vec<AllocatedLookupPayloadPublicMultiTable<E>> = (0..self
+      .lookup_fold_k)
+      .map(|j| {
+        let bundle_j = public_bundles_native.and_then(|bundles| bundles.get(j));
+        let num_value_columns = bundle_j.map(|b| b.comm_values.len()).unwrap_or(1);
+        AllocatedLookupPayloadPublicMultiTable::alloc(
+          cs.namespace(|| format!("allocate public_bundle[{j}]")),
+          bundle_j,
+          num_value_columns,
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    // t_lookup_running_per_table := U.T_lookup_per_table per pin §3.3.
+    // Under `lookup_fold_k > 0`, the U allocation in `alloc_witness`
+    // produces `Some(vec; k)` (either from `inst.t_lookup()` at fold-depth
+    // ≥ 1, or from the k-hint at shape-derivation). An empty slice
+    // indicates a wire-up bug.
+    let t_lookup_running_per_table_owned: Vec<AllocatedNum<E::Scalar>> = U
+      .T_lookup_per_table
+      .as_ref()
+      .ok_or_else(|| {
+        SynthesisError::Unsatisfiable(
+          "synthesize_non_base_case_lookup_fold: U.T_lookup_per_table is None \
+           under lookup_fold_k > 0; alloc_witness should populate via k-hint \
+           per M.GH5.3 / pin §3.2"
+            .to_string(),
+        )
+      })?
+      .clone();
+
+    // Invoke the multi-table verifier. This internally:
+    //   - Asserts t_lookup_running_per_table.len() == k (line 666-680).
+    //   - Fires the M.7 shape-registry assertion BEFORE pp_digest.absorb
+    //     (line 689-695, with pp_digest.absorb at line 698).
+    //   - Computes the FS transcript, the (C)-bindings, and the per-table
+    //     post-fold T_lookup_out_per_table.
+    let lookup_output = nifs.verify_with_multi_table_lookup(
+      cs.namespace(|| "verify_with_multi_table_lookup"),
+      pp_digest,
+      chunk_index_in_z,
+      &shape_registry_alloc,
+      self.index_n_bits,
+      U,
+      u,
+      &lookups,
+      &public_bundles_alloc,
+      &t_lookup_running_per_table_owned,
+      comm_W_fold,
+      comm_E_fold,
+      self.ro_consts.clone(),
+    )?;
+
+    // Re-bind the post-fold T_lookup_per_table from the verifier's output
+    // per pin §3.2: the verifier's `U_fold` came from `U1.fold(...)` which
+    // propagates `T_lookup_per_table` from U1 unchanged; we override with
+    // `T_lookup_out_per_table` so the new running U carries the correct
+    // post-fold per-table running scalars.
+    let U_fold = AllocatedFoldedInstance::from_lookup_fold_output(
+      lookup_output.U_fold,
+      lookup_output.T_lookup_out_per_table,
+    );
 
     Ok((U_fold, check_pass))
   }

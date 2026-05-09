@@ -56,11 +56,55 @@ pub struct AllocatedFoldedInstance<E: Engine> {
 }
 
 impl<E: Engine> AllocatedFoldedInstance<E> {
-  /// Allocates the given `FoldedInstance` as a witness of the circuit
+  /// Allocates the given `FoldedInstance` as a witness of the circuit.
+  ///
+  /// GH-#5 M.GH5.3: thin wrapper for the legacy 2-arg call sites
+  /// (vendor-internal tests in `circuit/lookup.rs` and the non-`lookup-fold`
+  /// build of `circuit/mod.rs::alloc_witness`). Under `lookup-fold`, the
+  /// `inst == None` path produces `T_lookup_per_table = None` — pre-M.GH5.3
+  /// behaviour. Augmented-circuit `alloc_witness` at fold-depth-≥1
+  /// lookup-fold paths invokes the explicit-k [`Self::alloc_with_k_hint`]
+  /// instead so shape derivation produces a `T_lookup_per_table` of the
+  /// structurally-pinned length k.
+  // `#[allow(dead_code)]`: under `--features lookup-fold`, the production
+  // augmented-circuit path uses `alloc_with_k_hint`; this wrapper only
+  // serves the `cfg(not(feature = "lookup-fold"))` branch + vendor-internal
+  // test fixtures (`circuit/lookup.rs::*`). Without the allow, the lib
+  // build under lookup-fold flags this as dead.
+  #[allow(dead_code)]
   pub fn alloc<CS: ConstraintSystem<<E as Engine>::Scalar>>(
-    mut cs: CS,
+    cs: CS,
     inst: Option<&FoldedInstance<E>>,
   ) -> Result<Self, SynthesisError> {
+    Self::alloc_with_k_hint(cs, inst, 0)
+  }
+
+  /// GH-#5 M.GH5.3: allocate with an explicit `lookup_fold_k_hint` for the
+  /// `inst == None` path.
+  ///
+  /// Semantics:
+  /// - When `inst` is `Some`: length of `T_lookup_per_table` is derived
+  ///   from `inst.t_lookup()` (which carries the structurally-pinned k
+  ///   from prior fold steps); the hint is unused.
+  /// - When `inst` is `None` AND `lookup_fold_k_hint > 0`: under
+  ///   `lookup-fold`, allocate `T_lookup_per_table = Some(vec![alloc; k])`
+  ///   so the shape-derivation path matches the non-base-case shape that
+  ///   `verify_with_multi_table_lookup` produces. Non-`lookup-fold` builds
+  ///   ignore the hint (the field does not exist).
+  /// - When `inst` is `None` AND `lookup_fold_k_hint == 0`: legacy path,
+  ///   `T_lookup_per_table = None`. This is the path that `Self::alloc`
+  ///   delegates to.
+  pub fn alloc_with_k_hint<CS: ConstraintSystem<<E as Engine>::Scalar>>(
+    mut cs: CS,
+    inst: Option<&FoldedInstance<E>>,
+    lookup_fold_k_hint: usize,
+  ) -> Result<Self, SynthesisError> {
+    // Suppress the `unused_variables` lint when `lookup-fold` is off — the
+    // hint is only consulted under `lookup-fold` (the field doesn't exist
+    // in non-`lookup-fold` builds, so no None-path k-hint allocation is
+    // emitted).
+    #[cfg(not(feature = "lookup-fold"))]
+    let _ = lookup_fold_k_hint;
     // We do not need to check that W or E are well-formed (e.g., on the curve) as we do a hash check
     // in the Nova augmented circuit, which ensures that the relaxed instance
     // came from a prior iteration of Nova.
@@ -120,16 +164,28 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       None => vec![AllocatedNum::alloc(cs.namespace(|| "allocate X[0]"), || Ok(E::Scalar::ZERO))?],
     };
 
-    // GH-#5 design pin §3.2: allocate `T_lookup_per_table` from `inst.t_lookup()`.
-    // Length is implicit (whatever the prior running U1 carried). At outer
-    // base (`inst == None` OR `inst.t_lookup() == None`), this is `None`.
+    // GH-#5 design pin §3.2 / M.GH5.3: allocate `T_lookup_per_table`.
+    //
+    // - When `inst.t_lookup() == Some(slice)`: allocate per-element from
+    //   the slice. Length is implicit (whatever the prior running U1
+    //   carried). This is the fold-depth-≥1 honest path.
+    // - When `inst.t_lookup() == None` AND `lookup_fold_k_hint > 0`:
+    //   M.GH5.3 shape-derivation path. Allocate `Some(vec![alloc(0); k])`
+    //   so `synthesize_non_base_case`'s `verify_with_multi_table_lookup`
+    //   invocation finds a length-k slice when synthesising the shape via
+    //   `inputs == None`. The witness values are zero (placeholder); the
+    //   shape is what matters.
+    // - When `inst.t_lookup() == None` AND `lookup_fold_k_hint == 0`:
+    //   legacy path, produces `T_lookup_per_table = None`. Used by the
+    //   non-lookup-fold internal vendor tests (TrivialCircuit /
+    //   CubicCircuit `RecursiveSNARK::new`) and shape derivation when
+    //   `lookup_fold_k == 0` on the `NeutronAugmentedCircuit`.
     #[cfg(feature = "lookup-fold")]
     let T_lookup_per_table = {
       let t_lookup_slice: Option<Vec<E::Scalar>> = inst
         .and_then(|inst| inst.t_lookup())
         .map(|s| s.to_vec());
       match t_lookup_slice {
-        None => None,
         Some(slice) => {
           let allocated = slice
             .into_iter()
@@ -143,6 +199,18 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
             .collect::<Result<Vec<_>, _>>()?;
           Some(allocated)
         }
+        None if lookup_fold_k_hint > 0 => {
+          let allocated = (0..lookup_fold_k_hint)
+            .map(|j| {
+              AllocatedNum::alloc(
+                cs.namespace(|| format!("allocate T_lookup_per_table[{j}] (k-hint)")),
+                || Ok(E::Scalar::ZERO),
+              )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          Some(allocated)
+        }
+        None => None,
       }
     };
 
@@ -172,7 +240,6 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
   /// multi-table prover's running U. `dead_code` allowed until M.GH5.3
   /// lands; all consumers are external (inumbra-harness integration
   /// tests) at this milestone.
-  #[allow(dead_code)] // until M.GH5.3 wires `synthesize_base_case` through this constructor
   #[cfg(feature = "lookup-fold")]
   pub fn default_with_lookup_k<CS: ConstraintSystem<<E as Engine>::Scalar>>(
     mut cs: CS,
@@ -422,6 +489,39 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       u: u_fold,
       X: vec![X_fold],
     })
+  }
+
+  /// GH-#5 M.GH5.3 / pin §3.2: construct a post-fold `AllocatedFoldedInstance`
+  /// from `verify_with_multi_table_lookup`'s output by overriding the
+  /// `T_lookup_per_table` field with the per-table post-fold running
+  /// scalars (`T_lookup_out_per_table`).
+  ///
+  /// The lookup verifier returns `LookupVerifyOutputMultiTable { U_fold,
+  /// T_lookup_out_per_table }` where `U_fold` was produced via `U1.fold(...)`
+  /// — and `fold` propagates `T_lookup_per_table` from `self` (U1) unchanged
+  /// per pin §3.2 ("`fold` passes `T_lookup_per_table` through unchanged").
+  /// To bind the post-fold per-table running scalars into the next step's
+  /// hash absorption (so the (W1) binding-via-hash chain extends to the
+  /// new running U), the augmented-circuit replaces `U_fold.T_lookup_per_table`
+  /// with `T_lookup_out_per_table`.
+  ///
+  /// The other fields (`comm_W`, `comm_E`, `T`, `u`, `X`) are passed
+  /// through from `u_fold` unchanged. This helper performs no constraint
+  /// emission — it is purely a structural rewiring of the existing
+  /// allocations.
+  #[cfg(feature = "lookup-fold")]
+  pub fn from_lookup_fold_output(
+    u_fold: Self,
+    t_lookup_out_per_table: Vec<AllocatedNum<E::Scalar>>,
+  ) -> Self {
+    Self {
+      comm_W: u_fold.comm_W,
+      comm_E: u_fold.comm_E,
+      T: u_fold.T,
+      T_lookup_per_table: Some(t_lookup_out_per_table),
+      u: u_fold.u,
+      X: u_fold.X,
+    }
   }
 
   /// If the condition is true then returns this otherwise it returns the other
