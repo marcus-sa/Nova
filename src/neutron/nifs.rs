@@ -231,8 +231,12 @@ pub struct PerTableBundle<E: Engine> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct NIFS<E: Engine> {
-  pub(crate) comm_E: Commitment<E>,
-  pub(crate) poly: UniPoly<E::Scalar>,
+  /// Commitment to the per-step error polynomial `E` produced by the
+  /// folding scheme's sumcheck reduction.
+  pub comm_E: Commitment<E>,
+  /// Univariate sumcheck polynomial sent by the prover for the core
+  /// (non-lookup) NeutronNova fold step.
+  pub poly: UniPoly<E::Scalar>,
 
   /// Lookup-fold extension fields (Stage C, C1-beta).
   /// Present only when a lookup payload was supplied to the fold step.
@@ -245,11 +249,15 @@ pub struct NIFS<E: Engine> {
   /// one-element Vec — the FS transcript byte stream remains identical to
   /// pre-#2 by §5.2 #2.
   #[cfg(feature = "lookup-fold")]
-  pub(crate) poly_lookup: Option<Vec<UniPoly<E::Scalar>>>,
+  pub poly_lookup: Option<Vec<UniPoly<E::Scalar>>>,
+  /// Per-table commitment to the witness-side inverse vector `inv_w`
+  /// (one entry per registered table, `table_id`-canonical order).
   #[cfg(feature = "lookup-fold")]
-  pub(crate) comm_inv_w: Option<Vec<Commitment<E>>>,
+  pub comm_inv_w: Option<Vec<Commitment<E>>>,
+  /// Per-table commitment to the table-side inverse vector `inv_t`
+  /// (one entry per registered table, `table_id`-canonical order).
   #[cfg(feature = "lookup-fold")]
-  pub(crate) comm_inv_t: Option<Vec<Commitment<E>>>,
+  pub comm_inv_t: Option<Vec<Commitment<E>>>,
 }
 
 impl<E: Engine> NIFS<E> {

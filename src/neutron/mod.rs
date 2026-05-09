@@ -30,7 +30,7 @@ pub mod relation;
 /// lookup-fold extension. Pinned by §B of the spike implementation
 /// outline (amendment 2026-05-07).
 #[cfg(feature = "lookup-fold")]
-pub(crate) mod lookup_sumcheck;
+pub mod lookup_sumcheck;
 
 use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
 use nifs::NIFS;
