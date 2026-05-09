@@ -269,8 +269,11 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
     &self,
     mut cs: CS,
   ) -> Result<AllocatedFoldedInstance<E>, SynthesisError> {
-    // In the base case, we simply return the default running instance
-    AllocatedFoldedInstance::default(cs.namespace(|| "Allocate U_default"))
+    // In the base case, we simply return the default running instance.
+    // Pin §1.4 Corrigendum #3: the augmented-circuit's R1CS shape has
+    // `num_io == 1` (single `hash.inputize` site at line 428 below), so
+    // the default running U1 carries a length-1 X Vec.
+    AllocatedFoldedInstance::default(cs.namespace(|| "Allocate U_default"), 1)
   }
 
   /// Synthesizes non base case and returns the new relaxed `FoldedInstance`

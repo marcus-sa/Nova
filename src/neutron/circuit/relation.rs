@@ -11,7 +11,17 @@ use crate::{
 use ff::Field;
 
 /// An in-circuit representation of NeutronNova's FoldedInstance
-/// In our context, public IO of circuits folded will have only one entry, so we have X
+///
+/// The `X` field is a `Vec<AllocatedNum<E::Scalar>>` mirroring the native
+/// `FoldedInstance::X: Vec<E::Scalar>` (length `S.S.num_io`). Per pin §1.4
+/// Corrigendum #2 (Path W ratification, Halpert 2026-05-09): `absorb_in_ro`
+/// absorbs each X scalar in canonical order, byte-equivalent to native at
+/// any `num_io >= 1`. Per Corrigendum #3 (fold-arity invariant under §1.6
+/// anchor): `fold` requires `X.len() == 1` because U2 is structurally
+/// single-IO (single `hash.inputize` site at `circuit/mod.rs:428`); fold
+/// fails-closed at `X.len() >= 2`. The arity-agnostic primitives
+/// (`absorb_in_ro`, `alloc`, `default`, `default_with_lookup_k`,
+/// `conditionally_select`) operate at any N.
 #[derive(Clone, Debug)]
 pub struct AllocatedFoldedInstance<E: Engine> {
   pub(crate) comm_W: AllocatedNonnativePoint<E>,
@@ -36,7 +46,13 @@ pub struct AllocatedFoldedInstance<E: Engine> {
   pub(crate) T_lookup_per_table: Option<Vec<AllocatedNum<E::Scalar>>>,
 
   pub(crate) u: AllocatedNum<E::Scalar>,
-  pub(crate) X: AllocatedNum<E::Scalar>,
+
+  /// Public IO scalar VECTOR. Length matches the underlying R1CS shape's
+  /// `S.num_io`. Path W (pin §1.4 Corrigendum #2): per-element absorption
+  /// in `absorb_in_ro` is byte-equivalent to native `for x in &self.X {
+  /// ro.absorb(*x) }` at any `num_io >= 1`. Per Corrigendum #3, `fold`
+  /// requires `len() == 1` (fail-closes at `>= 2`).
+  pub(crate) X: Vec<AllocatedNum<E::Scalar>>,
 }
 
 impl<E: Engine> AllocatedFoldedInstance<E> {
@@ -66,29 +82,43 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       Ok(inst.map_or(E::Scalar::ZERO, |inst| inst.u))
     })?;
 
-    // GH-#5 design pin §1.4 corrigendum (Halpert 2026-05-09): X-arity
-    // invariant — the (W1) binding-via-hash extension is sound only at
-    // `num_io == 1`. Native `FoldedInstance::X: Vec<E::Scalar>` (length
-    // `S.S.num_io`) absorbs N scalars; in-circuit `AllocatedFoldedInstance::X`
-    // is a single AllocatedNum and absorbs exactly one scalar. Silently
-    // taking `inst.X[0]` for `X.len() != 1` would be a soundness-relevant
-    // truncation. Fail closed at synthesis time. Mirrors the fail-closed
-    // posture of `conditionally_select`'s T_lookup_per_table shape check
-    // (lines ~379-384).
-    if let Some(inst) = inst {
-      if inst.X.len() != 1 {
-        return Err(SynthesisError::Unsatisfiable(
-          "AllocatedFoldedInstance::alloc: native FoldedInstance::X has len != 1; \
-           the (W1) binding-via-hash extension requires num_io == 1 per pin §1.4 corrigendum"
-            .to_string(),
-        ));
-      }
-    }
-
-    // Allocate X. If the input instance is None, then allocate default values 0.
-    let X = AllocatedNum::alloc(cs.namespace(|| "allocate X"), || {
-      Ok(inst.map_or(E::Scalar::ZERO, |inst| inst.X[0]))
-    })?;
+    // GH-#5 design pin §1.4 Corrigendum #2 (Halpert 2026-05-09, Path W
+    // ratification under Core Principle 7): allocate X as a Vec mirroring
+    // native `FoldedInstance::X: Vec<E::Scalar>` (length `S.S.num_io`).
+    // Per-element allocation is byte-equivalent to native at any N>=1 in
+    // `absorb_in_ro`. Corrigendum #3 (fold-arity invariant) constrains
+    // `fold` (not `alloc`) to `len() == 1`; `alloc` is arity-agnostic.
+    //
+    // At `inst == None` (outer base / shape derivation / base-case satisfying
+    // witness), the outer-base default mirrors the augmented circuit's
+    // structural `num_io == 1` invariant per Corrigendum #3 / §1.6 anchor
+    // (single `hash.inputize` site at `circuit/mod.rs:431`). A length-0 Vec
+    // here would trigger the γ.1 fold-arity fail-close on the honest path
+    // (where `fold` is invoked against this `alloc`-produced `None`-arm
+    // instance, e.g. at i=0 base case via `inputs.U == None`). The length-1
+    // zero default is byte-equivalent to the prior single-AllocatedNum
+    // behavior at N==1 and matches `default(cs, 1)` semantics at the
+    // augmented circuit's structural `num_io`.
+    let X = match inst {
+      Some(inst) => inst
+        .X
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+          AllocatedNum::alloc(cs.namespace(|| format!("allocate X[{i}]")), || Ok(*x))
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+      // Halpert's third triage ruling (cluster B follow-up): use bare
+      // `AllocatedNum::alloc` here, NOT `alloc_zero`. `alloc_zero` emits an
+      // additional `0*0 = var` constraint (see `gadgets/utils.rs:45-54`),
+      // which would force `var == 0` in the *None*-arm shape. The *Some*-arm
+      // pattern above is bare `AllocatedNum::alloc` (unconstrained), so at
+      // non-base IVC steps where `inst.X[0]` carries a non-zero hash output,
+      // the shape derived from `alloc_zero` would fail to satisfy the witness.
+      // Bare `AllocatedNum::alloc` here restores Some/None shape parity and
+      // preserves Corrigendum #3 honest-path semantics for length-1 `num_io`.
+      None => vec![AllocatedNum::alloc(cs.namespace(|| "allocate X[0]"), || Ok(E::Scalar::ZERO))?],
+    };
 
     // GH-#5 design pin §3.2: allocate `T_lookup_per_table` from `inst.t_lookup()`.
     // Length is implicit (whatever the prior running U1 carried). At outer
@@ -146,13 +176,23 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
   #[cfg(feature = "lookup-fold")]
   pub fn default_with_lookup_k<CS: ConstraintSystem<<E as Engine>::Scalar>>(
     mut cs: CS,
+    num_io: usize,
     k: usize,
   ) -> Result<Self, SynthesisError> {
     let comm_W = AllocatedNonnativePoint::default(cs.namespace(|| "allocate W"))?;
     let comm_E = comm_W.clone();
     let T = alloc_zero(cs.namespace(|| "allocate T"));
     let u = T.clone();
-    let X = T.clone();
+    // Path Y (pin §1.4 Corrigendum #4, Halpert 2026-05-09): X is a Vec
+    // mirroring native `FoldedInstance::X = vec![Scalar::ZERO; S.S.num_io]`,
+    // BUT each slot is `T.clone()` (sharing T's variable). This inherits
+    // `alloc_zero`'s `(0)·(0) = T` zero-binding constraint for free, closing
+    // the missing-constraint forgery vector that Path W's per-element
+    // `AllocatedNum::alloc(... || Ok(ZERO))` had introduced (allocated a
+    // fresh aux variable with witness-closure value zero but no constraint
+    // enforcing it). Restores upstream microsoft/Nova's `let X = T.clone()`
+    // pattern under Path W's Vec shape.
+    let X = (0..num_io).map(|_| T.clone()).collect::<Vec<_>>();
 
     let T_lookup_per_table = Some(
       (0..k)
@@ -187,17 +227,26 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
   /// intentionally model the structurally-empty outer base.
   pub fn default<CS: ConstraintSystem<<E as Engine>::Scalar>>(
     mut cs: CS,
+    num_io: usize,
   ) -> Result<Self, SynthesisError> {
     let comm_W = AllocatedNonnativePoint::default(cs.namespace(|| "allocate W"))?;
     let comm_E = comm_W.clone();
 
-    // Allocate T = 0. Similar to X0 and X1, we do not need to check that T is well-formed
+    // Allocate T = 0. Similar to X, we do not need to check that T is well-formed
     let T = alloc_zero(cs.namespace(|| "allocate T"));
 
     let u = T.clone();
 
-    // X is allocated and set to zero
-    let X = T.clone();
+    // Path Y (pin §1.4 Corrigendum #4, Halpert 2026-05-09): X is a Vec
+    // mirroring native `FoldedInstance::X = vec![Scalar::ZERO; S.S.num_io]`,
+    // BUT each slot is `T.clone()` (sharing T's variable). This inherits
+    // `alloc_zero`'s `(0)·(0) = T` zero-binding constraint for free, closing
+    // the missing-constraint forgery vector that Path W's per-element
+    // `AllocatedNum::alloc(... || Ok(ZERO))` had introduced (allocated a
+    // fresh aux variable with witness-closure value zero but no constraint
+    // enforcing it). Restores upstream microsoft/Nova's `let X = T.clone()`
+    // pattern under Path W's Vec shape.
+    let X = (0..num_io).map(|_| T.clone()).collect::<Vec<_>>();
 
     Ok(Self {
       comm_W,
@@ -250,11 +299,30 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     }
 
     ro.absorb(&self.u);
-    ro.absorb(&self.X);
+    // Path W (pin §1.4 Corrigendum #2): per-element X absorption mirrors
+    // native `for x in &self.X { ro.absorb(*x) }` (relation.rs:828-830).
+    // Byte-equivalent at any `num_io >= 1`. At `num_io == 1` this is
+    // byte-equivalent to the prior single-AllocatedNum absorption.
+    for x in &self.X {
+      ro.absorb(x);
+    }
     Ok(())
   }
 
   /// Folds self with an r1cs instance and returns the result
+  ///
+  /// Per pin §1.4 Corrigendum #3 (Halpert 2026-05-09, fold-arity invariant
+  /// under §1.6 anchor): the legal U1.X arity at fold time is **1**. The
+  /// augmented circuit's compiled R1CS shape MUST have `num_io == 1`,
+  /// structurally enforced by `circuit/mod.rs:428`'s single
+  /// `hash.inputize` site. This method fail-closes at `self.X.len() != 1`
+  /// because U2 is structurally single-IO per §1.6 (single AllocatedNum
+  /// at `AllocatedNonnativeR1CSInstance::X`); there is no native algebra
+  /// to mirror at N>=2 without breaking the single `hash.inputize` IVC
+  /// pattern (γ.1 ratification — α/β/δ alternatives all fail Principle 7
+  /// (a/b/c) grounds). Path W's Vec-shape applies to the arity-agnostic
+  /// primitives (`absorb_in_ro`, `alloc`, `default`, `select`); fold is
+  /// the single-arity exception.
   pub fn fold<CS: ConstraintSystem<<E as Engine>::Scalar>>(
     &self,
     mut cs: CS,
@@ -264,6 +332,26 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     comm_W_fold: &AllocatedNonnativePoint<E>,
     comm_E_fold: &AllocatedNonnativePoint<E>,
   ) -> Result<Self, SynthesisError> {
+    // GH-#5 design pin §1.4 Corrigendum #3 (γ.1 fail-close): assert U1.X
+    // arity == 1 BEFORE any algebra. U2 is structurally single-IO per
+    // §1.6 anchor (augmented-circuit single hash.inputize at
+    // circuit/mod.rs:428). The legal U1.X arity at fold time is 1 per
+    // pin §1.4 Corrigendum #3. Path W's Vec-shape applies to
+    // absorb_in_ro / select / alloc only; fold requires arity-match per
+    // native FoldedInstance::fold at relation.rs:669-674.
+    if self.X.len() != 1 {
+      return Err(SynthesisError::Unsatisfiable(
+        "AllocatedFoldedInstance::fold: self.X.len() != 1; \
+         U2 is structurally single-IO per §1.6 anchor (augmented-circuit \
+         single hash.inputize at circuit/mod.rs:428). The legal U1.X arity \
+         at fold time is 1 per pin §1.4 Corrigendum #3. Path W's Vec-shape \
+         applies to absorb_in_ro / select / alloc only; fold requires \
+         arity-match per native FoldedInstance::fold at relation.rs:669-674."
+          .to_string(),
+      ));
+    }
+    let self_X = &self.X[0];
+
     // u_fold = (1-r_b) * self.u + r_b * U2.u
     // u_fold = self.u - r_b * self.u + r_b * U2.u
     // u_fold = self.u + r_b (U2.u - self.u)
@@ -285,11 +373,10 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       |lc| lc + u_fold.get_variable() - self.u.get_variable(),
     );
 
-    // Fold the IO:
-    // X_fold = self.X + r_b (U2.X - self.X)
+    // Fold the IO (single-arity per Corrigendum #3):
+    // X_fold[0] = self.X[0] + r_b (U2.X - self.X[0])
     let X_fold = AllocatedNum::alloc(cs.namespace(|| "allocate X_fold"), || {
-      let X = self
-        .X
+      let X = self_X
         .get_value()
         .ok_or(SynthesisError::AssignmentMissing)?;
       let r_b = r_b.get_value().ok_or(SynthesisError::AssignmentMissing)?;
@@ -297,10 +384,10 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       Ok(X + r_b * (U2_X - X))
     })?;
     cs.enforce(
-      || "enforce X_fold - self.X = r_b (U2.X - self.X)",
+      || "enforce X_fold - self.X[0] = r_b (U2.X - self.X[0])",
       |lc| lc + r_b.get_variable(),
-      |lc| lc + U2.X.get_variable() - self.X.get_variable(),
-      |lc| lc + X_fold.get_variable() - self.X.get_variable(),
+      |lc| lc + U2.X.get_variable() - self_X.get_variable(),
+      |lc| lc + X_fold.get_variable() - self_X.get_variable(),
     );
 
     // GH-#5 design pin §3.2: `fold` passes `T_lookup_per_table` through
@@ -311,6 +398,9 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     // `AllocatedFoldedInstance` via a sibling helper. Mirrors the native
     // `FoldedInstance::fold` passthrough at
     // `vendor/nova/src/neutron/relation.rs:695`.
+    // Path W: wrap single-arity X_fold as length-1 Vec to satisfy the
+    // Vec-shaped X invariant. Byte-equivalent to the prior single-AllocatedNum
+    // result at N==1 (per Corrigendum #2's "row 6 generalises to N==1").
     Ok(Self {
       comm_W: comm_W_fold.clone(),
       comm_E: comm_E_fold.clone(),
@@ -318,7 +408,7 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       #[cfg(feature = "lookup-fold")]
       T_lookup_per_table: self.T_lookup_per_table.clone(),
       u: u_fold,
-      X: X_fold,
+      X: vec![X_fold],
     })
   }
 
@@ -357,12 +447,29 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       condition,
     )?;
 
-    let X = conditionally_select(
-      cs.namespace(|| "X[0] = cond ? self.X[0] : other.X[0]"),
-      &self.X,
-      &other.X,
-      condition,
-    )?;
+    // Path W (pin §1.4 Corrigendum #2): per-element matched-shape select
+    // mirrors native `FoldedInstance::X: Vec<E::Scalar>`. Length-mismatch
+    // is a wire-up bug at the caller; fail-close rather than panicking.
+    if self.X.len() != other.X.len() {
+      return Err(SynthesisError::Unsatisfiable(
+        "AllocatedFoldedInstance::conditionally_select: X shape mismatch"
+          .to_string(),
+      ));
+    }
+    let X = self
+      .X
+      .iter()
+      .zip(other.X.iter())
+      .enumerate()
+      .map(|(i, (s, o))| {
+        conditionally_select(
+          cs.namespace(|| format!("X[{i}] = cond ? self.X[{i}] : other.X[{i}]")),
+          s,
+          o,
+          condition,
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
 
     // GH-#5 design pin §2.3 / §3.2: under `lookup-fold`, both branches of
     // `conditionally_select` must carry `T_lookup_per_table` of the same
@@ -1015,23 +1122,91 @@ mod stage0_byte_equivalence_tests {
     );
   }
 
-  /// M.GH5.0 negative-arity test — `AllocatedFoldedInstance::alloc` MUST
-  /// reject `FoldedInstance::X` of length != 1 with `SynthesisError::Unsatisfiable`.
+  /// M.GH5.0 STAGE 0 (0b) — Path W byte-equivalence at `num_io == 2`.
   ///
-  /// Per pin §1.4 corrigendum (Halpert 2026-05-09): the (W1) binding-via-hash
-  /// extension is sound only at `num_io == 1`. The in-circuit allocator
-  /// previously did `inst.X[0]` silently — a soundness-relevant truncation
-  /// at any X-arity > 1. The corrigendum elevates `X.len() == 1` to a stated
-  /// invariant; this test documents the fail-closed posture at the impl
-  /// boundary so the invariant cannot drift back to silent truncation.
+  /// Per pin §1.4 Corrigendum #2 (Halpert 2026-05-09, Path W ratification
+  /// under Core Principle 7): the (W1) binding-via-hash extension is
+  /// sound at any `num_io >= 1`. RO2 collision-resistance is a function
+  /// of the input bitstring, not the semantic length of any sub-field.
+  /// Per-element X absorption in canonical order produces a byte-equivalent
+  /// hash schema at any N. This test directly constructs an
+  /// `AllocatedFoldedInstance` with `X: Vec<AllocatedNum>` of length 2
+  /// and a matching native `FoldedInstance` with `X: Vec<E::Scalar>` of
+  /// length 2 (same scalar values), then asserts byte-equivalent RO
+  /// output. Exercises only `absorb_in_ro` (arity-agnostic primitive);
+  /// does NOT exercise `fold` (which is N==1-only per Corrigendum #3).
   ///
-  /// Mirrors the fail-closed posture of `conditionally_select`'s
-  /// T_lookup_per_table shape check (lines ~379-384).
+  /// Twin-substring negative test pattern not applicable here (positive
+  /// equivalence test). The (0c) test below covers the fail-close path
+  /// for `fold` at N>=2.
   #[test]
-  fn m_gh5_0_alloc_rejects_x_arity_two() {
-    // Build a synthetic FoldedInstance with X of length 2 — the exact
-    // shape that fell out of the prior (DirectCircuit, num_io == 2)
-    // STAGE 0 fixture and falsified byte-equivalence at step 1.
+  fn m_gh5_0_stage0_absorb_in_ro_byte_equivalence_at_num_io_2() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1BE_5BAD_C0DE_0B02);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+
+    // Two distinct non-zero X scalars. Random per ChaCha20Rng so the test
+    // exercises non-trivial absorption (not just zeros).
+    let x0 = Scalar::random(&mut rng);
+    let x1 = Scalar::random(&mut rng);
+    assert_ne!(x0, x1, "fixture: x0 and x1 must differ");
+    assert_ne!(x0, Scalar::ZERO, "fixture: x0 must be non-zero");
+    assert_ne!(x1, Scalar::ZERO, "fixture: x1 must be non-zero");
+
+    // Native FoldedInstance with X.len() == 2.
+    let native_inst = FoldedInstance::<E> {
+      comm_W: Commitment::<E>::default(),
+      comm_E: Commitment::<E>::default(),
+      T: Scalar::ZERO,
+      u: Scalar::ZERO,
+      X: vec![x0, x1],
+      comm_L: None,
+      comm_ts: None,
+      comm_inv_w: None,
+      comm_inv_t: None,
+      T_lookup: None,
+    };
+
+    // Native squeeze.
+    let mut ro = <E as Engine>::RO2::new(ro_consts.clone());
+    native_inst.absorb_in_ro2(&mut ro);
+    let h_native = ro.squeeze(NUM_HASH_BITS, false);
+
+    // In-circuit squeeze via Path W's per-element absorption.
+    let (h_circuit, satisfied) = circuit_absorb_squeeze(&ro_consts_circuit, &native_inst);
+    assert!(
+      satisfied,
+      "STAGE 0 (0b) num_io==2: in-circuit absorb_in_ro CS must be satisfied. \
+       Path W per-element X absorption MUST synthesise cleanly at any N>=1."
+    );
+    assert_eq!(
+      h_native, h_circuit,
+      "STAGE 0 (0b) num_io==2: native FoldedInstance::absorb_in_ro2 squeeze MUST equal \
+       in-circuit AllocatedFoldedInstance::absorb_in_ro derived squeeze under Path W. \
+       (h_native, h_circuit) = ({:?}, {:?}). \
+       Per pin §1.4 Corrigendum #2: byte-equivalence holds for ANY N>=1.",
+      h_native, h_circuit
+    );
+  }
+
+  /// M.GH5.0 STAGE 0 (0c) — Corrigendum #3 fold-arity fail-close.
+  ///
+  /// Per pin §1.4 Corrigendum #3 (Halpert 2026-05-09, fold-arity invariant
+  /// under §1.6 anchor): the legal U1.X arity at fold time is **1**
+  /// (because U2 is structurally single-IO per §1.6). At N>=2 there is no
+  /// native algebra to mirror without breaking the single `hash.inputize`
+  /// IVC pattern; γ.1 ratification mandates `fold` fail-close with
+  /// `SynthesisError::Unsatisfiable` citing the corrigendum.
+  ///
+  /// This test constructs an `AllocatedFoldedInstance` with `X.len() == 2`
+  /// (legal under Path W's Vec-shape for `alloc` / `absorb_in_ro` /
+  /// `select`), invokes `fold`, and asserts the fail-close fires BEFORE
+  /// any U2 usage with the twin-substring match per pin §3.5
+  /// negative-test discipline (`self.X.len() != 1` AND `§1.6`).
+  #[test]
+  fn m_gh5_0_fold_rejects_x_arity_two() {
+    // Build a native FoldedInstance with X.len() == 2 — exercising Path
+    // W's arity-agnostic alloc.
     let inst_x_len_two = FoldedInstance::<E> {
       comm_W: Commitment::<E>::default(),
       comm_E: Commitment::<E>::default(),
@@ -1046,29 +1221,240 @@ mod stage0_byte_equivalence_tests {
     };
 
     let mut cs = TestConstraintSystem::<Scalar>::new();
-    let result = AllocatedFoldedInstance::<E>::alloc(
-      cs.namespace(|| "alloc rejects X.len() == 2"),
+
+    // Alloc must succeed under Path W (arity-agnostic).
+    let allocated = AllocatedFoldedInstance::<E>::alloc(
+      cs.namespace(|| "U with X.len()==2"),
       Some(&inst_x_len_two),
+    )
+    .expect(
+      "Path W: AllocatedFoldedInstance::alloc must accept any X.len() per Corrigendum #2; \
+       only `fold` fail-closes at N>=2 per Corrigendum #3.",
+    );
+    assert_eq!(
+      allocated.X.len(),
+      2,
+      "Path W: alloc preserves native X.len() == 2"
+    );
+
+    // Construct minimal U2, r_b, T_out, comm_W_fold, comm_E_fold for the
+    // fold call. The γ.1 fail-close fires BEFORE any U2 usage, so the U2
+    // contents don't affect the test outcome — but the call signature
+    // requires concrete arguments.
+    let U2 = AllocatedNonnativeR1CSInstance::<E>::alloc(cs.namespace(|| "U2"), None)
+      .expect("U2 alloc must succeed");
+    let r_b = AllocatedNum::alloc(cs.namespace(|| "r_b"), || Ok(Scalar::ZERO))
+      .expect("r_b alloc must succeed");
+    let T_out = AllocatedNum::alloc(cs.namespace(|| "T_out"), || Ok(Scalar::ZERO))
+      .expect("T_out alloc must succeed");
+    let comm_W_fold = AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_W_fold"))
+      .expect("comm_W_fold default must succeed");
+    let comm_E_fold = AllocatedNonnativePoint::<E>::default(cs.namespace(|| "comm_E_fold"))
+      .expect("comm_E_fold default must succeed");
+
+    let result = allocated.fold(
+      cs.namespace(|| "fold rejects X.len()==2"),
+      &U2,
+      &r_b,
+      &T_out,
+      &comm_W_fold,
+      &comm_E_fold,
     );
 
     match result {
       Err(SynthesisError::Unsatisfiable(msg)) => {
         assert!(
-          msg.contains("num_io == 1"),
-          "Negative-arity test: error message must mention the `num_io == 1` \
-           invariant (pin §1.4 corrigendum). Got: {msg}"
+          msg.contains("self.X.len() != 1"),
+          "Corrigendum #3 fold-arity fail-close: error message must mention \
+           `self.X.len() != 1`. Got: {msg}"
+        );
+        assert!(
+          msg.contains("§1.6"),
+          "Corrigendum #3 fold-arity fail-close: error message must cite the \
+           §1.6 anchor (single-IO `AllocatedNonnativeR1CSInstance` invariant). \
+           Got: {msg}"
         );
       }
       Ok(_) => panic!(
-        "Negative-arity test: AllocatedFoldedInstance::alloc accepted a \
-         FoldedInstance with X.len() == 2 — silent truncation regression. \
-         Per pin §1.4 corrigendum: must fail-closed with \
-         SynthesisError::Unsatisfiable mentioning `num_io == 1`."
+        "Corrigendum #3: AllocatedFoldedInstance::fold accepted X.len() == 2 — \
+         fold-arity fail-close regression. fold MUST return \
+         SynthesisError::Unsatisfiable at N>=2 per pin §1.4 Corrigendum #3."
       ),
       Err(other) => panic!(
-        "Negative-arity test: expected SynthesisError::Unsatisfiable with \
-         `num_io == 1` in the message; got {other:?}"
+        "Corrigendum #3: expected SynthesisError::Unsatisfiable; got {other:?}"
       ),
     }
+  }
+
+  /// M.GH5.0 STAGE 0 — Path Y structural-binding negative test
+  /// (pin §1.4 Corrigendum #4-A, Halpert ratification 2026-05-09).
+  ///
+  /// Path Y replaces Path W's per-slot
+  /// `AllocatedNum::alloc(... || Ok(F::ZERO))` for `X[i]` with `T.clone()`
+  /// (`circuit/relation.rs:185, 195` for `default_with_lookup_k`;
+  /// `:238, 249` for `default`). Under Path Y's variable-aliasing
+  /// semantics, every `X[i].get_variable() == T.get_variable()`, and
+  /// `T` is bound by `alloc_zero`'s `(0)·(0) = T` constraint
+  /// (`vendor/nova/src/gadgets/utils.rs`). Variable identity IS the
+  /// algebraic binding — `eval_lc` resolves `X[i]` to `T`'s witness
+  /// value, which `alloc_zero` pins to `F::ZERO` unforgeably.
+  ///
+  /// The original Corrigendum #4 negative-test obligation
+  /// (`Unew_base.X[0] = N ≠ 0` then assert `cs.is_satisfied() == false`)
+  /// is structurally meaningless against Path Y: there is no
+  /// independent aux index for `X[i]` to attack — setting `X[0] = N ≠ 0`
+  /// would require `T = N ≠ 0`, which `alloc_zero` rejects directly,
+  /// not the missing per-slot zero-binding the Path-W test would have
+  /// exposed. `WitnessCS::enforce` is a no-op (option 4 dead) per
+  /// `frontend/util_cs/witness_cs.rs:115-124`.
+  ///
+  /// Per Corrigendum #4-A, the amended obligation is a
+  /// **structural-binding test** that catches the only regression class
+  /// capable of re-opening the original missing-constraint forgery
+  /// vector — namely, an edit that reverts Path Y's `T.clone()` to a
+  /// fresh `AllocatedNum::alloc(..., || Ok(F::ZERO))` (or equivalent)
+  /// without an accompanying `enforce(X[i] - T == 0)` constraint. The
+  /// test asserts:
+  ///
+  ///   1. **Variable-identity binding** — `X[i].get_variable() ==
+  ///      T.get_variable()` for every `i ∈ [0, num_io)` AND
+  ///      `u.get_variable() == T.get_variable()`, exercised at the
+  ///      structurally-relevant arities for both `default` and
+  ///      `default_with_lookup_k`.
+  ///   2. **Constraint-count floor** — `cs.num_constraints() >= 1` to
+  ///      anchor `alloc_zero`'s `(0)·(0) = T` row. Floor (not exact)
+  ///      so future `alloc_zero` refactors do not bisect through this
+  ///      test.
+  ///   3. **Positive `is_satisfied`** — exercises `alloc_zero`'s
+  ///      `(0)·(0) = T` end-to-end against `eval_lc`; provides
+  ///      regression-bisect ergonomics for sibling negative tests.
+  ///
+  /// If a future edit re-introduces an independent aux index for
+  /// `X[i]` (whether by reverting Path Y, by lattice-folding, or by a
+  /// Stwo migration), the variable-identity assertion fires
+  /// algebraically before any cross-step substitution can be
+  /// exercised. At that point, a new corrigendum (Corrigendum #5)
+  /// MUST replace this amendment with an explicit malicious-witness
+  /// test against whatever then-current CS surface supports
+  /// witness-injection.
+  ///
+  /// Engine variants mirror `neutron/mod.rs::test_pp_digest`'s
+  /// (Pallas, Bn256, Secp) sweep so soundness-class assertions are
+  /// exercised across all production curve families.
+  fn m_gh5_0_path_y_x_t_aliasing_binding_with<EngineForTest: Engine>() {
+    type Cases = &'static [(usize, Option<usize>)];
+    // Cases mirror Corrigendum #4-A item 1 — production-relevant arities
+    // for both `default` and `default_with_lookup_k`. `num_io == 1` is
+    // the production base case (pin §1.6 single-IO anchor); `num_io == 2`
+    // is Path W's Vec at multi-IO (Corrigendum #2). `k ∈ {0, 1}` covers
+    // the lookup-fold k-typed running instance at degenerate (k=0) and
+    // minimal-non-trivial (k=1) shapes.
+    let cases: Cases = &[
+      (1, None),    // default(cs, num_io=1) — production base case
+      (2, None),    // default(cs, num_io=2) — Path W's Vec at multi-IO
+      (1, Some(0)), // default_with_lookup_k(cs, num_io=1, k=0)
+      (1, Some(1)), // default_with_lookup_k(cs, num_io=1, k=1)
+      (2, Some(1)), // default_with_lookup_k(cs, num_io=2, k=1)
+    ];
+
+    for &(num_io, k_opt) in cases {
+      let mut cs = TestConstraintSystem::<<EngineForTest as Engine>::Scalar>::new();
+      let unew_base = match k_opt {
+        None => AllocatedFoldedInstance::<EngineForTest>::default(
+          cs.namespace(|| format!("default num_io={num_io}")),
+          num_io,
+        )
+        .expect(
+          "Path Y: AllocatedFoldedInstance::default must synthesize cleanly \
+           per pin §1.4 Corrigendum #4 / #4-A",
+        ),
+        Some(k) => AllocatedFoldedInstance::<EngineForTest>::default_with_lookup_k(
+          cs.namespace(|| format!("default_with_lookup_k num_io={num_io} k={k}")),
+          num_io,
+          k,
+        )
+        .expect(
+          "Path Y: AllocatedFoldedInstance::default_with_lookup_k must synthesize \
+           cleanly per pin §1.4 Corrigendum #4 / #4-A",
+        ),
+      };
+
+      // (1) Variable-identity binding — Path Y's algebraic binding under
+      // Corrigendum #4-A. Each `X[i]` MUST share `T`'s variable; `u`
+      // MUST share `T`'s variable. Variable identity IS the binding
+      // under T.clone() semantics: `eval_lc` resolves these allocations
+      // to `T`'s witness value, which `alloc_zero`'s `(0)·(0) = T` row
+      // pins to `F::ZERO` unforgeably.
+      for i in 0..num_io {
+        assert_eq!(
+          unew_base.X[i].get_variable(),
+          unew_base.T.get_variable(),
+          "Path Y / Corrigendum #4-A item 1 (case num_io={num_io}, k={k_opt:?}): \
+           `X[{i}].get_variable()` MUST equal `T.get_variable()`. A regression \
+           that allocates `X[{i}]` as a fresh aux variable (e.g., reverting \
+           Path Y's `T.clone()` to `AllocatedNum::alloc(... || Ok(F::ZERO))`) \
+           without an accompanying `enforce(X[{i}] - T == 0)` constraint \
+           re-opens the missing-constraint forgery vector closed by Path Y. \
+           See pin §1.4 Corrigendum #4-A item 1.",
+        );
+      }
+      assert_eq!(
+        unew_base.u.get_variable(),
+        unew_base.T.get_variable(),
+        "Path Y / Corrigendum #4-A item 1 (case num_io={num_io}, k={k_opt:?}): \
+         `u.get_variable()` MUST equal `T.get_variable()` per upstream \
+         microsoft/Nova's clone-of-T pattern (`let u = T.clone()` at \
+         circuit/relation.rs:185, 238). Same forgery-vector class as the \
+         X[i] aliasing.",
+      );
+
+      // (2) Constraint-count floor — `alloc_zero` contributes the
+      // `(0)·(0) = T` row that pins `T`'s witness value to `F::ZERO`.
+      // After Path Y's `T.clone()`, no fresh aux for `X[i]` / `u` ⇒
+      // `num_aux()` matches the upstream clone-of-T baseline. We assert
+      // a floor (≥ 1 constraint) rather than exact count to avoid
+      // brittle drift under future `alloc_zero` refactors. Per pin §1.4
+      // Corrigendum #4-A item 2.
+      assert!(
+        cs.num_constraints() >= 1,
+        "Path Y / Corrigendum #4-A item 2 (case num_io={num_io}, k={k_opt:?}): \
+         `cs.num_constraints()` MUST be >= 1 to anchor `alloc_zero`'s \
+         `(0)·(0) = T` zero-binding row. A regression that drops the \
+         `alloc_zero` constraint (or replaces it with a constraint-free \
+         allocation) re-opens the forgery vector even with variable \
+         aliasing intact — `T`'s witness would be unconstrained, and \
+         every cloning `X[i]` / `u` would inherit the unconstraint. \
+         Got num_constraints() = {}.",
+        cs.num_constraints(),
+      );
+
+      // (3) Positive `is_satisfied` — exercises `alloc_zero`'s
+      // `(0)·(0) = T` end-to-end against `eval_lc`. The full-stack
+      // `test_pp_digest` and `test_neutron_recursive_circuit_pasta`
+      // runs already provide this coverage transitively, but the
+      // sibling assertion provides regression-bisect ergonomics. Per
+      // pin §1.4 Corrigendum #4-A item 3.
+      assert!(
+        cs.is_satisfied(),
+        "Path Y / Corrigendum #4-A item 3 (case num_io={num_io}, k={k_opt:?}): \
+         `default` / `default_with_lookup_k` MUST produce a satisfying \
+         base-case constraint system. Failure here means `alloc_zero`'s \
+         `(0)·(0) = T` row evaluates inconsistently against the \
+         `T.clone()`-aliased `X[i]` / `u` — a synthesis bug introduced \
+         by Path Y or a downstream Corrigendum.",
+      );
+    }
+  }
+
+  #[test]
+  fn m_gh5_0_path_y_x_t_aliasing_binding() {
+    // Mirror `neutron/mod.rs::test_pp_digest`'s engine sweep — soundness-
+    // class assertions are exercised across all production curve families
+    // (Pallas, Bn256, Secp). The test is engine-generic; the helper
+    // takes any `E: Engine` and constructs `AllocatedFoldedInstance::<E>`
+    // via the public `default` / `default_with_lookup_k` constructors.
+    m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::PallasEngine>();
+    m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::Bn256EngineKZG>();
+    m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::Secp256k1Engine>();
   }
 }

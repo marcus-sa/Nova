@@ -333,22 +333,49 @@ mod tests {
     },
     provider::{hyperkzg::EvaluationEngine, Bn256EngineKZG},
     r1cs::R1CSShape,
-    spartan::{
-      direct::DirectCircuit,
-      polys::power::PowPolynomial,
-      snark::RelaxedR1CSSNARK,
-    },
+    spartan::{polys::power::PowPolynomial, snark::RelaxedR1CSSNARK},
     traits::{
-      circuit::NonTrivialCircuit, commitment::CommitmentEngineTrait,
-      snark::RelaxedR1CSSNARKTrait, RO2Constants, RO2ConstantsCircuit,
+      commitment::CommitmentEngineTrait, snark::RelaxedR1CSSNARKTrait, RO2Constants,
+      RO2ConstantsCircuit,
     },
     Commitment,
   };
+  use ff::PrimeField;
   use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
   type E = Bn256EngineKZG;
   type Scalar = <E as Engine>::Scalar;
   type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
+
+  /// Minimal one-`inputize` test-only `Circuit` producing R1CS shapes with
+  /// `num_io == 1`.
+  ///
+  /// Pin §1.4 corrigendum (Halpert ratification 2026-05-09) elevated the
+  /// X-arity invariant `num_io == 1` to a stated soundness invariant for
+  /// the (W1) binding-via-hash extension; M.GH5.0 added a fail-closed
+  /// guard at `AllocatedFoldedInstance::alloc` (`circuit/relation.rs:78-85`)
+  /// rejecting `inst.X.len() != 1`. The lookup-side in-circuit tests in
+  /// this module exercise the lookup verifier's FS-replay equality and
+  /// per-table (C)-binding R1CS satisfaction; they do NOT exercise the
+  /// (W1) binding-via-hash surface, so they only need an R1CS shape with
+  /// `num_io == 1` — not the full `NeutronAugmentedCircuit` shape that
+  /// the STAGE 0 byte-equivalence test uses (Halpert Q2 2026-05-09: Path
+  /// Z, "minimal one-`inputize` test Circuit preferred"). This circuit
+  /// allocates one scalar and inputizes it, with no business constraints
+  /// — `SatisfyingAssignment` accepts any value (the satisfying-witness
+  /// caller passes `()` since there is no business state). The previous
+  /// fixture `DirectCircuit::<E, NonTrivialCircuit<Scalar>>` produced
+  /// `num_io == 2` (`spartan/direct.rs:59-64` inputizes both `z_i` and
+  /// `z_i_plus_one`), which the M.GH5.0 fail-close rejects.
+  struct MinimalSingleIOCircuit;
+
+  impl<F: PrimeField> Circuit<F> for MinimalSingleIOCircuit {
+    fn synthesize<CS: ConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+      let x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(F::ZERO))?;
+      x.inputize(cs.namespace(|| "x_io"))?;
+      Ok(())
+    }
+  }
 
   /// Stage G: in-circuit `verify_with_lookup` synthesises without
   /// SynthesisError on a real `NIFS::prove_with_lookup` output, and the
@@ -361,13 +388,17 @@ mod tests {
     let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
     let pp_digest = Scalar::ZERO;
 
-    // --- Build a small R1CS shape ---
-    let num_cons: usize = 32;
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
-      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    // --- Build a small R1CS shape (M.GH5.0a: minimal single-IO fixture
+    // per pin §1.4 corrigendum + §6.2 propagation corrigendum). ---
     let mut shape_cs: ShapeCS<E> = ShapeCS::new();
-    let _ = circuit.synthesize(&mut shape_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut shape_cs);
     let shape = shape_cs.r1cs_shape().unwrap();
+    assert_eq!(
+      shape.num_io(),
+      1,
+      "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
+    );
     let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
 
     // --- Build a 16-entry lookup table ---
@@ -392,12 +423,8 @@ mod tests {
     let shape = str.S.clone();
 
     // --- Make a satisfying U2/W2 ---
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
-      Some(vec![Scalar::from(2)]),
-      NonTrivialCircuit::<Scalar>::new(num_cons),
-    );
     let mut sat_cs = SatisfyingAssignment::<E>::new();
-    let _ = circuit.synthesize(&mut sat_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut sat_cs);
     let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
     let W2 = W2.pad(&shape);
 
@@ -628,13 +655,17 @@ mod tests {
     let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
     let pp_digest = Scalar::ZERO;
 
-    // Build a small R1CS shape.
-    let num_cons: usize = 32;
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
-      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    // Build a small R1CS shape (M.GH5.0a: minimal single-IO fixture
+    // per pin §1.4 corrigendum + §6.2 propagation corrigendum).
     let mut shape_cs: ShapeCS<E> = ShapeCS::new();
-    let _ = circuit.synthesize(&mut shape_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut shape_cs);
     let shape = shape_cs.r1cs_shape().unwrap();
+    assert_eq!(
+      shape.num_io(),
+      1,
+      "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
+    );
     let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
 
     // 16-row table with 2 value columns.
@@ -674,12 +705,8 @@ mod tests {
     let shape = str.S.clone();
 
     // Satisfying U2/W2.
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
-      Some(vec![Scalar::from(2)]),
-      NonTrivialCircuit::<Scalar>::new(num_cons),
-    );
     let mut sat_cs = SatisfyingAssignment::<E>::new();
-    let _ = circuit.synthesize(&mut sat_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut sat_cs);
     let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
     let W2 = W2.pad(&shape);
 
@@ -925,14 +952,20 @@ mod tests {
     let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
     let pp_digest = Scalar::ZERO;
 
-    // Build a small R1CS shape (mirrors the M.4 k=2 fixture and the
-    // single-table multi-column in-circuit test).
-    let num_cons: usize = 32;
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
-      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    // Build a small R1CS shape (M.GH5.0a: minimal single-IO fixture
+    // per pin §1.4 corrigendum + §6.2 propagation corrigendum; mirrors
+    // the M.4 k=2 fixture and the single-table multi-column in-circuit
+    // test at the lookup-side, but with `num_io == 1` per the X-arity
+    // invariant).
     let mut shape_cs: ShapeCS<E> = ShapeCS::new();
-    let _ = circuit.synthesize(&mut shape_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut shape_cs);
     let shape = shape_cs.r1cs_shape().unwrap();
+    assert_eq!(
+      shape.num_io(),
+      1,
+      "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
+    );
     let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
 
     // Two homogeneous-size random tables: n_1 = n_2 = 16, each with 1
@@ -981,12 +1014,8 @@ mod tests {
     let shape = str_local.S.clone();
 
     // Satisfying R1CS instance.
-    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
-      Some(vec![Scalar::from(2)]),
-      NonTrivialCircuit::<Scalar>::new(num_cons),
-    );
     let mut sat_cs = SatisfyingAssignment::<E>::new();
-    let _ = circuit2.synthesize(&mut sat_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut sat_cs);
     let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
     let W2 = W2.pad(&shape);
 
@@ -1476,13 +1505,18 @@ mod tests {
     let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
     let pp_digest = Scalar::ZERO;
 
-    // R1CS shape (mirrors the M.6 happy-path k=2 fixture).
-    let num_cons: usize = 32;
-    let circuit: DirectCircuit<E, NonTrivialCircuit<Scalar>> =
-      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    // R1CS shape (M.GH5.0a: minimal single-IO fixture per pin §1.4
+    // corrigendum + §6.2 propagation corrigendum; mirrors the M.6
+    // happy-path k=2 fixture at the lookup-side but with `num_io == 1`).
     let mut shape_cs: ShapeCS<E> = ShapeCS::new();
-    let _ = circuit.synthesize(&mut shape_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut shape_cs);
     let shape = shape_cs.r1cs_shape().unwrap();
+    assert_eq!(
+      shape.num_io(),
+      1,
+      "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
+    );
     let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
 
     // k = 2 homogeneous-size random tables: n_1 = n_2 = 16, each with 1
@@ -1531,12 +1565,8 @@ mod tests {
     let shape = str_local.S.clone();
 
     // Satisfying R1CS instance for the (single) honest fold step.
-    let circuit2: DirectCircuit<E, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
-      Some(vec![Scalar::from(2)]),
-      NonTrivialCircuit::<Scalar>::new(num_cons),
-    );
     let mut sat_cs = SatisfyingAssignment::<E>::new();
-    let _ = circuit2.synthesize(&mut sat_cs);
+    let _ = MinimalSingleIOCircuit.synthesize(&mut sat_cs);
     let (U2, W2) = sat_cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
     let W2 = W2.pad(&shape);
 
