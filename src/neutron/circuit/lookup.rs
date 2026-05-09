@@ -331,13 +331,9 @@ mod tests {
         LookupTableHandle, MultiColumnLookupTable, Structure,
       },
     },
-    provider::{hyperkzg::EvaluationEngine, Bn256EngineKZG},
-    r1cs::R1CSShape,
-    spartan::{polys::power::PowPolynomial, snark::RelaxedR1CSSNARK},
-    traits::{
-      commitment::CommitmentEngineTrait, snark::RelaxedR1CSSNARKTrait, RO2Constants,
-      RO2ConstantsCircuit,
-    },
+    provider::Bn256EngineKZG,
+    spartan::polys::power::PowPolynomial,
+    traits::{commitment::CommitmentEngineTrait, RO2Constants, RO2ConstantsCircuit},
     Commitment,
   };
   use ff::PrimeField;
@@ -345,7 +341,6 @@ mod tests {
 
   type E = Bn256EngineKZG;
   type Scalar = <E as Engine>::Scalar;
-  type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
 
   /// Minimal one-`inputize` test-only `Circuit` producing R1CS shapes with
   /// `num_io == 1`.
@@ -371,8 +366,26 @@ mod tests {
 
   impl<F: PrimeField> Circuit<F> for MinimalSingleIOCircuit {
     fn synthesize<CS: ConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+      // Single public IO (pin §1.6 + Corrigendum #3 fold-arity invariant).
       let x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(F::ZERO))?;
       x.inputize(cs.namespace(|| "x_io"))?;
+
+      // Pin §1.4 Corrigendum #5: emit ≥3 enforced constraints so
+      // S.ell = log2(next_pow2(num_cons)) >= 2. Restores the R1CS-side
+      // eq machinery's `PowPolynomial::new(&tau, S.ell).split_evals(...)`
+      // precondition (panic at power.rs:67 on ell == 0; right[1] indexing
+      // failure at ell == 1). Constraints are content-irrelevant —
+      // 0 * 0 == 0 triples on zero witnesses keep the fixture trivially
+      // satisfiable across both ShapeCS and SatisfyingAssignment.
+      for i in 0..4 {
+        let z = AllocatedNum::alloc(cs.namespace(|| format!("z_{i}")), || Ok(F::ZERO))?;
+        cs.enforce(
+          || format!("z_{i} == 0"),
+          |lc| lc + z.get_variable(),
+          |lc| lc + CS::one(),
+          |lc| lc,
+        );
+      }
       Ok(())
     }
   }
@@ -399,7 +412,20 @@ mod tests {
       "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
        with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
     );
-    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    assert!(
+      shape.num_cons >= 3,
+      "M.GH5.0c fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_cons >= 3` so `S.ell >= 2` (R1CS-hypercube precondition \
+       for `PowPolynomial::split_evals` under the lookup-fold prover path) \
+       per pin §1.4 Corrigendum #5."
+    );
+    // M.GH5.0b: explicit CK size for the lookup-side commits (table /
+    // witness_pool / multiplicities, all of size `table_size = 16`). The
+    // M.GH5.0a `MinimalSingleIOCircuit` shape gives `R1CSShape::commitment_key`
+    // a CK floor of 1 (from `num_vars = 1`), too small for the 16-entry
+    // lookup vectors committed below — hence panic at `hyperkzg.rs:567`
+    // (`ck.ck.len() >= v.len()`). Size to the actual max committed length.
+    let ck = <E as Engine>::CE::setup(b"lookup_test", 16).expect("CE::setup");
 
     // --- Build a 16-entry lookup table ---
     let table_size = 16usize;
@@ -666,7 +692,18 @@ mod tests {
       "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
        with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
     );
-    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    assert!(
+      shape.num_cons >= 3,
+      "M.GH5.0c fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_cons >= 3` so `S.ell >= 2` (R1CS-hypercube precondition \
+       for `PowPolynomial::split_evals` under the lookup-fold prover path) \
+       per pin §1.4 Corrigendum #5."
+    );
+    // M.GH5.0b: explicit CK size for the lookup-side commits. Tables (t1, t2),
+    // identity addr column, multi-column witness vectors, and multiplicities
+    // are all of size `table_size = 16`. M.GH5.0a's CK floor of 1 is too small
+    // for these commits — see stage_g rationale.
+    let ck = <E as Engine>::CE::setup(b"lookup_test", 16).expect("CE::setup");
 
     // 16-row table with 2 value columns.
     let table_size = 16usize;
@@ -966,7 +1003,18 @@ mod tests {
       "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
        with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
     );
-    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    assert!(
+      shape.num_cons >= 3,
+      "M.GH5.0c fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_cons >= 3` so `S.ell >= 2` (R1CS-hypercube precondition \
+       for `PowPolynomial::split_evals` under the lookup-fold prover path) \
+       per pin §1.4 Corrigendum #5."
+    );
+    // M.GH5.0b: explicit CK size for the lookup-side commits. k=2 multi-table
+    // homogeneous-size fixture, n_1 = n_2 = 16; per-table address / value /
+    // multiplicity vectors are all 16 entries; identity tables 16 entries.
+    // M.GH5.0a's CK floor of 1 is too small — see stage_g rationale.
+    let ck = <E as Engine>::CE::setup(b"lookup_test", 16).expect("CE::setup");
 
     // Two homogeneous-size random tables: n_1 = n_2 = 16, each with 1
     // value column. Random table contents pinned via ChaCha20Rng.
@@ -1517,7 +1565,18 @@ mod tests {
       "M.GH5.0a fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
        with `num_io == 1` per pin §1.4 corrigendum (X-arity invariant)."
     );
-    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    assert!(
+      shape.num_cons >= 3,
+      "M.GH5.0c fixture: `MinimalSingleIOCircuit` must produce R1CS shape \
+       with `num_cons >= 3` so `S.ell >= 2` (R1CS-hypercube precondition \
+       for `PowPolynomial::split_evals` under the lookup-fold prover path) \
+       per pin §1.4 Corrigendum #5."
+    );
+    // M.GH5.0b: explicit CK size for the lookup-side commits. Same shape as
+    // the M.6 happy-path k=2 fixture; n_1 = n_2 = 16; per-table address /
+    // value / multiplicity / identity vectors all 16 entries. M.GH5.0a's CK
+    // floor of 1 is too small — see stage_g rationale.
+    let ck = <E as Engine>::CE::setup(b"lookup_test", 16).expect("CE::setup");
 
     // k = 2 homogeneous-size random tables: n_1 = n_2 = 16, each with 1
     // value column.
