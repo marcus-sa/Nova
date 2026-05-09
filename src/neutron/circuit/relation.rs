@@ -194,16 +194,28 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     // pattern under Path W's Vec shape.
     let X = (0..num_io).map(|_| T.clone()).collect::<Vec<_>>();
 
-    let T_lookup_per_table = Some(
-      (0..k)
-        .map(|j| {
-          AllocatedNum::alloc(
-            cs.namespace(|| format!("allocate T_lookup_per_table[{j}] = 0")),
-            || Ok(E::Scalar::ZERO),
-          )
-        })
-        .collect::<Result<Vec<_>, _>>()?,
-    );
+    // Path Y extension to T_lookup_per_table (pin §1.4 Corrigendum #6,
+    // Halpert ratification 2026-05-09): allocate a single
+    // `T_lookup_zero` via `alloc_zero` and clone across all k slots.
+    // Each `T_lookup_per_table[j]` shares `T_lookup_zero`'s variable,
+    // inheriting `alloc_zero`'s `(0)·(0) = T_lookup_zero` zero-binding
+    // constraint for free. Closes the IVC-anchor (i==0) missing-
+    // constraint forgery vector for the running lookup scalar — same
+    // class as Corrigendum #4's X-side gap, extended to the
+    // `T_lookup_per_table` field that Corrigendum #4-A implicitly
+    // omitted. The separate `T_lookup_zero` (rather than aliasing to
+    // `T`) is preferred for namespace and audit-surface clarity per
+    // Corrigendum #6 ("Why a dedicated `T_lookup_zero` rather than
+    // aliasing to `T`"); X-T aliasing is upstream-precedented but
+    // T_lookup-T aliasing would be novel cross-field reuse. Native-
+    // side mirror: no change required (native `FoldedInstance::default`
+    // produces `T_lookup: None` — the structurally-empty outer base
+    // has no zeroed-Vec to bind; the in-circuit `Some(vec![alloc; k])`
+    // shape is intentional per §2.3 / §3.2 for the constant-shape FS
+    // schedule across base/non-base, and the binding obligation is
+    // in-circuit-only).
+    let T_lookup_zero = alloc_zero(cs.namespace(|| "allocate T_lookup_zero"));
+    let T_lookup_per_table = Some((0..k).map(|_| T_lookup_zero.clone()).collect::<Vec<_>>());
 
     Ok(Self {
       comm_W,
@@ -1288,6 +1300,8 @@ mod stage0_byte_equivalence_tests {
 
   /// M.GH5.0 STAGE 0 — Path Y structural-binding negative test
   /// (pin §1.4 Corrigendum #4-A, Halpert ratification 2026-05-09).
+  /// M.GH5.2 extension: Corrigendum #6 (Halpert ratification 2026-05-09)
+  /// — Path Y extension to `T_lookup_per_table` base-case zero-binding.
   ///
   /// Path Y replaces Path W's per-slot
   /// `AllocatedNum::alloc(... || Ok(F::ZERO))` for `X[i]` with `T.clone()`
@@ -1355,6 +1369,13 @@ mod stage0_byte_equivalence_tests {
       (1, Some(0)), // default_with_lookup_k(cs, num_io=1, k=0)
       (1, Some(1)), // default_with_lookup_k(cs, num_io=1, k=1)
       (2, Some(1)), // default_with_lookup_k(cs, num_io=2, k=1)
+      // Corrigendum #6 item 1 — production-relevant T_lookup arities
+      // per ADR-0021 (k=2: T_1 merged window table + T_2 chunk-lookup
+      // identity table). The intra-Vec aliasing assertion at (4) only
+      // fires algebraically at k >= 2 — these cases are the load-bearing
+      // ones for the regression-detection of per-slot fresh aux.
+      (1, Some(2)), // default_with_lookup_k(cs, num_io=1, k=2) — production
+      (2, Some(2)), // default_with_lookup_k(cs, num_io=2, k=2)
     ];
 
     for &(num_io, k_opt) in cases {
@@ -1415,6 +1436,22 @@ mod stage0_byte_equivalence_tests {
       // a floor (≥ 1 constraint) rather than exact count to avoid
       // brittle drift under future `alloc_zero` refactors. Per pin §1.4
       // Corrigendum #4-A item 2.
+      // Constraint-count floor — Corrigendum #4-A item 2 + Corrigendum
+      // #6 item 2 unified obligation. `alloc_zero` for `T` contributes
+      // the `(0)·(0) = T` row (X-side zero-binding); under
+      // `default_with_lookup_k`, `alloc_zero` for `T_lookup_zero`
+      // contributes a second `(0)·(0) = T_lookup_zero` row. Floor (not
+      // exact) so future `alloc_zero` refactors do not bisect through
+      // this test. Empirically anchored: pre-Corrigendum-#6 baseline at
+      // M.GH5.1 close was `num_constraints == 5` for `default(num_io)`
+      // (k_opt == None) and `num_constraints == 5` for
+      // `default_with_lookup_k(num_io, k)` (k slots had fresh aux but
+      // ZERO new constraints — the gap Corrigendum #6 closes); post-
+      // Corrigendum-#6: `default(num_io)` stays at 5, but
+      // `default_with_lookup_k(num_io, k)` advances to 6 (one new
+      // constraint from `T_lookup_zero`'s `alloc_zero`). The floor
+      // enforces: lookup-aware constructor MUST emit ≥ 1 more
+      // constraint than the default constructor at the same num_io.
       assert!(
         cs.num_constraints() >= 1,
         "Path Y / Corrigendum #4-A item 2 (case num_io={num_io}, k={k_opt:?}): \
@@ -1427,6 +1464,28 @@ mod stage0_byte_equivalence_tests {
          Got num_constraints() = {}.",
         cs.num_constraints(),
       );
+      // Corrigendum #6 item 2 — lookup-aware constructor MUST emit at
+      // least one more constraint than the unallocated `T_lookup_zero`
+      // baseline. The `T_lookup_zero` `alloc_zero` row is unconditional
+      // in `default_with_lookup_k` (allocated before the `(0..k).map`),
+      // so even at `k == 0` the constraint count strictly exceeds the
+      // `default(num_io)` baseline (no `T_lookup_zero` allocation).
+      // Empirical: 5 (default) → 6 (default_with_lookup_k) at M.GH5.2.
+      if k_opt.is_some() {
+        assert!(
+          cs.num_constraints() >= 6,
+          "Corrigendum #6 item 2 (case num_io={num_io}, k={k_opt:?}): \
+           `default_with_lookup_k` MUST emit at least 6 constraints (the \
+           pre-Corrigendum-#6 `default(num_io)` baseline of 5 + one new \
+           `(0)·(0) = T_lookup_zero` row from `alloc_zero(cs.namespace(|| \
+           \"allocate T_lookup_zero\"))`). A regression that drops the \
+           `T_lookup_zero` `alloc_zero` (e.g., reverting to per-slot \
+           `AllocatedNum::alloc(... || Ok(F::ZERO))`) re-opens the IVC- \
+           anchor missing-constraint forgery vector for the running \
+           lookup scalar. Got num_constraints() = {}.",
+          cs.num_constraints(),
+        );
+      }
 
       // (3) Positive `is_satisfied` — exercises `alloc_zero`'s
       // `(0)·(0) = T` end-to-end against `eval_lc`. The full-stack
@@ -1443,6 +1502,95 @@ mod stage0_byte_equivalence_tests {
          `T.clone()`-aliased `X[i]` / `u` — a synthesis bug introduced \
          by Path Y or a downstream Corrigendum.",
       );
+
+      // (4) Path Y extension to T_lookup_per_table — pin §1.4
+      // Corrigendum #6 (Halpert ratification 2026-05-09). At
+      // `default_with_lookup_k` only: the per-slot
+      // `T_lookup_per_table[j]` allocations MUST share a single
+      // `T_lookup_zero` aux variable (clone-across-k aliasing),
+      // inheriting `alloc_zero`'s `(0)·(0) = T_lookup_zero`
+      // zero-binding constraint for free. The X-side aliasing in
+      // Corrigendum #4 is precedented by upstream microsoft/Nova;
+      // this extension closes the analogous IVC-anchor binding gap
+      // for the `T_lookup_per_table` field that Corrigendum #4-A
+      // implicitly omitted. A regression that reverts to per-slot
+      // `AllocatedNum::alloc(... || Ok(F::ZERO))` re-opens the
+      // missing-constraint forgery vector for the running lookup
+      // scalar at the IVC anchor (i==0), which subsequent fold steps
+      // would absorb honestly via the (W1) §1.4 hash extension —
+      // producing a corrupt running scalar throughout the chain.
+      //
+      // Algebraic binding under Corrigendum #6: variable identity
+      // across all k slots IS the binding. `eval_lc` resolves every
+      // `T_lookup_per_table[j]` to the shared `T_lookup_zero`'s
+      // witness value, which `alloc_zero` pins to `F::ZERO`
+      // unforgeably. Per pin §1.4 Corrigendum #6 item 1
+      // (variable-identity binding) — the dispatch's adapted
+      // intra-Vec form: assert all slots share a single variable,
+      // catching a regression to per-slot fresh aux.
+      if let Some(k) = k_opt {
+        if k > 0 {
+          let t_lookup = unew_base
+            .T_lookup_per_table
+            .as_ref()
+            .expect(
+              "Corrigendum #6: default_with_lookup_k MUST produce \
+               T_lookup_per_table = Some(...) — None at this \
+               constructor would itself be a regression.",
+            );
+          assert_eq!(
+            t_lookup.len(),
+            k,
+            "Corrigendum #6 (case num_io={num_io}, k={k}): \
+             T_lookup_per_table.len() MUST equal k.",
+          );
+          let v0 = t_lookup[0].get_variable();
+          for j in 1..k {
+            assert_eq!(
+              t_lookup[j].get_variable(),
+              v0,
+              "Corrigendum #6 / pin §1.4 — T_lookup_zero variable-identity \
+               binding (case num_io={num_io}, k={k}): \
+               `T_lookup_per_table[{j}].get_variable()` MUST equal \
+               `T_lookup_per_table[0].get_variable()` — all k slots MUST \
+               share the single `T_lookup_zero` aux variable allocated \
+               via `alloc_zero(cs.namespace(|| \"allocate T_lookup_zero\"))`. \
+               A regression that allocates each slot via \
+               `AllocatedNum::alloc(... || Ok(F::ZERO))` (per-slot fresh \
+               aux without an enforcing constraint) re-opens the IVC-anchor \
+               missing-constraint forgery vector for the running lookup \
+               scalar — same class as Corrigendum #4's X-side gap. See pin \
+               §1.4 Corrigendum #6 item 1 (\"Path Y extension to \
+               T_lookup_per_table\").",
+            );
+          }
+          // (4b) Distinctness from `T` — Halpert's recommended algebra
+          // prefers a SEPARATE `T_lookup_zero` rather than aliasing to
+          // `T` for namespace and audit-surface clarity (the X-T
+          // aliasing is upstream-precedented; T_lookup-T aliasing would
+          // be novel cross-field reuse — pin §1.4 Corrigendum #6, "Why
+          // a dedicated `T_lookup_zero` rather than aliasing to `T`").
+          // This assertion fires if a future edit collapses
+          // `T_lookup_zero` into `T` sharing — soundness-equivalent but
+          // corrigendum-departing (would require a new corrigendum).
+          assert_ne!(
+            v0,
+            unew_base.T.get_variable(),
+            "Corrigendum #6 / pin §1.4 — T_lookup_zero distinct-from-T \
+             binding (case num_io={num_io}, k={k}): \
+             `T_lookup_per_table[0].get_variable()` MUST NOT equal \
+             `T.get_variable()` — Halpert's recommended algebra is a \
+             SEPARATE `T_lookup_zero` allocation, not aliasing to `T`. \
+             See pin §1.4 Corrigendum #6 (\"Why a dedicated `T_lookup_zero` \
+             rather than aliasing to `T`\"): namespace and audit-surface \
+             clarity. If this assertion fires, EITHER the alias was \
+             collapsed into `T` (soundness-equivalent but corrigendum- \
+             departing — requires a new corrigendum) OR a per-slot \
+             fresh-aux regression also produced `v0 == T.get_variable()` \
+             by accident (extremely unlikely but worth catching).",
+          );
+        }
+      }
     }
   }
 
