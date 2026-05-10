@@ -694,7 +694,10 @@ mod stage0_byte_equivalence_tests {
     Commitment,
   };
   use ff::Field;
-  use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+  use rand_chacha::{
+    rand_core::{RngCore, SeedableRng},
+    ChaCha20Rng,
+  };
 
   type E = Bn256EngineKZG;
   type Scalar = <E as Engine>::Scalar;
@@ -1704,5 +1707,536 @@ mod stage0_byte_equivalence_tests {
     m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::PallasEngine>();
     m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::Bn256EngineKZG>();
     m_gh5_0_path_y_x_t_aliasing_binding_with::<crate::provider::Secp256k1Engine>();
+  }
+
+  // =========================================================================
+  // M.GH5.5 (per Pin Corrigendum #9, 2026-05-10) — Fold-of-N happy-path
+  // augmented-circuit-shape differential.
+  //
+  // Source-of-truth: `docs/research/cryptography/gh-5-augmented-circuit-wireup-design-pin-2026-05-08.md`
+  //   §1.4 — (W1) binding-via-hash + absorption-order pin.
+  //   §5.5 row M.GH5.5 (Corrigendum #9) — milestone contract.
+  //   §5.3 #1 — (W1)/(W2)/(W3) end-to-end discharge.
+  //
+  // Scope per Corrigendum #9: ≥ 4 fold steps, multi-table k=2 absent-table
+  // pattern (M.11 §D.1 template), driven via direct
+  // `NIFS::prove_with_multi_table_lookup` + `verify_with_multi_table_lookup`,
+  // NOT via `RecursiveSNARK::prove_step` (which is GH-#7 / Stage K scope per
+  // the chunk_index_in_z routing carry-forward).
+  //
+  // Per-step assertions per Corrigendum #9:
+  //   (a) `cs.is_satisfied() == true` on augmented-circuit `absorb_in_ro`
+  //        synthesis at every fold step ≥ 1.
+  //   (b) `T_lookup_per_table` non-zero at every fold-depth ≥ 1 (empirical
+  //        signal that (W1) binding-via-hash is being exercised end-to-end).
+  //   (c) byte-equivalent native ↔ in-circuit hash output (the (W1)
+  //        absorption-order invariant survives at fold-depth ≥ 4).
+  //
+  // Co-located with `m_gh5_0_stage0_absorb_in_ro_byte_equivalence_at_fold_depth_1_and_2`
+  // because `AllocatedFoldedInstance`, `circuit_absorb_squeeze`,
+  // `native_absorb_squeeze`, and `NeutronAugmentedCircuit` are all
+  // vendor-internal (`mod circuit;` is private at `neutron/mod.rs:25`,
+  // and `pub use` re-exports of `AllocatedFoldedInstance` are absent).
+  // The Halpert-authored M.11 file header established the precedent of
+  // deferring vendor visibility bumps until consumers exist (Finding 1
+  // ruling §1.4); the natural sequencing for the augmented-circuit-shape
+  // byte-equivalence at fold-depth ≥ 4 is to extend the vendor-internal
+  // STAGE 0 fixture rather than introduce a new visibility surface.
+  // =========================================================================
+
+  /// Number of fold steps (≥ 4 per Corrigendum #9 contract).
+  const M_GH5_5_NUM_FOLD_STEPS: usize = 4;
+
+  /// k = 2 multi-table arity (production per ADR-0021).
+  const M_GH5_5_K_TABLES: usize = 2;
+
+  /// M.11 §D.1 step pattern: T_2 absent at steps 1 and 4 (1-based);
+  /// 0-indexed here. The absent table is T_2 (table_id = 1) per the
+  /// chunk-lookup identity-table production shape.
+  const M_GH5_5_T2_ABSENT_AT_STEP: [bool; M_GH5_5_NUM_FOLD_STEPS] =
+    [true, false, false, true];
+
+  /// Deterministic seed (US-05 reviewer-reproducibility).
+  const M_GH5_5_SEED: u64 = 0xC1BE_5BAD_C0DE_0055;
+
+  /// M.GH5.5 — Fold-of-4 happy-path augmented-circuit-shape differential.
+  ///
+  /// Per Pin Corrigendum #9 (2026-05-10) §5.5 row M.GH5.5: discharges
+  /// pin §5.3 #1 — (W1)/(W2)/(W3) end-to-end at fold-depth ≥ 4 under the
+  /// multi-table k=2 absent-table pattern.
+  ///
+  /// At each of 4 fold steps, the test:
+  ///   1. Drives one direct `NIFS::prove_with_multi_table_lookup` call
+  ///      with a per-step bundle pair (T_1 always queried; T_2 absent at
+  ///      steps 1 and 4, queried at steps 2 and 3 — M.11 §D.1).
+  ///   2. Verifies the resulting NIFS via `verify_with_multi_table_lookup`
+  ///      and asserts `verified_U == folded_U`.
+  ///   3. Mirrors the post-step running U into an `AllocatedFoldedInstance`
+  ///      via `circuit_absorb_squeeze` and asserts:
+  ///      (a) `cs.is_satisfied() == true`
+  ///      (b) byte-equivalent native ↔ in-circuit hash output
+  ///      (c) `T_lookup_per_table` is `Some(&[..])` at fold-depth ≥ 1 with
+  ///          at least one non-zero entry (the (W1) extension is being
+  ///          exercised).
+  ///
+  /// STOP-AND-ASK on any failure per Corrigendum #9. `cargo test --release`
+  /// per `.claude/rules/testing.md` (cryptography-tests release-mode rule).
+  #[test]
+  fn m_gh5_5_fold_of_n_augmented_circuit_shape_differential() {
+    let mut rng = ChaCha20Rng::seed_from_u64(M_GH5_5_SEED);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // === R1CS shape from `NeutronAugmentedCircuit` (`num_io == 1`). ===
+    // Path A per pin §1.4 corrigendum: the (W1) binding-via-hash
+    // extension's intended deployment shape is `num_io == 1` (single
+    // `hash.inputize` site at `circuit/mod.rs:428`). Per Corrigendum #2
+    // (Path W) byte-equivalence holds at any `num_io >= 1`; we still
+    // exercise the production-shape invariant.
+    let num_cons = 32usize;
+    let step_circuit = NonTrivialCircuit::<Scalar>::new(num_cons);
+    let augmented_shape_builder: NeutronAugmentedCircuit<'_, E, NonTrivialCircuit<Scalar>> =
+      NeutronAugmentedCircuit::new(None, &step_circuit, ro_consts_circuit.clone());
+    let mut shape_cs: ShapeCS<E> = ShapeCS::new();
+    let _ = augmented_shape_builder.synthesize(&mut shape_cs);
+    let shape = shape_cs.r1cs_shape().unwrap();
+    assert_eq!(
+      shape.num_io(),
+      1,
+      "M.GH5.5: production-shape invariant — `NeutronAugmentedCircuit` \
+       must produce R1CS shape with `num_io == 1` per pin §1.6 anchor."
+    );
+
+    // === Multi-table k=2 fixture (M.11 §D.1 + STAGE 0 size). ===
+    // Both tables sized to 64 (production merged-table arity stand-in;
+    // M.11's 1024-row T_2 is unnecessary for the byte-equivalence
+    // contract — STAGE 0 used 64 and the algebra is symmetric in size).
+    let table_size = 64usize;
+    let table_log2 = 6usize;
+    let t1_col0: Vec<Scalar> = (0..table_size).map(|_| Scalar::random(&mut rng)).collect();
+    let identity: Vec<Scalar> =
+      (0..table_size).map(|i| Scalar::from(i as u64)).collect();
+
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    let lookup_shape = LookupShape::<E> {
+      tables: vec![
+        LookupTableHandle {
+          table_id: 0,
+          size: table_size,
+          commitment: <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO),
+        },
+        LookupTableHandle {
+          table_id: 1,
+          size: table_size,
+          commitment: <E as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO),
+        },
+      ],
+      multi_column_tables: vec![
+        // T_1: 1 value column (M.11 §D.1 — synthetic stand-in for the
+        // 9-column production merged table; algebra is symmetric).
+        MultiColumnLookupTable {
+          table_id: 0,
+          size: table_size,
+          columns: vec![t1_col0.clone()],
+          value_commitments: vec![<E as Engine>::CE::commit(
+            &ck,
+            &t1_col0,
+            &Scalar::ZERO,
+          )],
+        },
+        // T_2: 0 value columns (M.11 §D.1 — chunk-lookup identity table
+        // shape per `chunk_table_as_multi_column`).
+        MultiColumnLookupTable {
+          table_id: 1,
+          size: table_size,
+          columns: Vec::new(),
+          value_commitments: Vec::new(),
+        },
+      ],
+      num_addr_columns: 1,
+      num_witness_columns: M_GH5_5_K_TABLES,
+      witness_ell_cached: table_log2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // === Per-table eq dimensions. ===
+    let per_table_log2 = table_log2;
+    let ell1 = per_table_log2.div_ceil(2);
+    let ell2 = per_table_log2 / 2;
+    let per_table_w_left = 1usize << ell1;
+    let per_table_w_right = 1usize << ell2;
+
+    // === Helper: build a satisfying witness for T_1 (1 value column). ===
+    let build_present_t1 =
+      |rng: &mut ChaCha20Rng,
+       column: &[Scalar],
+       query_indices: &[usize]|
+       -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+        let mut witness_addr = vec![Scalar::ZERO; table_size];
+        let mut witness_v0 = vec![Scalar::ZERO; table_size];
+        let mut multiplicities = vec![Scalar::ZERO; table_size];
+        for (i, &idx) in query_indices.iter().enumerate() {
+          witness_addr[i] = Scalar::from(idx as u64);
+          witness_v0[i] = column[idx];
+          multiplicities[idx] += Scalar::ONE;
+        }
+        for i in query_indices.len()..table_size {
+          witness_addr[i] = Scalar::ZERO;
+          witness_v0[i] = column[0];
+          multiplicities[0] += Scalar::ONE;
+        }
+        // suppress unused-rng warning on this branch — caller drives RNG.
+        let _ = rng;
+        (witness_addr, witness_v0, multiplicities)
+      };
+
+    // === Helper: build a "present" T_2 witness (0 value columns). ===
+    // Mirrors M.11 `build_present_bundle` for `column_count == 0`:
+    // witness_v0 stays zero, multiplicities still account for queries.
+    let build_present_t2 = |query_indices: &[usize]| -> (Vec<Scalar>, Vec<Scalar>) {
+      let mut witness_addr = vec![Scalar::ZERO; table_size];
+      let mut multiplicities = vec![Scalar::ZERO; table_size];
+      for (i, &idx) in query_indices.iter().enumerate() {
+        witness_addr[i] = Scalar::from(idx as u64);
+        multiplicities[idx] += Scalar::ONE;
+      }
+      for _ in query_indices.len()..table_size {
+        multiplicities[0] += Scalar::ONE;
+      }
+      (witness_addr, multiplicities)
+    };
+
+    // === Helper: build per-step eqs. ===
+    let mk_eqs = |rng: &mut ChaCha20Rng| -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
+      let tau_w = Scalar::random(&mut *rng);
+      let pow_w = PowPolynomial::new(&tau_w, per_table_log2);
+      let combined_w = pow_w.split_evals(per_table_w_left, per_table_w_right);
+      let (eq_w_left, eq_w_right) = combined_w.split_at(per_table_w_left);
+      let tau_t = Scalar::random(&mut *rng);
+      let pow_t = PowPolynomial::new(&tau_t, per_table_log2);
+      let combined_t = pow_t.split_evals(per_table_w_left, per_table_w_right);
+      let (eq_t_left, eq_t_right) = combined_t.split_at(per_table_w_left);
+      (
+        eq_w_left.to_vec(),
+        eq_w_right.to_vec(),
+        eq_t_left.to_vec(),
+        eq_t_right.to_vec(),
+      )
+    };
+
+    // === Helper: outer-base running_lw (sized to n_j). ===
+    let mk_running_lw = || LookupRunningWitness::<E> {
+      witness: vec![Scalar::ZERO; table_size],
+      inv_w: vec![Scalar::ZERO; table_size],
+      table: vec![Scalar::ZERO; table_size],
+      multiplicities: vec![Scalar::ZERO; table_size],
+      inv_t: vec![Scalar::ZERO; table_size],
+      eq_w_left: vec![Scalar::ZERO; per_table_w_left],
+      eq_w_right: vec![Scalar::ZERO; per_table_w_right],
+      eq_t_left: vec![Scalar::ZERO; per_table_w_left],
+      eq_t_right: vec![Scalar::ZERO; per_table_w_right],
+    };
+
+    // === Helper: distinct R1CS witness per step from the augmented
+    // circuit, varying `r_next` to give distinct U2 instances (mirrors
+    // the STAGE 0 fixture pattern at `relation.rs:846-870`). ===
+    let make_r1cs = |seed: u64| {
+      let inputs: NeutronAugmentedCircuitInputs<E> = NeutronAugmentedCircuitInputs::new(
+        pp_digest,          // pp_digest
+        Scalar::ZERO,       // i = 0 (base case)
+        vec![Scalar::ZERO], // z0 (arity == 1)
+        None,               // zi (base case)
+        None,               // U (base case)
+        None,               // ri
+        Scalar::from(seed), // r_next — distinct per step
+        None,               // u (base case)
+        None,               // nifs (base case)
+        None,               // comm_W_fold
+        None,               // comm_E_fold
+      );
+      let circuit: NeutronAugmentedCircuit<'_, E, NonTrivialCircuit<Scalar>> =
+        NeutronAugmentedCircuit::new(
+          Some(inputs),
+          &step_circuit,
+          ro_consts_circuit.clone(),
+        );
+      let mut cs = SatisfyingAssignment::<E>::new();
+      let _ = circuit.synthesize(&mut cs);
+      let (u, w) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+      (u, w.pad(&shape))
+    };
+
+    // === Outer-base running U/W. ===
+    let mut running_U = FoldedInstance::default(&str_local);
+    let mut running_W = FoldedWitness::default(&str_local);
+    let mut running_lws: Vec<LookupRunningWitness<E>> =
+      (0..M_GH5_5_K_TABLES).map(|_| mk_running_lw()).collect();
+
+    // === Per-step T_lookup snapshot for the audit trail. ===
+    let mut t_lookup_per_step: Vec<Vec<Scalar>> = Vec::with_capacity(M_GH5_5_NUM_FOLD_STEPS);
+
+    // === N-step fold loop. ===
+    for step in 0..M_GH5_5_NUM_FOLD_STEPS {
+      // ----- Build per-step bundles (T_1 always queried; T_2 per §D.1). -----
+      // T_1: random query count in [1, table_size].
+      let t1_query_count = ((rng.next_u32() as usize) % table_size) + 1;
+      let t1_query_indices: Vec<usize> = {
+        let mut pool: Vec<usize> = (0..table_size).collect();
+        for i in (1..pool.len()).rev() {
+          let j = (rng.next_u32() as usize) % (i + 1);
+          pool.swap(i, j);
+        }
+        pool.truncate(t1_query_count);
+        pool
+      };
+      let (wa_1, wv_1, m_1) = build_present_t1(&mut rng, &t1_col0, &t1_query_indices);
+      let (eq_w1l, eq_w1r, eq_t1l, eq_t1r) = mk_eqs(&mut rng);
+
+      let payload_1 = LookupPayload::<E> {
+        comm_L: <E as Engine>::CE::commit(&ck, &wa_1, &Scalar::ZERO),
+        comm_ts: <E as Engine>::CE::commit(&ck, &m_1, &Scalar::ZERO),
+        comm_inv_w: Commitment::<E>::default(),
+        comm_inv_t: Commitment::<E>::default(),
+        T2_lookup: Scalar::ZERO,
+        comm_values: vec![<E as Engine>::CE::commit(&ck, &wv_1, &Scalar::ZERO)],
+      };
+      let bundle_1 = crate::neutron::nifs::PerTableBundle::<E> {
+        table_id: 0,
+        payload: payload_1.clone(),
+        fresh_witness_address: wa_1,
+        fresh_witness_value_columns: vec![wv_1],
+        fresh_multiplicities: m_1,
+        fresh_eq_w_left: eq_w1l,
+        fresh_eq_w_right: eq_w1r,
+        fresh_eq_t_left: eq_t1l,
+        fresh_eq_t_right: eq_t1r,
+        running_lw: running_lws[0].clone(),
+      };
+
+      // T_2: absent at steps 1 and 4 (0-indexed 0 and 3), queried at 2 and 3.
+      let (wa_2, m_2) = if M_GH5_5_T2_ABSENT_AT_STEP[step] {
+        (vec![Scalar::ZERO; table_size], vec![Scalar::ZERO; table_size])
+      } else {
+        let t2_query_count = ((rng.next_u32() as usize) % table_size) + 1;
+        let t2_query_indices: Vec<usize> = {
+          let mut pool: Vec<usize> = (0..table_size).collect();
+          for i in (1..pool.len()).rev() {
+            let j = (rng.next_u32() as usize) % (i + 1);
+            pool.swap(i, j);
+          }
+          pool.truncate(t2_query_count);
+          pool
+        };
+        build_present_t2(&t2_query_indices)
+      };
+      let (eq_w2l, eq_w2r, eq_t2l, eq_t2r) = mk_eqs(&mut rng);
+
+      let payload_2 = LookupPayload::<E> {
+        comm_L: <E as Engine>::CE::commit(&ck, &wa_2, &Scalar::ZERO),
+        comm_ts: <E as Engine>::CE::commit(&ck, &m_2, &Scalar::ZERO),
+        comm_inv_w: Commitment::<E>::default(),
+        comm_inv_t: Commitment::<E>::default(),
+        T2_lookup: Scalar::ZERO,
+        comm_values: Vec::new(),
+      };
+      let bundle_2 = crate::neutron::nifs::PerTableBundle::<E> {
+        table_id: 1,
+        payload: payload_2.clone(),
+        fresh_witness_address: wa_2,
+        fresh_witness_value_columns: Vec::new(),
+        fresh_multiplicities: m_2,
+        fresh_eq_w_left: eq_w2l,
+        fresh_eq_w_right: eq_w2r,
+        fresh_eq_t_left: eq_t2l,
+        fresh_eq_t_right: eq_t2r,
+        running_lw: running_lws[1].clone(),
+      };
+
+      // ----- R1CS U2 for this step (distinct seed per step). -----
+      let (u_step, w_step) = make_r1cs((step as u64) + 2);
+
+      // ----- Direct NIFS prove (multi-table). -----
+      let (nifs, (folded_U, folded_W), folded_lw_per_table) =
+        NIFS::<E>::prove_with_multi_table_lookup(
+          &ck,
+          &ro_consts,
+          &pp_digest,
+          &str_local,
+          &running_U,
+          &running_W,
+          &u_step,
+          &w_step,
+          &[bundle_1, bundle_2],
+        )
+        .unwrap_or_else(|e| {
+          panic!(
+            "M.GH5.5 STOP-AND-ASK: prove FAILED at step {} (1-based {}): \
+             {:?} — most likely cause: absent-on-running mid-fold \
+             rejection at LookupSumcheckInstance::new (M.11 §D.3 \
+             Trigger 2). Halt; surface to orchestrator.",
+            step,
+            step + 1,
+            e,
+          )
+        });
+
+      // ----- Direct NIFS verify (multi-table). -----
+      let public_bundles = vec![
+        LookupPayloadPublicMultiTable::<E> {
+          table_id: 0,
+          comm_L: payload_1.comm_L,
+          comm_values: payload_1.comm_values.clone(),
+          comm_ts: payload_1.comm_ts,
+        },
+        LookupPayloadPublicMultiTable::<E> {
+          table_id: 1,
+          comm_L: payload_2.comm_L,
+          comm_values: payload_2.comm_values.clone(),
+          comm_ts: payload_2.comm_ts,
+        },
+      ];
+      let verified_U = nifs
+        .verify_with_multi_table_lookup(
+          &ro_consts,
+          &pp_digest,
+          &str_local,
+          &running_U,
+          &u_step,
+          &public_bundles,
+        )
+        .unwrap_or_else(|e| {
+          panic!(
+            "M.GH5.5 STOP-AND-ASK: verify FAILED at step {} (1-based {}): \
+             {:?} — most likely cause: fixture-builder miscoded the \
+             absent shape per pin §1.5.2 (M.11 §D.3 Trigger 4). Halt; \
+             surface to orchestrator.",
+            step,
+            step + 1,
+            e,
+          )
+        });
+      assert_eq!(
+        verified_U, folded_U,
+        "M.GH5.5 step {} (1-based {}): prove/verify must agree on folded U",
+        step,
+        step + 1,
+      );
+
+      // ----- Per-step assertions per Corrigendum #9. -----
+
+      // (b) T_lookup_per_table is Some(&[..]) at fold-depth ≥ 1 with at
+      // least one non-zero entry. T_1 is always queried, so T_1's
+      // running scalar accumulates non-zero contributions; T_2's scalar
+      // also accumulates because the T_2 LogUp identity contributes
+      // Σ inv_w − Σ inv_t = n_j / r_logup_j even on the absent-shape side.
+      let t_lookup_slice = verified_U.t_lookup().unwrap_or_else(|| {
+        panic!(
+          "M.GH5.5 STOP-AND-ASK: T_lookup_per_table is None at fold-depth \
+           {} (1-based step {}) — the (W1) extension is not being \
+           exercised end-to-end. Halt; surface to orchestrator.",
+          step + 1,
+          step + 1,
+        )
+      });
+      assert_eq!(
+        t_lookup_slice.len(),
+        M_GH5_5_K_TABLES,
+        "M.GH5.5 step {} (1-based {}): T_lookup_per_table.len() must equal k = {}; got {}",
+        step,
+        step + 1,
+        M_GH5_5_K_TABLES,
+        t_lookup_slice.len(),
+      );
+      let any_nonzero = t_lookup_slice.iter().any(|s| *s != Scalar::ZERO);
+      assert!(
+        any_nonzero,
+        "M.GH5.5 STOP-AND-ASK: at fold-depth {} (1-based step {}) all \
+         T_lookup_per_table entries are zero. T_1 was queried at every \
+         step, so its running scalar must be non-zero by construction. \
+         All-zero indicates the running-scalar pipeline silently dropped \
+         state — the (W1) binding-via-hash is not being exercised. Halt; \
+         surface to orchestrator.",
+        step + 1,
+        step + 1,
+      );
+      let t_lookup_owned: Vec<Scalar> = t_lookup_slice.to_vec();
+      t_lookup_per_step.push(t_lookup_owned);
+
+      // (a) cs.is_satisfied() == true on augmented-circuit absorb_in_ro
+      // synthesis AND (c) byte-equivalent native ↔ in-circuit hash output.
+      let h_native = native_absorb_squeeze(&ro_consts, &verified_U);
+      let (h_circuit, satisfied) = circuit_absorb_squeeze(&ro_consts_circuit, &verified_U);
+      assert!(
+        satisfied,
+        "M.GH5.5 STOP-AND-ASK: at fold-depth {} (1-based step {}) the \
+         in-circuit `absorb_in_ro` CS is NOT satisfied. The augmented- \
+         circuit synthesis at fold-depth ≥ 1 with non-trivial \
+         T_lookup_per_table has a constraint-system bug. Per pin §6.2 \
+         halt all further GH-#5 milestones.",
+        step + 1,
+        step + 1,
+      );
+      assert_eq!(
+        h_native, h_circuit,
+        "M.GH5.5 STOP-AND-ASK: at fold-depth {} (1-based step {}) the \
+         native `FoldedInstance::absorb_in_ro2` squeeze MUST equal the \
+         in-circuit `AllocatedFoldedInstance::absorb_in_ro` derived \
+         squeeze. (h_native, h_circuit) = ({:?}, {:?}). Most likely \
+         cause: native and in-circuit `T_lookup_per_table` absorption \
+         order disagrees, or one side handles outer-base differently \
+         from the other. Per pin §6.2 halt all further GH-#5 milestones \
+         and re-derive §1.4.",
+        step + 1,
+        step + 1,
+        h_native,
+        h_circuit,
+      );
+
+      // ----- Advance state for next iteration. -----
+      running_U = folded_U;
+      running_W = folded_W;
+      for j in 0..M_GH5_5_K_TABLES {
+        running_lws[j] = folded_lw_per_table[j].clone();
+      }
+    }
+
+    // === Final-step audit-trail assertion. ===
+    assert_eq!(
+      t_lookup_per_step.len(),
+      M_GH5_5_NUM_FOLD_STEPS,
+      "M.GH5.5: must have collected one T_lookup snapshot per fold step",
+    );
+
+    // Defensive: the (W1) running scalar must visibly evolve across steps.
+    // Two consecutive steps with all-equal T_lookup would indicate the
+    // fold prover is ignoring fresh-side contributions silently. (T_2's
+    // entry can stay equal across consecutive absent-on-fresh steps — the
+    // n_j / r_logup_j contribution depends on the per-step rho_logup
+    // challenge, which is FS-derived; we assert at least ONE pair of
+    // consecutive snapshots differs in T_1's entry.)
+    let any_pair_t1_evolves = (1..M_GH5_5_NUM_FOLD_STEPS)
+      .any(|s| t_lookup_per_step[s][0] != t_lookup_per_step[s - 1][0]);
+    assert!(
+      any_pair_t1_evolves,
+      "M.GH5.5: T_1's running scalar must evolve across consecutive fold \
+       steps (T_1 is queried at every step with random per-step indices); \
+       all-equal T_1 across 4 steps indicates the (W1) running-scalar \
+       pipeline silently dropped state. T_lookup snapshots: {:?}",
+      t_lookup_per_step,
+    );
+
+    // Audit-trail eprintln (non-fatal, helps reviewer-journey logs).
+    eprintln!(
+      "M.GH5.5 fold-of-{} happy-path GREEN (seed={M_GH5_5_SEED:#x}): \
+       num_io={}, k={}, table_size={}, absent_pattern={:?}",
+      M_GH5_5_NUM_FOLD_STEPS,
+      str_local.S.num_io(),
+      M_GH5_5_K_TABLES,
+      table_size,
+      M_GH5_5_T2_ABSENT_AT_STEP,
+    );
   }
 }
