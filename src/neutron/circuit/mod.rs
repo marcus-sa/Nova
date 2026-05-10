@@ -265,7 +265,6 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
   /// `verify_with_multi_table_lookup` invocation; the constructor itself
   /// does not validate (no `Result` shape).
   #[cfg(feature = "lookup-fold")]
-  #[allow(dead_code)] // until M.GH5.4 wires inumbra-side public-params through this builder
   pub fn with_lookup_fold(
     mut self,
     lookup_fold_k: usize,

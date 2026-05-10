@@ -52,6 +52,41 @@ where
   ck: CommitmentKey<E1>,
   structure: Structure<E1>,
 
+  /// GH-#5 M.GH5.4 / pin §3.1: per-position `pp_digest` registry, in
+  /// chunk-position-canonical order (NOT `table_id` order). Length pinned
+  /// by the inumbra-side public-params (length 16 production per
+  /// ADR-0021). Empty Vec ⇒ no lookup-fold path; the augmented circuit
+  /// falls back to `nifs.verify` and `default(cs, num_io)` (vendor
+  /// upstream-tracking shape; what `TrivialCircuit` / `CubicCircuit`
+  /// vendor-internal tests exercise via `setup` with default args).
+  ///
+  /// `#[serde(skip)]` so adding the field does not change the bincode
+  /// encoding of `PublicParams` and therefore preserves `pp_digest`
+  /// byte-equivalence at the default state. The shape registry is the
+  /// inumbra-side artifact the M.7 shape-registry assertion fires
+  /// against (`circuit/nifs.rs:689-695` in `verify_with_multi_table_lookup`),
+  /// orthogonal to `pp_digest` itself.
+  #[cfg(feature = "lookup-fold")]
+  #[serde(skip, default)]
+  shape_registry: Vec<E1::Scalar>,
+
+  /// GH-#5 M.GH5.4 / pin §3.1: structurally-pinned per-table count
+  /// (`LookupShape::multi_column_tables.len()`). Production: k=2 per
+  /// ADR-0021, uniform across all 16 chunked-Strauss-Shamir positions
+  /// (Auditor Obligation 10). `0` ⇒ no lookup-fold path.
+  /// `#[serde(skip)]` for the same reason as `shape_registry`.
+  #[cfg(feature = "lookup-fold")]
+  #[serde(skip, default)]
+  lookup_fold_k: usize,
+
+  /// GH-#5 M.GH5.4 / pin §3.1: bit-width for the `chunk_index_in_z`
+  /// range-check inside the M.7 shape-registry assertion. Must be
+  /// `>= ceil(log2(shape_registry.len()))`. Production: 4 (16 positions
+  /// per ADR-0021); 5 if extended to ≤ 30 chunk-band positions (Phase-5+).
+  #[cfg(feature = "lookup-fold")]
+  #[serde(skip, default)]
+  index_n_bits: usize,
+
   #[serde(skip, default = "OnceCell::new")]
   digest: OnceCell<E1::Scalar>,
   _p: PhantomData<(C, E2)>,
@@ -113,6 +148,82 @@ where
   /// let pp = PublicParams::setup(&circuit, ck_hint1, ck_hint2)?;
   /// Ok::<(), nova_snark::errors::NovaError>(())
   /// ```
+  ///
+  /// # GH-#5 M.GH5.4: lookup-fold path
+  ///
+  /// Under `feature = "lookup-fold"`, `setup` accepts a non-empty
+  /// `shape_registry` + non-zero `lookup_fold_k` + non-zero `index_n_bits`
+  /// to wire `NeutronAugmentedCircuit::with_lookup_fold` per pin §3.1.
+  /// At the default `(vec![], 0, 0)` state, the shape derivation reduces
+  /// to the upstream-tracking pre-M.GH5.3 path (no `T_lookup_per_table`
+  /// allocation, `nifs.verify` instead of `verify_with_multi_table_lookup`),
+  /// which is what the vendor-internal `TrivialCircuit` / `CubicCircuit`
+  /// tests exercise. The non-`lookup-fold` build ignores all three
+  /// `_lookup_*` parameters (the field gate excludes them from the
+  /// `PublicParams` struct).
+  #[cfg(feature = "lookup-fold")]
+  pub fn setup(
+    c: &C,
+    ck_hint1: &CommitmentKeyHint<E1>,
+    _ck_hint2: &CommitmentKeyHint<E2>,
+    shape_registry: Vec<E1::Scalar>,
+    lookup_fold_k: usize,
+    index_n_bits: usize,
+  ) -> Result<Self, NovaError> {
+    let F_arity = c.arity();
+
+    let ro_consts: RO2Constants<E1> = RO2Constants::<E1>::default();
+    let ro_consts_circuit: RO2ConstantsCircuit<E1> = RO2ConstantsCircuit::<E1>::default();
+
+    // Initialize shape for the primary
+    //
+    // GH-#5 M.GH5.4: thread the shape registry to the augmented-circuit
+    // constructor via `with_lookup_fold(...)`. At `lookup_fold_k == 0`
+    // the call is a no-op (defaults are already 0/&[]/0 in `new`), so
+    // the R1CS shape and `pp_digest` are byte-equivalent to pre-M.GH5.4
+    // for the vendor-internal default-state tests.
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(None, c, ro_consts_circuit.clone())
+        .with_lookup_fold(lookup_fold_k, &shape_registry, index_n_bits);
+    let mut cs: ShapeCS<E1> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let r1cs_shape = cs.r1cs_shape()?;
+
+    if r1cs_shape.num_io != 1 {
+      return Err(NovaError::InvalidStepCircuitIO);
+    }
+
+    // Generate the commitment key
+    let ck = R1CSShape::commitment_key(&[&r1cs_shape], &[ck_hint1])?;
+
+    let structure = Structure::new(&r1cs_shape);
+
+    let pp = PublicParams {
+      F_arity,
+
+      ro_consts,
+      ro_consts_circuit,
+      ck,
+      structure,
+
+      shape_registry,
+      lookup_fold_k,
+      index_n_bits,
+
+      digest: OnceCell::new(),
+      _p: Default::default(),
+    };
+
+    // call pp.digest() so the digest is computed here rather than in RecursiveSNARK methods
+    let _ = pp.digest();
+
+    Ok(pp)
+  }
+
+  /// `setup` for non-`lookup-fold` builds — preserves the pre-M.GH5.4
+  /// signature so upstream-tracking consumers (vendor examples / benches
+  /// not built under `lookup-fold`) compile unchanged.
+  #[cfg(not(feature = "lookup-fold"))]
   pub fn setup(
     c: &C,
     ck_hint1: &CommitmentKeyHint<E1>,
@@ -171,7 +282,69 @@ where
   /// * `ck_hint1`: A `CommitmentKeyHint` for the primary circuit.
   /// * `ck_hint2`: A `CommitmentKeyHint` for the secondary circuit (unused but kept for API consistency).
   /// * `ptau_dir`: Path to the directory containing pruned ptau files.
-  #[cfg(feature = "io")]
+  #[cfg(all(feature = "io", feature = "lookup-fold"))]
+  pub fn setup_with_ptau_dir(
+    c: &C,
+    ck_hint1: &CommitmentKeyHint<E1>,
+    _ck_hint2: &CommitmentKeyHint<E2>,
+    ptau_dir: &std::path::Path,
+    shape_registry: Vec<E1::Scalar>,
+    lookup_fold_k: usize,
+    index_n_bits: usize,
+  ) -> Result<Self, NovaError>
+  where
+    E1::GE: crate::provider::traits::PairingGroup,
+  {
+    let F_arity = c.arity();
+
+    let ro_consts: RO2Constants<E1> = RO2Constants::<E1>::default();
+    let ro_consts_circuit: RO2ConstantsCircuit<E1> = RO2ConstantsCircuit::<E1>::default();
+
+    // Initialize shape for the primary
+    //
+    // GH-#5 M.GH5.4: thread the shape registry to the augmented-circuit
+    // constructor via `with_lookup_fold(...)` (mirror of `setup` above).
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(None, c, ro_consts_circuit.clone())
+        .with_lookup_fold(lookup_fold_k, &shape_registry, index_n_bits);
+    let mut cs: ShapeCS<E1> = ShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+    let r1cs_shape = cs.r1cs_shape()?;
+
+    if r1cs_shape.num_io != 1 {
+      return Err(NovaError::InvalidStepCircuitIO);
+    }
+
+    // Load the commitment key from ptau directory
+    let ck = R1CSShape::commitment_key_from_ptau_dir(&[&r1cs_shape], &[ck_hint1], ptau_dir)?;
+
+    let structure = Structure::new(&r1cs_shape);
+
+    let pp = PublicParams {
+      F_arity,
+
+      ro_consts,
+      ro_consts_circuit,
+      ck,
+      structure,
+
+      shape_registry,
+      lookup_fold_k,
+      index_n_bits,
+
+      digest: OnceCell::new(),
+      _p: Default::default(),
+    };
+
+    // call pp.digest() so the digest is computed here rather than in RecursiveSNARK methods
+    let _ = pp.digest();
+
+    Ok(pp)
+  }
+
+  /// `setup_with_ptau_dir` for non-`lookup-fold` builds — preserves the
+  /// pre-M.GH5.4 signature.
+  #[cfg(all(feature = "io", not(feature = "lookup-fold")))]
   pub fn setup_with_ptau_dir(
     c: &C,
     ck_hint1: &CommitmentKeyHint<E1>,
@@ -285,6 +458,14 @@ where
       None,
     );
 
+    // GH-#5 M.GH5.4: thread the shape registry stored in `pp` to the
+    // augmented-circuit constructor (mirror of `setup` above so the
+    // shape-derivation site and the prove-step site emit the same R1CS).
+    #[cfg(feature = "lookup-fold")]
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(Some(inputs), c, pp.ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, pp.index_n_bits);
+    #[cfg(not(feature = "lookup-fold"))]
     let circuit: NeutronAugmentedCircuit<'_, E1, C> =
       NeutronAugmentedCircuit::new(Some(inputs), c, pp.ro_consts_circuit.clone());
     let zi = circuit.synthesize(&mut cs)?;
@@ -347,6 +528,12 @@ where
       Some(r_U.comm_E),
     );
 
+    // GH-#5 M.GH5.4: same threading as `RecursiveSNARK::new` above.
+    #[cfg(feature = "lookup-fold")]
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(Some(inputs), c, pp.ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, pp.index_n_bits);
+    #[cfg(not(feature = "lookup-fold"))]
     let circuit: NeutronAugmentedCircuit<'_, E1, C> =
       NeutronAugmentedCircuit::new(Some(inputs), c, pp.ro_consts_circuit.clone());
     let zi = circuit.synthesize(&mut cs)?;
@@ -532,6 +719,13 @@ mod tests {
     // this tests public parameters with a size specifically intended for a spark-compressed SNARK
     let ck_hint1 = &*SPrime::<E1, EE<E1>>::ck_floor();
     let ck_hint2 = &*SPrime::<E2, EE<E2>>::ck_floor();
+    // GH-#5 M.GH5.4: vendor-internal `TrivialCircuit` test exercises the
+    // default lookup-fold-OFF state (k=0, empty registry); shape and
+    // pp_digest are byte-equivalent to pre-M.GH5.4.
+    #[cfg(feature = "lookup-fold")]
+    let pp =
+      PublicParams::<E1, E2, C>::setup(circuit, ck_hint1, ck_hint2, vec![], 0, 0).unwrap();
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, C>::setup(circuit, ck_hint1, ck_hint2).unwrap();
 
     let digest_str = pp
@@ -572,6 +766,17 @@ mod tests {
     let test_circuit1 = TrivialCircuit::<<E1 as Engine>::Scalar>::default();
 
     // produce public parameters
+    #[cfg(feature = "lookup-fold")]
+    let pp = PublicParams::<E1, E2, TrivialCircuit<<E1 as Engine>::Scalar>>::setup(
+      &test_circuit1,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![],
+      0,
+      0,
+    )
+    .unwrap();
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, TrivialCircuit<<E1 as Engine>::Scalar>>::setup(
       &test_circuit1,
       &*default_ck_hint(),
@@ -609,6 +814,17 @@ mod tests {
     let circuit = CubicCircuit::default();
 
     // produce public parameters
+    #[cfg(feature = "lookup-fold")]
+    let pp = PublicParams::<E1, E2, CubicCircuit<<E1 as Engine>::Scalar>>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![],
+      0,
+      0,
+    )
+    .unwrap();
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, CubicCircuit<<E1 as Engine>::Scalar>>::setup(
       &circuit,
       &*default_ck_hint(),
@@ -665,6 +881,17 @@ mod tests {
     let test_circuit1 = CubicCircuit::<<E1 as Engine>::Scalar>::default();
 
     // produce public parameters
+    #[cfg(feature = "lookup-fold")]
+    let pp = PublicParams::<E1, E2, CubicCircuit<<E1 as Engine>::Scalar>>::setup(
+      &test_circuit1,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![],
+      0,
+      0,
+    )
+    .unwrap();
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, CubicCircuit<<E1 as Engine>::Scalar>>::setup(
       &test_circuit1,
       &*default_ck_hint(),
@@ -732,6 +959,16 @@ mod tests {
 
     // produce public parameters with trivial secondary
     let circuit = CircuitWithInputize::<<E1 as Engine>::Scalar>::default();
+    #[cfg(feature = "lookup-fold")]
+    let pp = PublicParams::<E1, E2, CircuitWithInputize<E1::Scalar>>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![],
+      0,
+      0,
+    );
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, CircuitWithInputize<E1::Scalar>>::setup(
       &circuit,
       &*default_ck_hint(),
@@ -742,6 +979,16 @@ mod tests {
 
     // produce public parameters with the trivial primary
     let circuit = CircuitWithInputize::<E1::Scalar>::default();
+    #[cfg(feature = "lookup-fold")]
+    let pp = PublicParams::<E1, E2, CircuitWithInputize<E1::Scalar>>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![],
+      0,
+      0,
+    );
+    #[cfg(not(feature = "lookup-fold"))]
     let pp = PublicParams::<E1, E2, CircuitWithInputize<E1::Scalar>>::setup(
       &circuit,
       &*default_ck_hint(),
