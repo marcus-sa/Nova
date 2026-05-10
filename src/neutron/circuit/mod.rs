@@ -83,6 +83,39 @@ pub struct NeutronAugmentedCircuitInputs<E: Engine> {
   /// for the non-lookup-fold-active build path.
   #[cfg(feature = "lookup-fold")]
   pub(crate) public_bundles_multi_table: Option<Vec<LookupPayloadPublicMultiTable<E>>>,
+
+  /// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 ruling (Halpert 2026-05-10):
+  /// test-only corruption knob that perturbs the **U.T_lookup_per_table**
+  /// allocation at index `idx` by additive offset, AFTER the honest
+  /// witness-closure value is read from `inputs.U.t_lookup()` and BEFORE
+  /// `U.absorb_in_ro` consumes the allocation in the Phase-1 hash check
+  /// (`circuit/mod.rs:462`).
+  ///
+  /// Wired in `alloc_witness` (the U allocation site under
+  /// `lookup_fold_k > 0`); perturbing U.T_lookup_per_table directly causes
+  /// the Phase-1 hash check to recompute a hash that diverges from the
+  /// honest `u.X[0]`, firing the constraint
+  /// `"check consistency of u.X[0] with H(params, U, i, z0, zi)"`
+  /// (`circuit/mod.rs:467-471`). Per `TestConstraintSystem::which_is_unsatisfied`
+  /// declaration-order semantics (`frontend/util_cs/test_cs.rs:99-113`,
+  /// Corrigendum #10 Q3 ratification), Phase-1's `alloc_num_equals`
+  /// constraint fires BEFORE Phase-2's `verify_with_multi_table_lookup`-
+  /// internal (C)-binding constraints — so the FIRST failing constraint
+  /// path twin-substrings on Phase-1, not on the (C)-binding.
+  ///
+  /// `None` (default) preserves honest synthesis; `Some((idx, offset))`
+  /// is the test (i) (W1)-direct corruption pattern of pin §3.5
+  /// alternative-corruption + §5.3 #3.
+  ///
+  /// Gated behind `cfg(any(test, feature = "test-debug-knobs"))`:
+  /// `cfg(test)` alone is INSUFFICIENT — vendor's `cfg(test)` does NOT
+  /// activate when consumed as a dependency from inumbra-spend-harness
+  /// (out-of-crate); the `test-debug-knobs` feature flag (declared in
+  /// `vendor/nova/Cargo.toml`) is the harness-from-vendor exposure
+  /// mechanism. Audit-firm packet documents the feature flag's
+  /// test-only contract per Corrigendum #10 Q2 ruling.
+  #[cfg(all(feature = "lookup-fold", any(test, feature = "test-debug-knobs")))]
+  pub corrupt_t_lookup_at_index: Option<(usize, E::Scalar)>,
 }
 
 impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
@@ -124,7 +157,36 @@ impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
       comm_inv_t_fold: None,
       #[cfg(feature = "lookup-fold")]
       public_bundles_multi_table: None,
+      // GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2: default-`None` preserves
+      // honest synthesis. The harness-side `with_corrupt_t_lookup_at_index`
+      // builder (under cfg(any(test, feature = "test-debug-knobs"))) is
+      // the test-only opt-in for the (W1)-direct Phase-1 corruption test.
+      #[cfg(all(feature = "lookup-fold", any(test, feature = "test-debug-knobs")))]
+      corrupt_t_lookup_at_index: None,
     }
+  }
+
+  /// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 ruling (Halpert 2026-05-10):
+  /// test-only builder for the (W1)-direct corruption pattern of pin
+  /// §3.5 alternative-corruption + §5.3 #3. Sets the
+  /// `corrupt_t_lookup_at_index` field on this `NeutronAugmentedCircuitInputs`
+  /// so `alloc_witness` perturbs the in-circuit `U.T_lookup_per_table[idx]`
+  /// allocation by `offset` after reading the honest witness-closure
+  /// value, causing the Phase-1 hash check at `circuit/mod.rs:467-471` to
+  /// reject (the recomputed hash diverges from `u.X[0]`).
+  ///
+  /// Returns `Self` (builder pattern, signature-stable with `with_lookup`
+  /// / `with_multi_table_bundles`).
+  ///
+  /// Gated behind `cfg(any(test, feature = "test-debug-knobs"))` per Q2
+  /// ruling: vendor `cfg(test)` does NOT activate from harness-crate
+  /// consumers, but the feature flag does. The audit-firm packet records
+  /// this method's test-only role.
+  #[cfg(all(feature = "lookup-fold", any(test, feature = "test-debug-knobs")))]
+  #[allow(dead_code)] // consumed only by inumbra-spend-harness M.GH5.7 negative tests
+  pub fn with_corrupt_t_lookup_at_index(mut self, idx: usize, offset: E::Scalar) -> Self {
+    self.corrupt_t_lookup_at_index = Some((idx, offset));
+    self
   }
 
   /// GH-#5 M.GH5.3: attach multi-table lookup-fold public bundles to an
@@ -332,7 +394,21 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
     // via `inputs == None`) allocates `T_lookup_per_table = Some(vec![alloc; k])`
     // matching the non-base-case shape produced by `verify_with_multi_table_lookup`.
     // At `lookup_fold_k == 0` the hint is no-op (legacy `T_lookup_per_table = None`).
-    #[cfg(feature = "lookup-fold")]
+    // GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2: the `mut` binding on `U`
+    // is required ONLY when the `test-debug-knobs` (or `test`) cfg path
+    // is active — that path mutates `U.T_lookup_per_table[idx]` in place
+    // via the corruption knob block below. Under the production build
+    // (`lookup-fold` alone, no `test-debug-knobs`), `U` is read-only
+    // and `let mut` would trip `#[deny(unused_mut)]` at the workspace
+    // lint level (`vendor/nova/src/lib.rs:4`). Splitting the cfg gates
+    // keeps the production binding immutable.
+    #[cfg(all(feature = "lookup-fold", any(test, feature = "test-debug-knobs")))]
+    let mut U: AllocatedFoldedInstance<E> = AllocatedFoldedInstance::alloc_with_k_hint(
+      cs.namespace(|| "Allocate U"),
+      self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
+      self.lookup_fold_k,
+    )?;
+    #[cfg(all(feature = "lookup-fold", not(any(test, feature = "test-debug-knobs"))))]
     let U: AllocatedFoldedInstance<E> = AllocatedFoldedInstance::alloc_with_k_hint(
       cs.namespace(|| "Allocate U"),
       self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
@@ -343,6 +419,58 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       cs.namespace(|| "Allocate U"),
       self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
     )?;
+
+    // GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 ruling (Halpert 2026-05-10):
+    // (W1)-direct corruption knob. When the knob is set, replace
+    // `U.T_lookup_per_table[idx]` with a fresh `AllocatedNum` whose witness
+    // value is the honest scalar plus `offset`. The fresh aux variable has
+    // no constraint binding it, so the witness assignment is honored at
+    // synthesis. Downstream:
+    //   - Phase-1 hash check (`circuit/mod.rs:462`): `U.absorb_in_ro`
+    //     absorbs the corrupt allocation. The recomputed hash diverges
+    //     from `u.X[0]` (which was honestly produced at the prior step
+    //     with the un-corrupted `Unew_step_prev.T_lookup`). The
+    //     `alloc_num_equals` constraint at line 467 (path
+    //     `"check consistency of u.X[0] with H(params, U, i, z0, zi)"`)
+    //     fails.
+    //   - Phase-2 (`verify_with_multi_table_lookup`): reads
+    //     `U.T_lookup_per_table` as `t_lookup_running_per_table` per
+    //     `synthesize_non_base_case_lookup_fold` (line 630-641); the
+    //     (C)-binding may also fail downstream, BUT
+    //     `which_is_unsatisfied` (per Corrigendum #10 Q3 ratification +
+    //     `frontend/util_cs/test_cs.rs:99-113`) returns the FIRST failing
+    //     constraint in declaration order — Phase-1 fires before Phase-2.
+    //
+    // Per pin §3.5 alternative-corruption + Corrigendum #10 Q3, this is
+    // the test (i) `gh5_augmented_circuit_corrupt_running_T_lookup_breaks_phase1_hash_rejects`
+    // wire-up (§5.3 #3 / (W1)-direct discharge).
+    #[cfg(all(feature = "lookup-fold", any(test, feature = "test-debug-knobs")))]
+    if let Some((idx, offset)) = self.inputs.as_ref().and_then(|i| i.corrupt_t_lookup_at_index) {
+      let t_vec = U.T_lookup_per_table.as_mut().ok_or_else(|| {
+        SynthesisError::Unsatisfiable(
+          "alloc_witness: corrupt_t_lookup_at_index is Some but \
+           U.T_lookup_per_table is None — knob requires lookup_fold_k > 0 \
+           and U with non-empty T_lookup (Pin Corrigendum #10 Q2)"
+            .to_string(),
+        )
+      })?;
+      if idx >= t_vec.len() {
+        return Err(SynthesisError::Unsatisfiable(format!(
+          "alloc_witness: corrupt_t_lookup_at_index idx={idx} out of bounds \
+           for U.T_lookup_per_table.len()={} (Pin Corrigendum #10 Q2)",
+          t_vec.len(),
+        )));
+      }
+      let honest_value = t_vec[idx]
+        .get_value()
+        .ok_or(SynthesisError::AssignmentMissing)?;
+      let corrupt_value = honest_value + offset;
+      let corrupt_alloc = AllocatedNum::alloc(
+        cs.namespace(|| format!("corrupt T_lookup_per_table[{idx}] (M.GH5.7 knob)")),
+        || Ok(corrupt_value),
+      )?;
+      t_vec[idx] = corrupt_alloc;
+    }
 
     // Allocate ri
     let r_i = AllocatedNum::alloc(cs.namespace(|| "ri"), || {

@@ -484,6 +484,23 @@ pub struct LookupFreshWitness<E: Engine> {
 }
 
 impl<E: Engine> Structure<E> {
+  /// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 (Halpert 2026-05-10):
+  /// accessor for the canonical (padded) `R1CSShape` carried by this
+  /// structure. `Structure::new` calls `S.pad()` internally
+  /// (`relation.rs:490`); harness-side consumers building witnesses
+  /// against `Structure`-bound provers (M.GH5.7 negative-test triple)
+  /// need this shape, not the unpadded original, for
+  /// `r1cs_instance_and_witness` to produce a witness whose length
+  /// agrees with the prover's `multiply_vec` invariant
+  /// (`r1cs/mod.rs:384` `z.len() != self.num_io + self.num_vars + 1
+  /// → InvalidWitnessLength`).
+  ///
+  /// Co-classified with the `comm_W()` / `comm_E()` accessors on
+  /// `FoldedInstance` (same M.GH5.7 visibility-bump bracket).
+  pub fn shape(&self) -> &R1CSShape<E> {
+    &self.S
+  }
+
   /// Create a new structure using the provided shape
   pub fn new(S: &R1CSShape<E>) -> Self {
     // pad to the regular shape
@@ -653,6 +670,28 @@ impl<E: Engine> FoldedInstance<E> {
   #[cfg(feature = "lookup-fold")]
   pub fn t_lookup(&self) -> Option<&[E::Scalar]> {
     self.T_lookup.as_deref()
+  }
+
+  /// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 (Halpert 2026-05-10):
+  /// folded R1CS-side `comm_W` accessor. The field is `pub(crate)` so
+  /// that the augmented-circuit's `alloc_witness` site (in vendor
+  /// `circuit/mod.rs`) can read it via field access; harness-side
+  /// consumers (M.GH5.7 negative-test triple) need the accessor to
+  /// build `NeutronAugmentedCircuitInputs::new(... Some(comm_W_fold), ...)`
+  /// for the non-base-case fold-depth-≥1 augmented-circuit synthesis.
+  ///
+  /// Co-classified with `t_lookup()` above (a similar M.11 / M.GH5.6
+  /// enabler accessor pattern). Zero-algebra-zero-FS-zero-digest;
+  /// audit envelope folded into the M.GH5.1 visibility-bump bracket.
+  pub fn comm_W(&self) -> Commitment<E> {
+    self.comm_W
+  }
+
+  /// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 (Halpert 2026-05-10):
+  /// folded R1CS-side `comm_E` accessor. Co-classified with
+  /// [`Self::comm_W`]; same M.GH5.1-visibility-bump bracket.
+  pub fn comm_E(&self) -> Commitment<E> {
+    self.comm_E
   }
 
   /// Fold the instance with another instance

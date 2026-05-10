@@ -1325,7 +1325,23 @@ impl<E: Engine> NIFS<E> {
   /// k=1 and multi-table k=1 paths. Production callers should use the
   /// public wrapper, which sources `r_E` from `OsRng`.
   #[cfg(feature = "lookup-fold")]
-  pub(crate) fn prove_with_multi_table_lookup_inner(
+  // GH-#5 M.GH5.7 / Pin Corrigendum #10 Q1 / AO 17 (Halpert 2026-05-10):
+  // visibility bumped from `pub(crate)` to `pub` so the AO 17 smoke test
+  // (`crates/inumbra-spend-harness/tests/m_gh5_7_negative_test_triple.rs`)
+  // can assert Lemma α-Q1 byte-equivalence at the deterministic-r_E
+  // prover-inner level. The public `prove_with_multi_table_lookup`
+  // (line 1297) samples `r_E` from `OsRng`, breaking the byte-
+  // equivalence claim (each call produces a different `comm_E`); the
+  // inner prover takes `r_E` as an explicit parameter, allowing the
+  // AO 17 smoke to call both arms with the SAME r_E and verify the
+  // produced NIFS bytes are identical.
+  //
+  // Co-classified with the M.GH5.1 `pub` field bumps on `NIFS::{poly,
+  // poly_lookup, comm_E, comm_inv_w, comm_inv_t}` (zero-algebra-zero-FS-
+  // zero-digest); audit envelope folded into the M.GH5.7 visibility-bump
+  // bracket.
+  #[allow(clippy::too_many_arguments)]
+  pub fn prove_with_multi_table_lookup_inner(
     ck: &CommitmentKey<E>,
     ro_consts: &RO2Constants<E>,
     pp_digest: &E::Scalar,

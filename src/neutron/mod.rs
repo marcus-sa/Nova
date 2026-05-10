@@ -23,6 +23,39 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 mod circuit;
+// GH-#5 M.GH5.7 / Pin Corrigendum #10 Q2 ruling (Halpert 2026-05-10):
+// targeted re-exports of the circuit-side symbols required by the
+// M.GH5.7 negative-test triple's Option A.2 path (harness-side direct
+// invocation of `AllocatedNIFS::verify_with_multi_table_lookup` for
+// tests (ii) and (iii)). This composes with M.GH5.1's vendor visibility
+// bumps on `NIFS::{poly, poly_lookup, comm_E, comm_inv_w, comm_inv_t}`
+// (zero-algebra-zero-FS-zero-digest); the audit envelope already covers
+// harness-from-vendor reachability for the lookup-fold surface.
+//
+// Re-exported symbols (test-only consumers in
+// `crates/inumbra-spend-harness/tests/m_gh5_7_negative_test_triple.rs`):
+//
+//   - `NeutronAugmentedCircuit` / `NeutronAugmentedCircuitInputs` (test (i)
+//     full augmented-circuit synthesis under the `corrupt_t_lookup_at_index`
+//     `test-debug-knobs` knob)
+//   - `AllocatedNIFS` / `AllocatedFoldedInstance` /
+//     `AllocatedLookupNIFSMultiTable` / `AllocatedLookupPayloadPublicMultiTable`
+//     / `AllocatedNonnativeR1CSInstance` (tests (ii) and (iii) direct
+//     invocation of the in-circuit verifier under Option A.2).
+//
+// Production callsites for the augmented circuit live inside vendor
+// `PublicParams::setup` (this same file, lines 165-225) and DO NOT
+// expose the in-circuit types to inumbra public-params consumers; those
+// route through `PublicParams::setup` / `RecursiveSNARK::prove_step`,
+// which are already pub.
+pub use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
+#[cfg(feature = "lookup-fold")]
+pub use circuit::{
+    lookup::{AllocatedLookupNIFSMultiTable, AllocatedLookupPayloadPublicMultiTable},
+    nifs::AllocatedNIFS,
+    r1cs::AllocatedNonnativeR1CSInstance,
+    relation::AllocatedFoldedInstance,
+};
 pub mod nifs;
 pub mod relation;
 
@@ -32,7 +65,10 @@ pub mod relation;
 #[cfg(feature = "lookup-fold")]
 pub mod lookup_sumcheck;
 
-use circuit::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
+// Note: `NeutronAugmentedCircuit` / `NeutronAugmentedCircuitInputs` are
+// `pub use`-re-exported above (M.GH5.7 / Corrigendum #10 Q2). The in-file
+// callsites (`PublicParams::setup`, `RecursiveSNARK::*`) reach them via
+// the re-export; no separate `use` needed.
 use nifs::NIFS;
 use relation::{FoldedInstance, FoldedWitness, Structure};
 

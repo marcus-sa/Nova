@@ -102,3 +102,20 @@ evm = []
 io = []
 # Enables insecure setup methods that generate random tau. Only for testing!
 test-utils = []
+# C1-β GH-#5 M.GH5.7 (Pin Corrigendum #10 Q2 ruling, Halpert 2026-05-10):
+# opt-in feature flag exposing test-only corruption knobs on the augmented-
+# circuit's input builder for the negative-test triple in
+# `crates/inumbra-spend-harness/tests/m_gh5_7_negative_test_triple.rs`.
+#
+# Vendor `#[cfg(test)]` gates do NOT activate when the consumer crate is
+# inumbra-spend-harness (out-of-crate); this feature flag's
+# `#[cfg(any(test, feature = "test-debug-knobs"))]` gating allows
+# inumbra-spend-harness `[dev-dependencies]` to enable the knob without
+# polluting the production build surface.
+#
+# Audit-firm packet documents this feature flag's test-only contract per
+# Corrigendum #10 Q2 ruling. The `corrupt_t_lookup_at_index` field on
+# `NeutronAugmentedCircuitInputs` is the only knob this gate exposes;
+# enabling the feature in production is incorrect (no production callsite
+# constructs `NeutronAugmentedCircuitInputs` with the knob set).
+test-debug-knobs = []
