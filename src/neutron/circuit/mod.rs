@@ -136,7 +136,7 @@ impl<E: Engine> NeutronAugmentedCircuitInputs<E> {
   /// At outer base / non-lookup steps, leave the field as `None` (the
   /// default from `new`).
   #[cfg(feature = "lookup-fold")]
-  #[allow(dead_code)] // until M.GH5.4 wires inumbra-side prove_step through this builder
+  #[allow(dead_code)] // until GH-#7 wires inumbra-side prove_step through this builder; Pin Corrigendum #9 routing-carry-forward
   pub fn with_multi_table_bundles(
     mut self,
     bundles: Option<Vec<LookupPayloadPublicMultiTable<E>>>,
