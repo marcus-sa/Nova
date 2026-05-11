@@ -222,11 +222,27 @@ pub struct Structure<E: Engine> {
 pub struct FoldedWitness<E: Engine> {
   /// Running witness of the main relation
   pub(crate) W: Vec<E::Scalar>,
-  r_W: E::Scalar,
+  /// Witness blinding factor.
+  ///
+  /// GH-#7 M.GH7.0.1 visibility bump (Corrigendum #8 §1.2(a)): bumped from
+  /// fully-private to `pub(crate)` so the sibling `neutron::compressed_snark`
+  /// module can read/write `r_W` when constructing test fixtures for the
+  /// Pedersen MSM-linearity split-E commitment helper. Co-classified with
+  /// the M.GH5.1 / M.GH5.7 lookup-fold-surface visibility-bump bracket
+  /// noted at `neutron/mod.rs:30-32`.
+  pub(crate) r_W: E::Scalar,
 
   /// eq polynomial in tensor form
   pub(crate) E: Vec<E::Scalar>,
-  r_E: E::Scalar,
+  /// `E`-blinding factor.
+  ///
+  /// GH-#7 M.GH7.0.1 visibility bump (Corrigendum #8 §1.2(a)): bumped from
+  /// fully-private to `pub(crate)` so the sibling `neutron::compressed_snark`
+  /// module can read `r_E` when computing the blinding split
+  /// `r_E1 + r_E2 == W.r_E` for `split_E_commitments`. Co-classified with
+  /// the `r_W` bump above and the M.GH5.1 / M.GH5.7 visibility-bump
+  /// bracket noted at `neutron/mod.rs:30-32`.
+  pub(crate) r_E: E::Scalar,
 }
 
 /// A type that holds instance information for a zero-fold relation

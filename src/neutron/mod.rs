@@ -59,6 +59,13 @@ pub use circuit::{
 pub mod nifs;
 pub mod relation;
 
+/// GH-#7 / Stage K design pin Corrigenda #7+#8+#9: NeutronNova-side
+/// compressed SNARK envelope, landing incrementally across M.GH7.0.1
+/// (Pedersen MSM-linearity split-E commitment helper) → M.GH7.0.2
+/// (envelope + verifier off-FS binding check) → M.GH7.4 (LogUp identity
+/// composition).
+pub mod compressed_snark;
+
 /// Closed-form, fold-step-collapsed sumcheck instance for the C1-β
 /// lookup-fold extension. Pinned by §B of the spike implementation
 /// outline (amendment 2026-05-07).
