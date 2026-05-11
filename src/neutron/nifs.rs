@@ -773,15 +773,18 @@ impl<E: Engine> NIFS<E> {
       T2_lookup: payload.T2_lookup,
       comm_values: payload.comm_values.clone(),
     };
-    // Multi-table extension (GH-#2 M.2): `fold_with_lookup` takes a slice
-    // of per-table running scalars. The single-table caller passes a
-    // one-element slice; storage shape is byte-identical to M.1.
+    // Multi-table extension (GH-#2 M.2 + GH-#7 M.GH7.0a): `fold_with_lookup`
+    // takes a slice of per-table running scalars AND a slice of per-table
+    // payloads. The single-table caller passes one-element slices; storage
+    // shape is byte-identical to M.1 for `T_lookup_per_table`, and
+    // byte-identical-modulo-`Some(vec![…])`-wrap to pre-M.GH7.0a for the
+    // four `comm_X_per_table` fields.
     let U = U1.fold_with_lookup(
       U2,
       &comm_E,
       &r_b,
       &T_out,
-      &effective_payload,
+      std::slice::from_ref(&effective_payload),
       std::slice::from_ref(&T_lookup_out),
     )?;
     let W = W1.fold(W2, &E, &r_E, &r_b)?;
@@ -1177,14 +1180,15 @@ impl<E: Engine> NIFS<E> {
       T2_lookup: payload.T2_lookup,
       comm_values: payload.comm_values.clone(),
     };
-    // Multi-table extension (GH-#2 M.2): one-element slice; see commentary
-    // at the analogous site in `prove_with_lookup`.
+    // Multi-table extension (GH-#2 M.2 + GH-#7 M.GH7.0a): one-element
+    // payload slice + one-element T_lookup slice; see commentary at the
+    // analogous site in `prove_with_lookup`.
     let U = U1.fold_with_lookup(
       U2,
       &comm_E,
       &r_b,
       &T_out,
-      &effective_payload,
+      std::slice::from_ref(&effective_payload),
       std::slice::from_ref(&T_lookup_out),
     )?;
     let W = W1.fold(W2, &E, &r_E, &r_b)?;
@@ -1655,24 +1659,33 @@ impl<E: Engine> NIFS<E> {
     // j≥1 are still threaded into the NIFS struct's Vec fields and
     // verified per-table at M.4).
     //
-    // GH-#2 M.3 single-table-degeneration discipline: at k=1 the
-    // effective_payload below is byte-identical to the
-    // `prove_with_multi_column_lookup_inner` construction, preserving
-    // the byte-equivalence pin §5.2 #2.
-    let effective_payload = LookupPayload {
-      comm_L: bundles[0].payload.comm_L,
-      comm_ts: bundles[0].payload.comm_ts,
-      comm_inv_w: comm_inv_w_vec[0],
-      comm_inv_t: comm_inv_t_vec[0],
-      T2_lookup: bundles[0].payload.T2_lookup,
-      comm_values: bundles[0].payload.comm_values.clone(),
-    };
+    // GH-#7 M.GH7.0a (design pin Corrigendum #1 + #6 §1.3): per-table
+    // multi-table routing — replaces the pre-M.GH7.0a single-table
+    // `effective_payload = bundles[0]` collapse with a per-table slice
+    // `payload_per_table` of length `k`, one [`LookupPayload`] per
+    // registered table in `table_id`-canonical order. The four `comm_X`
+    // running fields on the resulting `FoldedInstance` are populated
+    // per-`j` via Corrigendum #6 primitive 3 (per-table independent fold
+    // under common `r_b`; no cross-`j` term). At k=1 this collapses to
+    // a one-element slice byte-identical-modulo-`Some(vec![…])`-wrap to
+    // the pre-M.GH7.0a `effective_payload` shape, preserving the §5.2
+    // #2 byte-equivalence pin at the k=1 single-table degeneration.
+    let payload_per_table: Vec<LookupPayload<E>> = (0..k)
+      .map(|j| LookupPayload {
+        comm_L: bundles[j].payload.comm_L,
+        comm_ts: bundles[j].payload.comm_ts,
+        comm_inv_w: comm_inv_w_vec[j],
+        comm_inv_t: comm_inv_t_vec[j],
+        T2_lookup: bundles[j].payload.T2_lookup,
+        comm_values: bundles[j].payload.comm_values.clone(),
+      })
+      .collect();
     let U = U1.fold_with_lookup(
       U2,
       &comm_E,
       &r_b,
       &T_out,
-      &effective_payload,
+      &payload_per_table,
       &t_lookup_out_per_table,
     )?;
     let W = W1.fold(W2, &E_eq, &r_E, &r_b)?;
@@ -1842,14 +1855,15 @@ impl<E: Engine> NIFS<E> {
     let T_lookup_out =
       LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, poly_lookup, &t_lookup_running)?;
 
-    // Multi-table extension (GH-#2 M.2): one-element slice; verify-side
-    // path mirrors the prove-side single-table contract.
+    // Multi-table extension (GH-#2 M.2 + GH-#7 M.GH7.0a): one-element
+    // payload slice + one-element T_lookup slice; verify-side path mirrors
+    // the prove-side single-table contract.
     let U = U1.fold_with_lookup(
       U2,
       &self.comm_E,
       &r_b,
       &T_out,
-      payload,
+      std::slice::from_ref(payload),
       std::slice::from_ref(&T_lookup_out),
     )?;
     Ok(U)
@@ -2036,27 +2050,31 @@ impl<E: Engine> NIFS<E> {
     }
 
     // --- Fold the FoldedInstance ---
-    // Per the M.3 commentary at `prove_with_multi_table_lookup_inner`,
-    // FoldedInstance's four `comm_*` fields are still single-commitment
-    // `Option<Commitment<E>>` (per pin §5.1 explicit listing); the M.3
-    // prover threads bundle[0]'s commitments through `effective_payload`,
-    // and M.4's verifier mirrors that here for byte-equivalence at k=1.
-    // The k≥2 FoldedInstance commitment shape is deferred to a later
-    // milestone per pin §5.4.
-    let effective_payload = LookupPayload {
-      comm_L: public_bundles[0].comm_L,
-      comm_ts: public_bundles[0].comm_ts,
-      comm_inv_w: comm_inv_w_vec[0],
-      comm_inv_t: comm_inv_t_vec[0],
-      T2_lookup: E::Scalar::ZERO,
-      comm_values: public_bundles[0].comm_values.clone(),
-    };
+    // GH-#7 M.GH7.0a (design pin Corrigendum #1 + #6 §1.3): per-table
+    // multi-table routing — replaces the pre-M.GH7.0a single-table
+    // `effective_payload = public_bundles[0]` collapse with a per-table
+    // slice `payload_per_table` of length `k`, one [`LookupPayload`] per
+    // registered table in `table_id`-canonical order. Mirrors the
+    // prover-side construction at `prove_with_multi_table_lookup_inner`
+    // for byte-equivalent verifier-prover agreement under per-`j`
+    // independent fold under common `r_b` (Corrigendum #6 primitive 3).
+    let k_local = t_lookup_out_per_table.len();
+    let payload_per_table: Vec<LookupPayload<E>> = (0..k_local)
+      .map(|j| LookupPayload {
+        comm_L: public_bundles[j].comm_L,
+        comm_ts: public_bundles[j].comm_ts,
+        comm_inv_w: comm_inv_w_vec[j],
+        comm_inv_t: comm_inv_t_vec[j],
+        T2_lookup: E::Scalar::ZERO,
+        comm_values: public_bundles[j].comm_values.clone(),
+      })
+      .collect();
     let U = U1.fold_with_lookup(
       U2,
       &self.comm_E,
       &r_b,
       &T_out,
-      &effective_payload,
+      &payload_per_table,
       &t_lookup_out_per_table,
     )?;
 
@@ -2163,14 +2181,15 @@ impl<E: Engine> NIFS<E> {
       LookupSumcheckInstance::<E>::verify_step(&rho, &r_b, poly_lookup, &t_lookup_running)?;
 
     // --- Fold with lookup ---
-    // Multi-table extension (GH-#2 M.2): one-element slice for the
-    // single-table multi-column verify path.
+    // Multi-table extension (GH-#2 M.2 + GH-#7 M.GH7.0a): one-element
+    // payload slice + one-element T_lookup slice for the single-table
+    // multi-column verify path.
     let U = U1.fold_with_lookup(
       U2,
       &self.comm_E,
       &r_b,
       &T_out,
-      payload,
+      std::slice::from_ref(payload),
       std::slice::from_ref(&T_lookup_out),
     )?;
 
