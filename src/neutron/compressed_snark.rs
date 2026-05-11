@@ -1,22 +1,68 @@
 //! NeutronNova-side compressed SNARK envelope.
 //!
-//! Authored per GH-#7 / Stage K design pin Corrigenda #7+#8+#9. This module
-//! lands incrementally across M.GH7.0.1 (this commit; Pedersen MSM-linearity
-//! split-E commitment helper) → M.GH7.0.2 (envelope + verifier off-FS
-//! binding check) → M.GH7.4 (LogUp identity composition).
+//! Authored per GH-#7 / Stage K design pin Corrigenda #7+#8+#9+#11. This
+//! module lands incrementally across M.GH7.0.1 REWORKED (this commit; the
+//! Corrigendum #11 three-commitment split-E helper) → M.GH7.0.1b
+//! (Σ-protocol equality-of-opening helper) → M.GH7.0.2 (envelope + verifier
+//! off-FS binding check + Σ-protocol verification) → M.GH7.4 (LogUp identity
+//! composition).
 //!
-//! # M.GH7.0.1 scope (this commit)
+//! # M.GH7.0.1 REWORKED scope (this commit; Corrigendum #11)
 //!
 //! Provides [`split_E_commitments`], a helper that splits a `FoldedWitness`'s
 //! flat `E: Vec<E::Scalar>` (length `left + right`) into two halves
-//! `(E1, E2)` of lengths `left` and `right`, and emits commitments
-//! `(comm_E1, comm_E2)` against disjoint prefix/suffix slices of the same
-//! flat commitment-key generator vector that the existing
-//! `commit(ck, &W.E, &W.r_E)` uses. A blinding split `r_E1 + r_E2 == W.r_E`
-//! is also emitted so that the Pedersen-additive identity
-//! `comm_E1 + comm_E2 == U.comm_E` holds by construction.
+//! `(E1, E2)` of lengths `left` and `right`, and emits a
+//! [`SplitECommitments<E>`] struct carrying THREE commitments and THREE
+//! blinding factors:
 //!
-//! # Soundness anchor
+//! ```text
+//!   comm_E1      := MSM(E1, ck.ck[..left])                + h · r_E1
+//!   comm_E2_bind := MSM(E2, ck.ck[left..left+right])      + h · r_E2_bind
+//!   comm_E2_pcs  := MSM(E2, ck.ck[..right])               + h · r_E2_pcs
+//! ```
+//!
+//! with disciplined blinding-split:
+//!
+//! - `r_E1 + r_E2_bind == W.r_E` (preserves the off-FS Pedersen-additive
+//!   binding identity `comm_E1 + comm_E2_bind == U.comm_E` byte-equal at
+//!   the group level; Corrigendum #8 (iv-B) carried verbatim);
+//! - `r_E2_pcs` is **fresh-independent** from `OsRng` and does NOT enter
+//!   the binding identity. It exists solely so that `comm_E2_pcs` can be
+//!   consumed by the Spartan T-claim sibling's PCS-opening shape, which
+//!   expects a **prefix-basis** commitment to `E2` (canonical `EE::verify`
+//!   contract at HyperKZG `provider/hyperkzg.rs:1080-...` and IPA-PC
+//!   `provider/ipa_pc.rs:286-...`).
+//!
+//! # Why three commitments (Corrigendum #11)
+//!
+//! Pre-Corrigendum-#11 (the original M.GH7.0.1 at vendor commit `5cbc0e9`)
+//! emitted only `(comm_E1, comm_E2)` with `comm_E2` in the **suffix** basis
+//! `ck.ck[left..left+right]`. That single `comm_E2` simultaneously had to
+//! serve TWO disjoint contracts:
+//!
+//! 1. Off-FS Pedersen-additive binding: `comm_E1 + comm_E2 == U.comm_E`,
+//!    requiring `comm_E2 = MSM(E2, ck.ck[left..left+right]) + h · r_E2`
+//!    against the suffix basis (so `comm_E1 + comm_E2 = MSM([E1||E2],
+//!    ck.ck[..left+right]) + h · (r_E1 + r_E2)`).
+//!
+//! 2. Spartan-sibling PCS opening at `r_x_high`: `EE::prove`/`EE::verify`
+//!    treat `comm_E2` as a standard prefix-basis commitment
+//!    `MSM(E2, ck.ck[..right]) + h · r`. The HyperKZG `EE::verify` at
+//!    `provider/hyperkzg.rs:1080-...` and the IPA-PC `EE::verify` at
+//!    `provider/ipa_pc.rs:286-...` both consume `Commitment<E>` against
+//!    the prefix slice `ck.ck[..v.len()]` — they have no API surface for
+//!    a non-prefix slice.
+//!
+//! The two contracts require **different group elements** in general
+//! (`ck.ck[left..left+right]` ≠ `ck.ck[..right]`), so a single `comm_E2`
+//! cannot satisfy both. This was the basis-collision diagnosed at the
+//! M.GH7.0.2-attempt-2 GREEN halt (STOP-AND-ASK gate A; execution-log
+//! 2026-05-11T16:31:00Z). Corrigendum #11 disposes it by emitting BOTH
+//! commitments — `comm_E2_bind` (suffix) and `comm_E2_pcs` (prefix) —
+//! together with a downstream Σ-protocol equality-of-opening proof
+//! (M.GH7.0.1b) tying them at the algebraic value `E2`.
+//!
+//! # Soundness anchor — binding side
 //!
 //! Pedersen MSM-linearity at `vendor/nova/src/provider/pedersen.rs:285-292`:
 //!
@@ -35,48 +81,101 @@
 //!   = MSM(E1, ck.ck[..left]) + MSM(E2, ck.ck[left..left+right])
 //! ```
 //!
-//! Combined with `(h * r_E1) + (h * r_E2) = h * (r_E1 + r_E2) = h * W.r_E`,
-//! this gives `comm_E1 + comm_E2 = U.comm_E` whenever
-//! `r_E1 + r_E2 == W.r_E`.
+//! Combined with `(h · r_E1) + (h · r_E2_bind) = h · (r_E1 + r_E2_bind) =
+//! h · W.r_E`, this gives `comm_E1 + comm_E2_bind = U.comm_E` whenever
+//! `r_E1 + r_E2_bind == W.r_E`. This is Corrigendum #8 (iv-B) carried
+//! verbatim modulo the rename `r_E2 → r_E2_bind`.
+//!
+//! # Soundness anchor — PCS-opening side
+//!
+//! `comm_E2_pcs = E::CE::commit(ck, E2, &r_E2_pcs)` follows the canonical
+//! prefix-basis Pedersen contract at `provider/pedersen.rs:285-292`:
+//! `E::CE::commit(ck, v, r)` selects `ck.ck[..v.len()]` directly, so with
+//! `v.len() = right` this commits against `ck.ck[..right]`. This is the
+//! shape consumed by:
+//!
+//! - HyperKZG `EE::verify` at `provider/hyperkzg.rs:1080-...` (the
+//!   `C: &Commitment<E>` argument is opened against the prefix basis via
+//!   the polynomial-evaluation pairing equation).
+//! - IPA-PC `EE::verify` at `provider/ipa_pc.rs:286-...` (the inner-product
+//!   instance commitment is split by `ck.split_at(U.b_vec.len())` at line
+//!   294 — again a prefix selection).
+//!
+//! # Why `r_E2_pcs` is fresh-independent
+//!
+//! `r_E2_pcs` does NOT enter the binding identity `comm_E1 + comm_E2_bind
+//! == U.comm_E`. The binding identity constrains the **blinding** values
+//! `(r_E1, r_E2_bind)` to sum to `W.r_E`, but says nothing about the
+//! blinding of `comm_E2_pcs`. Algebraically `r_E2_pcs` is a free degree
+//! of freedom — it could be any value in `F`. Drawing it fresh from
+//! `OsRng` preserves Pedersen hiding on `comm_E2_pcs` independently of
+//! the binding side. **The Σ-protocol at M.GH7.0.1b (next milestone)** is
+//! what ties `comm_E2_bind` and `comm_E2_pcs` together at the algebraic
+//! value of `E2`, proving that the prover did not commit to a forged
+//! `E2' ≠ E2` against the prefix basis. Without that Σ-protocol, the
+//! envelope would be unsound: a malicious prover could supply
+//! `comm_E2_pcs := MSM(E2', ck.ck[..right]) + h · r_E2_pcs` for any
+//! `E2' ≠ E2`, and the off-FS binding check on `comm_E2_bind` would not
+//! catch it. The Σ-protocol closes this gap.
 //!
 //! # Generator-vector alignment
 //!
-//! The helper relies on `CE::commit(ck, &v, &r)` using `ck.ck[..v.len()]` —
-//! i.e., the first `v.len()` generators in flat order. For
-//! `comm_E1 = CE::commit(ck, E1, r_E1)` this is `ck.ck[..left]` directly.
-//! For `comm_E2` the helper passes a length-`(left + right)` vector
-//! `[zeros(left) || E2]` so that `CE::commit` selects `ck.ck[..left+right]`,
-//! and the zero-prefix contributes zero to the MSM — leaving exactly
-//! `MSM(E2, ck.ck[left..left+right]) + h * r_E2`. Both halves therefore
-//! commit against the same flat generator vector that `U.comm_E` is
-//! committed against; the additive identity is byte-equal at the group
-//! level (Corrigendum #8 §1.2(a) "MSM-linear over flat `ck.ck` generator
-//! vector").
+//! The helper relies on `CE::commit(ck, &v, &r)` using `ck.ck[..v.len()]`
+//! — i.e., the first `v.len()` generators in flat order:
+//!
+//! - `comm_E1 = CE::commit(ck, E1, r_E1)` with `E1.len() = left` selects
+//!   `ck.ck[..left]` directly. **This is also the prefix-basis shape
+//!   Spartan consumes for its PCS opening at `r_x_low`**, so a single
+//!   `comm_E1` serves BOTH the off-FS binding and the Spartan opening on
+//!   the E1 side — no basis divergence on E1.
+//! - `comm_E2_bind`: we pass a length-`(left + right)` vector
+//!   `[zeros(left) || E2]` so that `CE::commit` selects
+//!   `ck.ck[..left+right]`, and the zero-prefix contributes zero to the
+//!   MSM — leaving exactly `MSM(E2, ck.ck[left..left+right]) + h · r_E2_bind`.
+//!   This is the suffix-basis shape required for the additive identity.
+//! - `comm_E2_pcs = CE::commit(ck, E2, r_E2_pcs)` with `E2.len() = right`
+//!   selects `ck.ck[..right]` directly. This is the prefix-basis shape
+//!   Spartan consumes for its PCS opening at `r_x_high`.
 //!
 //! # Blinding-split discipline
 //!
 //! The helper draws `r_E1` from `OsRng` (matching the
 //! `RecursiveSNARK::{new, prove_step}` precedent at
 //! `vendor/nova/src/neutron/mod.rs:479, 550`) and emits
-//! `r_E2 = W.r_E - r_E1`. The sum identity `r_E1 + r_E2 == W.r_E` holds
-//! algebraically; both halves are independently uniformly distributed in
-//! the group's exponent space (Pedersen hiding preserved on both halves
-//! independently).
+//! `r_E2_bind = W.r_E - r_E1`. The sum identity `r_E1 + r_E2_bind ==
+//! W.r_E` holds algebraically; both halves are independently uniformly
+//! distributed in the group's exponent space (Pedersen hiding preserved
+//! on both halves independently). `r_E2_pcs` is drawn fresh from `OsRng`
+//! and is statistically independent of `(r_E1, r_E2_bind)` with
+//! overwhelming probability (collision probability ≈ 1/|F|; negligible
+//! for the scalar field of `Bn256`/`Pallas`).
 //!
-//! # Consumer integration (M.GH7.0.0 carry-forward)
+//! # Consumer integration (M.GH7.0.2 carry-forward)
 //!
-//! The Spartan-side `prove_with_split_error` sibling at
-//! `vendor/nova/src/spartan/snark.rs` (M.GH7.0.0) operates on
-//! **derandomized** commitments (mirroring
-//! `vendor/nova/src/spartan/direct.rs:159-175`). This helper itself emits
-//! **blinded** commitments preserving `r_E1 + r_E2 == W.r_E`. The
-//! M.GH7.0.2 envelope is responsible for the derandomize-before-Spartan-
-//! prove dance: it will call this helper, then `CE::derandomize` the
-//! results with `(r_E1, r_E2)`, then feed the derandomized commitments
-//! into `prove_with_split_error`. Keeping the helper blinded preserves
-//! the Pedersen-additive identity at the M.GH7.0.1 acceptance-test
-//! callsite (where `U.comm_E` is also blinded), and gives M.GH7.0.2 the
-//! information it needs to derandomize correctly.
+//! The M.GH7.0.2 envelope consumes this helper's output, then:
+//!
+//! 1. Derandomizes `(comm_E1, comm_E2_bind, comm_E2_pcs)` against
+//!    `(r_E1, r_E2_bind, r_E2_pcs)` via `CE::derandomize` (mirror of
+//!    `vendor/nova/src/spartan/direct.rs:159-175`). The Pedersen-additive
+//!    identity is preserved at the derandomized layer because both
+//!    `comm_E1_derand` and `comm_E2_bind_derand` strip the `h · r_·` term.
+//! 2. Invokes M.GH7.0.1b `prove_sigma_E2_equality(...)` over the envelope-
+//!    side transcript, producing a `SigmaE2EqualityProof<E>` that ties
+//!    `comm_E2_bind` to `comm_E2_pcs` at the field-value `E2`.
+//! 3. Feeds `(comm_E1, comm_E2_pcs)` (NOT `comm_E2_bind`) into the Spartan
+//!    sibling `RelaxedR1CSSNARK::prove_with_T_claim_split_error`, which
+//!    expects both commitments in the prefix basis (matching the
+//!    sibling-internal test pattern at `snark.rs:1824-1825` where the
+//!    sibling's own tests commit `comm_E2 = CE::commit(ck, &E2, &r)`
+//!    against `ck.ck[..right]`).
+//! 4. At verify, the envelope runs (a) the off-FS Pedersen-additive
+//!    binding check `comm_E1 + comm_E2_bind == r_U_derand.comm_E`, (b)
+//!    the Σ-protocol verification `verify_sigma_E2_equality(...)`, and
+//!    (c) delegates to the Spartan sibling's `verify_with_T_claim_split_error`
+//!    consuming `(comm_E1, comm_E2_pcs)`.
+//!
+//! Steps (1)-(4) collectively discharge the Corrigendum #11 algebra at
+//! STAGE 0 (§6.2 Pass Criterion #9).
 
 use crate::{
   neutron::relation::{FoldedInstance, FoldedWitness, Structure},
@@ -94,15 +193,21 @@ use serde::{Deserialize, Serialize};
 /// Extends the pre-Corrigendum-#10 `RelaxedR1CSInstance` shape by:
 ///
 /// - Splitting `comm_E` into `(comm_E1, comm_E2)` per the Pedersen
-///   MSM-linearity helper at [`split_E_commitments`] (Corrigendum #8 §1.2(a)).
+///   MSM-linearity helper at [`split_E_commitments`] (Corrigendum #8 §1.2(a);
+///   M.GH7.0.2 will REWIRE the second-half field to `comm_E2_pcs` per
+///   Corrigendum #11, consuming the prefix-basis side of the three-commitment
+///   helper output).
 /// - Carrying the running neutron-form sumcheck claim `T: E::Scalar`
 ///   extracted from `FoldedInstance::T` (`relation.rs:254`).
 ///
-/// The envelope (M.GH7.0.2) constructs this from
+/// The envelope (M.GH7.0.2 REWIRED per Corrigendum #11) constructs this from
 ///   `(r_U: &FoldedInstance<E>, r_W: &FoldedWitness<E>, structure: &Structure<E>)`
 /// by extracting `(comm_W, u, X, T) := (r_U.comm_W, r_U.u, r_U.X.clone(), r_U.T)`,
-/// invoking [`split_E_commitments`] to produce `(comm_E1, comm_E2, r_E1, r_E2)`,
-/// and assembling the [`BridgedNeutronInstance`] from the resulting parts.
+/// invoking [`split_E_commitments`] to produce a [`SplitECommitments<E>`]
+/// (three commitments + three blinding factors), and assembling the
+/// [`BridgedNeutronInstance`] from the resulting parts (consuming
+/// `comm_E2_pcs` — the PCS-opening-side commitment — as the second
+/// commitment field at M.GH7.0.2 re-execution).
 ///
 /// # FS-transcript discipline
 ///
@@ -166,22 +271,105 @@ impl<E: Engine> TranscriptReprTrait<E::GE> for BridgedNeutronInstance<E> {
   }
 }
 
-/// Pedersen MSM-linearity split-E commitment helper (M.GH7.0.1 per
-/// Corrigendum #8 §1.2(a)).
+/// Three-commitment output of [`split_E_commitments`] per Corrigendum #11.
+///
+/// Carries the split-E commitments and their corresponding blinding factors
+/// in disciplined roles:
+///
+/// - `(comm_E1, r_E1)` — prefix-basis commitment to `E1`. Serves BOTH the
+///   off-FS Pedersen-additive binding identity (`comm_E1 + comm_E2_bind ==
+///   U.comm_E`) AND the Spartan-sibling PCS opening at `r_x_low`. No basis
+///   divergence on the E1 side because `ck.ck[..left]` is simultaneously
+///   the prefix-of-prefix for `[E1||E2]`'s flat commitment and the prefix
+///   basis for a standalone `commit(ck, E1, r_E1)` (Pedersen-1991
+///   MSM-linearity at `provider/pedersen.rs:285-292`).
+///
+/// - `(comm_E2_bind, r_E2_bind)` — **suffix-basis** commitment to `E2`,
+///   used ONLY for the off-FS Pedersen-additive binding identity
+///   `comm_E1 + comm_E2_bind == U.comm_E`. Blinding-split discipline
+///   `r_E1 + r_E2_bind == W.r_E` ensures the binding identity holds
+///   byte-equal at the group level.
+///
+/// - `(comm_E2_pcs, r_E2_pcs)` — **prefix-basis** commitment to `E2`,
+///   used ONLY for the Spartan-sibling PCS opening at `r_x_high`. `r_E2_pcs`
+///   is fresh-independent from `OsRng` and does NOT enter the binding
+///   identity. The Σ-protocol at M.GH7.0.1b ties `comm_E2_bind` and
+///   `comm_E2_pcs` to the same algebraic `E2`; without that Σ-protocol the
+///   envelope would be unsound (see module-level documentation).
+///
+/// # Field naming
+///
+/// The `_bind` / `_pcs` suffixes on `comm_E2_bind` / `comm_E2_pcs` make
+/// the role of each commitment explicit at the call site. A reviewer
+/// reading the envelope code or any consumer thereof can see immediately
+/// which commitment satisfies which contract:
+///
+/// - `comm_E2_bind` → consumed by the envelope's off-FS binding check;
+/// - `comm_E2_pcs` → consumed by the Spartan sibling's PCS-opening shape.
+///
+/// This naming discipline is part of the audit-firm engagement surface —
+/// the `Frozen-Heart`-class adversary inspection workflow at M.GH7.7 will
+/// trace each field through the envelope to its single consumer.
+#[derive(Clone, Debug)]
+#[allow(non_snake_case)]
+pub struct SplitECommitments<E: Engine> {
+  /// Prefix-basis commitment to `E1`:
+  /// `comm_E1 = MSM(E1, ck.ck[..left]) + h · r_E1`.
+  pub comm_E1: Commitment<E>,
+  /// Suffix-basis commitment to `E2` (binding side):
+  /// `comm_E2_bind = MSM(E2, ck.ck[left..left+right]) + h · r_E2_bind`.
+  pub comm_E2_bind: Commitment<E>,
+  /// Prefix-basis commitment to `E2` (PCS-opening side):
+  /// `comm_E2_pcs = MSM(E2, ck.ck[..right]) + h · r_E2_pcs`.
+  pub comm_E2_pcs: Commitment<E>,
+  /// Blinding for `comm_E1`. Drawn fresh from `OsRng`.
+  pub r_E1: E::Scalar,
+  /// Blinding for `comm_E2_bind`. Computed as `W.r_E - r_E1` so the
+  /// binding identity `comm_E1 + comm_E2_bind == U.comm_E` holds.
+  pub r_E2_bind: E::Scalar,
+  /// Blinding for `comm_E2_pcs`. Drawn fresh and independently from
+  /// `OsRng`; statistically independent of `(r_E1, r_E2_bind)` with
+  /// overwhelming probability. Does NOT enter the binding identity.
+  pub r_E2_pcs: E::Scalar,
+}
+
+/// Pedersen MSM-linearity split-E commitment helper (M.GH7.0.1 REWORKED
+/// per Corrigendum #11; supersedes the pre-Corrigendum-#11 4-tuple
+/// signature at vendor commit `5cbc0e9`).
 ///
 /// Given a `FoldedWitness<E>` carrying flat `E: Vec<E::Scalar>` of length
 /// `structure.left + structure.right` with blinding `W.r_E`, splits `E`
-/// into `(E1, E2)` at `structure.left` and emits:
+/// into `(E1, E2)` at `structure.left` and emits a [`SplitECommitments<E>`]
+/// carrying the three commitments and their blinding factors:
 ///
-/// - `comm_E1 = MSM(E1, ck.ck[..left]) + h * r_E1`,
-/// - `comm_E2 = MSM(E2, ck.ck[left..left+right]) + h * r_E2`,
+/// - `comm_E1      = MSM(E1, ck.ck[..left])               + h · r_E1`,
+/// - `comm_E2_bind = MSM(E2, ck.ck[left..left+right])     + h · r_E2_bind`,
+/// - `comm_E2_pcs  = MSM(E2, ck.ck[..right])              + h · r_E2_pcs`,
 ///
-/// with blinding-split discipline `r_E1 + r_E2 == W.r_E` so that the
-/// Pedersen-additive identity `comm_E1 + comm_E2 == U.comm_E` holds by
-/// construction.
+/// with blinding-split discipline `r_E1 + r_E2_bind == W.r_E` (preserving
+/// the off-FS Pedersen-additive binding `comm_E1 + comm_E2_bind == U.comm_E`
+/// byte-equal at the group level; Corrigendum #8 (iv-B) carried verbatim)
+/// and `r_E2_pcs` drawn FRESH-INDEPENDENT from `OsRng` (does NOT enter the
+/// binding identity; provides the prefix-basis PCS-opening shape Spartan
+/// expects at `HyperKZG::EE::verify`, `IPA-PC::EE::verify`).
 ///
-/// See module-level documentation for the soundness anchor, generator-
-/// vector-alignment argument, and M.GH7.0.0/0.2 envelope integration.
+/// See module-level documentation for the full Corrigendum #11 soundness
+/// argument, the generator-vector-alignment proof, and the M.GH7.0.1b /
+/// M.GH7.0.2 envelope integration.
+///
+/// # Soundness anchors
+///
+/// - Binding side: Pedersen-1991 MSM-linearity at
+///   `provider/pedersen.rs:285-292` — `commit(ck, v, r) = MSM(v, ck.ck[..v.len()])
+///   + group(ck.h) · r`. The suffix-basis construction for `comm_E2_bind`
+///   uses the zero-padded-vector trick (`[zeros(left) || E2]`) so the
+///   commit machinery selects `ck.ck[..left+right]` and the zero-prefix
+///   contributes zero to the MSM.
+/// - PCS side: standard prefix-basis Pedersen commitment via
+///   `CE::commit(ck, E2, &r_E2_pcs)` at the same `pedersen.rs:285-292` —
+///   selects `ck.ck[..right]` directly. This is the canonical contract
+///   consumed by HyperKZG `EE::verify` (`provider/hyperkzg.rs:1080-...`)
+///   and IPA-PC `EE::verify` (`provider/ipa_pc.rs:286-...`).
 ///
 /// # Panics
 ///
@@ -194,7 +382,7 @@ pub fn split_E_commitments<E: Engine>(
   W: &FoldedWitness<E>,
   _U: &FoldedInstance<E>,
   structure: &Structure<E>,
-) -> (Commitment<E>, Commitment<E>, E::Scalar, E::Scalar)
+) -> SplitECommitments<E>
 where
   E::GE: DlogGroup,
 {
@@ -206,28 +394,68 @@ where
 
   let (E1, E2) = W.E.split_at(structure.left);
 
-  // Blinding-split discipline: r_E1 fresh from OsRng; r_E2 = W.r_E - r_E1.
-  // Preserves Pedersen hiding on both halves independently. The sum
-  // identity r_E1 + r_E2 == W.r_E holds algebraically.
+  // Blinding-split discipline (binding side): r_E1 fresh from OsRng;
+  // r_E2_bind = W.r_E - r_E1. Preserves Pedersen hiding on both halves
+  // independently. The sum identity r_E1 + r_E2_bind == W.r_E holds
+  // algebraically — this is the algebra-level invariant that makes the
+  // off-FS Pedersen-additive binding identity comm_E1 + comm_E2_bind ==
+  // U.comm_E hold byte-equal at the group level.
   let r_E1 = E::Scalar::random(&mut OsRng);
-  let r_E2 = W.r_E - r_E1;
+  let r_E2_bind = W.r_E - r_E1;
 
-  // comm_E1 = MSM(E1, ck.ck[..left]) + h * r_E1.
-  // `CE::commit(ck, v, r)` uses `ck.ck[..v.len()]`, so with `v.len() = left`
-  // this commits against the first `left` generators directly.
+  // Blinding for the PCS-opening side: FRESH-INDEPENDENT from OsRng.
+  // r_E2_pcs is a free degree of freedom — it does NOT enter the binding
+  // identity. The M.GH7.0.1b Σ-protocol equality-of-opening helper is
+  // what ties comm_E2_bind and comm_E2_pcs together at the algebraic
+  // value of E2. Drawing r_E2_pcs fresh from OsRng (rather than reusing
+  // r_E2_bind) is the Corrigendum #11 break of the basis-collision: with
+  // two independent blindings, `comm_E2_bind` and `comm_E2_pcs` are
+  // statistically independent group elements committed to the same E2.
+  //
+  // Falsifier I (RNG-misuse): `r_E2_pcs == r_E2_bind` would collapse this
+  // independence and re-introduce the basis collision (the Σ-protocol at
+  // M.GH7.0.1b would be trivially satisfiable). Surfaced by the
+  // independence-check unit test at 1000-iter ChaCha20Rng granularity.
+  let r_E2_pcs = E::Scalar::random(&mut OsRng);
+
+  // comm_E1 = MSM(E1, ck.ck[..left]) + h · r_E1.
+  // `CE::commit(ck, v, r)` uses `ck.ck[..v.len()]` per
+  // `provider/pedersen.rs:285-292`, so with `v.len() = left` this commits
+  // against the first `left` generators directly. This same group element
+  // is also the prefix-basis PCS-opening shape Spartan expects at
+  // `r_x_low` — no basis divergence on the E1 side.
   let comm_E1 = E::CE::commit(ck, E1, &r_E1);
 
-  // comm_E2 = MSM(E2, ck.ck[left..left+right]) + h * r_E2.
+  // comm_E2_bind = MSM(E2, ck.ck[left..left+right]) + h · r_E2_bind.
   // We construct a length-(left+right) scalar vector `[zeros(left) || E2]`
   // so that `CE::commit` selects `ck.ck[..left+right]` (matching the flat
   // generator slice that `U.comm_E` is committed against). The zero-prefix
   // contributes zero to the MSM, leaving exactly the desired suffix MSM
-  // plus `h * r_E2`.
+  // plus `h · r_E2_bind`. This is the binding-side commitment ONLY —
+  // it is NOT consumed by the Spartan sibling's PCS-opening shape.
   let mut e2_padded = vec![E::Scalar::ZERO; structure.left + structure.right];
   e2_padded[structure.left..].copy_from_slice(E2);
-  let comm_E2 = E::CE::commit(ck, &e2_padded, &r_E2);
+  let comm_E2_bind = E::CE::commit(ck, &e2_padded, &r_E2_bind);
 
-  (comm_E1, comm_E2, r_E1, r_E2)
+  // comm_E2_pcs = MSM(E2, ck.ck[..right]) + h · r_E2_pcs.
+  // Canonical prefix-basis Pedersen commit via `CE::commit(ck, E2, &r)`
+  // with `E2.len() = right`. This is the PCS-opening-side commitment
+  // ONLY — it is consumed by the Spartan sibling
+  // `RelaxedR1CSSNARK::prove_with_T_claim_split_error` as the second
+  // commitment argument (mirroring the sibling-internal test pattern at
+  // `spartan/snark.rs:1824-1825`). It is NOT consumed by the envelope's
+  // off-FS binding check; the Σ-protocol at M.GH7.0.1b is what ties it
+  // back to `comm_E2_bind`.
+  let comm_E2_pcs = E::CE::commit(ck, E2, &r_E2_pcs);
+
+  SplitECommitments {
+    comm_E1,
+    comm_E2_bind,
+    comm_E2_pcs,
+    r_E1,
+    r_E2_bind,
+    r_E2_pcs,
+  }
 }
 
 #[cfg(test)]
@@ -343,48 +571,82 @@ mod tests {
     (ck, structure, U, W)
   }
 
-  /// **Acceptance test** (M.GH7.0.1).
+  /// **Acceptance test (M.GH7.0.1 REWORKED per Corrigendum #11).**
   ///
-  /// Asserts the Pedersen-additive binding `comm_E1 + comm_E2 == U.comm_E`
-  /// byte-equal at the group level, AND the blinding-split discipline
-  /// `r_E1 + r_E2 == W.r_E`, against a satisfying
-  /// `(Structure, FoldedInstance, FoldedWitness)` triple.
+  /// Asserts the **three-commitment** shape produced by
+  /// [`split_E_commitments`]:
   ///
-  /// This is the M.GH7.0.1 acceptance gate — Corrigendum #8 §1.2(a) MSM-
-  /// linearity over the flat `ck.ck` generator vector.
+  /// 1. **Off-FS Pedersen-additive binding** (Corrigendum #8 (iv-B), carried
+  ///    verbatim under the rename `comm_E2 → comm_E2_bind`):
+  ///    `comm_E1 + comm_E2_bind == U.comm_E` byte-equal at the group level.
+  /// 2. **Blinding-split discipline (binding side)**:
+  ///    `r_E1 + r_E2_bind == W.r_E`.
+  /// 3. **PCS-basis assertion (NEW per Corrigendum #11)**: `comm_E2_pcs` is
+  ///    constructed against `ck.ck[..right]` — the canonical prefix basis
+  ///    consumed by HyperKZG / IPA-PC `EE::verify`. Asserted by recomputing
+  ///    `MSM(E2, ck.ck[..right]) + h · r_E2_pcs` independently (via the same
+  ///    `CE::commit(ck, E2, r_E2_pcs)` contract at
+  ///    `provider/pedersen.rs:285-292`) and comparing byte-equal.
+  ///
+  /// This is the M.GH7.0.1 REWORKED acceptance gate — Corrigendum #11
+  /// §1.2(a) three-commitment helper. The previous Corrigendum-#8-only
+  /// signature (returning `(Commitment<E>, Commitment<E>, E::Scalar,
+  /// E::Scalar)`) is SUPERSEDED in implementation by [`SplitECommitments<E>`];
+  /// the binding-side algebra is preserved verbatim.
   #[test]
   #[allow(non_snake_case)]
-  fn m_gh7_0_1_split_E_commitments_pedersen_additive_binding_byte_equal() {
+  fn m_gh7_0_1_split_E_commitments_three_commitments_pedersen_additive_binding_byte_equal() {
     type E = Bn256EngineKZG;
     type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
 
     let (ck, structure, U, W) = build_satisfying_triple::<E, S>();
 
-    let (comm_E1, comm_E2, r_E1, r_E2) = split_E_commitments(&ck, &W, &U, &structure);
+    let result = split_E_commitments(&ck, &W, &U, &structure);
 
-    // Pedersen-additive identity (byte-equal at the group level).
+    // (1) Off-FS Pedersen-additive binding (Corrigendum #8 (iv-B) preserved).
     assert_eq!(
-      comm_E1 + comm_E2,
+      result.comm_E1 + result.comm_E2_bind,
       U.comm_E,
-      "Pedersen-additive identity violated: comm_E1 + comm_E2 != U.comm_E",
+      "Pedersen-additive identity violated: comm_E1 + comm_E2_bind != U.comm_E",
     );
 
-    // Blinding-split discipline.
+    // (2) Blinding-split discipline (binding side).
     assert_eq!(
-      r_E1 + r_E2,
+      result.r_E1 + result.r_E2_bind,
       W.r_E,
-      "Blinding-split discipline violated: r_E1 + r_E2 != W.r_E",
+      "Blinding-split discipline violated: r_E1 + r_E2_bind != W.r_E",
+    );
+
+    // (3) PCS-basis assertion (NEW per Corrigendum #11): `comm_E2_pcs` is
+    // constructed against the prefix basis `ck.ck[..right]` via the
+    // standard `CE::commit(ck, E2, r_E2_pcs)` contract. We independently
+    // recompute the expected commitment from `(E2, r_E2_pcs)` and assert
+    // byte-equal. This pins the SHAPE of `comm_E2_pcs` against
+    // `ck.ck[..right]` rather than any other slice — a reviewer reading
+    // this assertion sees the prefix-basis contract explicitly. The
+    // Σ-protocol at M.GH7.0.1b provides the non-circular tie between
+    // `comm_E2_bind` and `comm_E2_pcs` at the algebraic value of `E2`.
+    let (_E1_slice, E2_slice) = W.E.split_at(structure.left);
+    let expected_comm_E2_pcs: Commitment<E> =
+      <E as Engine>::CE::commit(&ck, E2_slice, &result.r_E2_pcs);
+    assert_eq!(
+      result.comm_E2_pcs, expected_comm_E2_pcs,
+      "PCS-basis assertion violated: comm_E2_pcs != MSM(E2, ck.ck[..right]) + h * r_E2_pcs",
     );
   }
 
   /// **Unit test**: MSM-linearity prefix/suffix decomposition over a
-  /// deterministic ChaCha20Rng-seeded input. Verifies the structural
-  /// identity `MSM(E1, ck.ck[..left]) + MSM(E2, ck.ck[left..left+right])
-  /// == MSM([E1 || E2], ck.ck[..left+right])` against the same flat `ck`
-  /// that the helper consumes.
+  /// deterministic ChaCha20Rng-seeded input. Verifies that the binding-side
+  /// identity `comm_E1 + comm_E2_bind == U.comm_E` and the PCS-side shape
+  /// `comm_E2_pcs == CE::commit(ck, E2, r_E2_pcs)` hold across 1000 random
+  /// `(E1, E2, r_E)` triples — the structural identities hold for every
+  /// input (Pedersen 1991 MSM-linearity over the partitioned `ck.ck`
+  /// generator vector).
   ///
-  /// This is a 1000-iter differential against random `(E1, E2, r_E)`
-  /// triples — the structural identity holds for every input.
+  /// This is the Corrigendum #11 STAGE-0 1000-iter differential threshold
+  /// per `.claude/rules/cryptography.md` — the binding-side algebra +
+  /// the PCS-basis shape are both pinned at the algebra level, separately
+  /// from the Σ-protocol that will tie them in M.GH7.0.1b.
   #[test]
   #[allow(non_snake_case)]
   fn msm_linearity_prefix_suffix_decomposition_byte_equal_1000_iter() {
@@ -427,17 +689,76 @@ mod tests {
         T_lookup: None,
       };
 
-      let (comm_E1, comm_E2, r_E1, r_E2) = split_E_commitments(&ck, &W, &U, &structure);
+      let result = split_E_commitments(&ck, &W, &U, &structure);
 
-      assert_eq!(comm_E1 + comm_E2, U.comm_E);
-      assert_eq!(r_E1 + r_E2, W.r_E);
+      // Binding-side identity: comm_E1 + comm_E2_bind == U.comm_E.
+      assert_eq!(result.comm_E1 + result.comm_E2_bind, U.comm_E);
+      // Binding-side blinding-split: r_E1 + r_E2_bind == W.r_E.
+      assert_eq!(result.r_E1 + result.r_E2_bind, W.r_E);
+
+      // PCS-side shape: comm_E2_pcs == MSM(E2, ck.ck[..right]) + h * r_E2_pcs.
+      let (_E1_slice, E2_slice) = W.E.split_at(structure.left);
+      let expected_comm_E2_pcs: Commitment<E> =
+        <E as Engine>::CE::commit(&ck, E2_slice, &result.r_E2_pcs);
+      assert_eq!(result.comm_E2_pcs, expected_comm_E2_pcs);
+    }
+  }
+
+  /// **Unit test (Falsifier I — Corrigendum #11)**: independence check for
+  /// the PCS-side blinding `r_E2_pcs` vs the binding-side blinding
+  /// `r_E2_bind`.
+  ///
+  /// The Corrigendum #11 break of the basis-collision relies on
+  /// `r_E2_pcs` being statistically independent of `r_E2_bind` — drawn
+  /// fresh from `OsRng` as a free degree of freedom that does NOT enter
+  /// the binding identity. If the helper were to reuse the same RNG draw
+  /// for both (Falsifier I — RNG-misuse), the Σ-protocol at M.GH7.0.1b
+  /// would become trivially satisfiable and the basis-collision would
+  /// re-emerge in a subtle way.
+  ///
+  /// This test runs the helper 1000 times against a stable input and
+  /// asserts `result.r_E2_pcs != result.r_E2_bind` on every iteration.
+  /// With overwhelming probability (≈ 1 − 1000/|F| ≈ 1 − 2^{-244} for
+  /// `Bn256`'s scalar field), the inequality holds for every draw if and
+  /// only if the helper is using independent RNG calls.
+  ///
+  /// **STOP-AND-ASK trigger**: if any iteration collides, halt and
+  /// surface to Halpert — the helper has an RNG-misuse bug.
+  #[test]
+  #[allow(non_snake_case)]
+  fn falsifier_i_r_E2_pcs_independent_from_r_E2_bind_1000_iter() {
+    type E = Bn256EngineKZG;
+    type S = RelaxedR1CSSNARK<E, EvaluationEngine<E>>;
+
+    let (ck, structure, U, W) = build_satisfying_triple::<E, S>();
+
+    // 1000 iterations against a stable input. Each call MUST produce a
+    // fresh independent `r_E2_pcs` distinct from `r_E2_bind`.
+    for iter in 0..1000 {
+      let result = split_E_commitments(&ck, &W, &U, &structure);
+
+      assert_ne!(
+        result.r_E2_pcs, result.r_E2_bind,
+        "Falsifier I — RNG-misuse detected at iter {}: r_E2_pcs == r_E2_bind. \
+         This would collapse Corrigendum #11's basis-collision break and re-introduce \
+         the trivially-satisfiable Σ-protocol failure mode. Halt and inspect the \
+         helper's RNG draws.",
+        iter
+      );
     }
   }
 
   /// **Unit test**: blinding-split sum identity is preserved exactly,
-  /// independent of the random draw of `r_E1`. Asserts the algebraic
-  /// invariant `r_E1 + r_E2 == W.r_E` across distinct invocations (the
-  /// random `r_E1` differs each call; the sum must still equal `W.r_E`).
+  /// independent of the random draws of `r_E1` and `r_E2_pcs`. Asserts:
+  ///
+  /// - the binding-side algebraic invariant `r_E1 + r_E2_bind == W.r_E`
+  ///   across distinct invocations,
+  /// - the binding-side group identity `comm_E1 + comm_E2_bind == U.comm_E`
+  ///   across distinct invocations,
+  /// - both `r_E1` and `r_E2_pcs` are fresh across calls (asserts `OsRng`
+  ///   is being used and not stubbed to a constant — the structural
+  ///   difference from a ChaCha20Rng-reseed-determinism test, which would
+  ///   only apply if the helper accepted a seeded RNG argument).
   #[test]
   #[allow(non_snake_case)]
   fn blinding_split_sum_identity_independent_of_random_draw() {
@@ -446,28 +767,39 @@ mod tests {
 
     let (ck, structure, U, W) = build_satisfying_triple::<E, S>();
 
-    // Multiple draws — each call uses a fresh `r_E1` from OsRng. The sum
-    // identity must hold for every draw, and the Pedersen-additive
-    // identity must also hold (proving the random `r_E1` does not break
-    // the binding).
-    let mut prior_r_E1 = None;
+    // Multiple draws — each call uses fresh `r_E1` and `r_E2_pcs` from
+    // OsRng. The sum identity must hold for every draw, and the
+    // Pedersen-additive identity must also hold (proving the random
+    // draws do not break the binding).
+    let mut prior_r_E1: Option<<E as Engine>::Scalar> = None;
+    let mut prior_r_E2_pcs: Option<<E as Engine>::Scalar> = None;
     for _ in 0..8 {
-      let (comm_E1, comm_E2, r_E1, r_E2) = split_E_commitments(&ck, &W, &U, &structure);
+      let result = split_E_commitments(&ck, &W, &U, &structure);
 
-      assert_eq!(r_E1 + r_E2, W.r_E);
-      assert_eq!(comm_E1 + comm_E2, U.comm_E);
+      assert_eq!(result.r_E1 + result.r_E2_bind, W.r_E);
+      assert_eq!(result.comm_E1 + result.comm_E2_bind, U.comm_E);
 
       // Sanity: across distinct draws, `r_E1` should not be the same
       // value (probability of collision is negligible). This pins the
-      // "fresh random" property of the blinding split.
+      // "fresh random" property of the binding-side blinding split.
       if let Some(prior) = prior_r_E1 {
         assert_ne!(
-          r_E1, prior,
+          result.r_E1, prior,
           "r_E1 should be fresh-random per call (negligible collision probability)",
         );
       }
-      prior_r_E1 = Some(r_E1);
+      prior_r_E1 = Some(result.r_E1);
+
+      // Same property for `r_E2_pcs` — pins that `OsRng` is actually
+      // being consumed for the PCS-side blinding (not stubbed to a
+      // constant).
+      if let Some(prior) = prior_r_E2_pcs {
+        assert_ne!(
+          result.r_E2_pcs, prior,
+          "r_E2_pcs should be fresh-random per call (negligible collision probability)",
+        );
+      }
+      prior_r_E2_pcs = Some(result.r_E2_pcs);
     }
   }
-
 }
