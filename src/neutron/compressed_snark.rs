@@ -81,11 +81,90 @@
 use crate::{
   neutron::relation::{FoldedInstance, FoldedWitness, Structure},
   provider::traits::DlogGroup,
-  traits::{commitment::CommitmentEngineTrait, Engine},
+  traits::{commitment::CommitmentEngineTrait, Engine, TranscriptReprTrait},
   Commitment, CommitmentKey,
 };
 use ff::Field;
 use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
+
+/// M.GH7.0.0b (Corrigendum #10) — envelope-published bridge shape consumed
+/// by the Spartan T-claim sibling `RelaxedR1CSSNARK::prove_with_T_claim_split_error`.
+///
+/// Extends the pre-Corrigendum-#10 `RelaxedR1CSInstance` shape by:
+///
+/// - Splitting `comm_E` into `(comm_E1, comm_E2)` per the Pedersen
+///   MSM-linearity helper at [`split_E_commitments`] (Corrigendum #8 §1.2(a)).
+/// - Carrying the running neutron-form sumcheck claim `T: E::Scalar`
+///   extracted from `FoldedInstance::T` (`relation.rs:254`).
+///
+/// The envelope (M.GH7.0.2) constructs this from
+///   `(r_U: &FoldedInstance<E>, r_W: &FoldedWitness<E>, structure: &Structure<E>)`
+/// by extracting `(comm_W, u, X, T) := (r_U.comm_W, r_U.u, r_U.X.clone(), r_U.T)`,
+/// invoking [`split_E_commitments`] to produce `(comm_E1, comm_E2, r_E1, r_E2)`,
+/// and assembling the [`BridgedNeutronInstance`] from the resulting parts.
+///
+/// # FS-transcript discipline
+///
+/// The Spartan T-claim sibling absorbs `T` STRICTLY BEFORE any outer-sumcheck
+/// challenge is squeezed:
+///
+/// ```text
+///   ts.absorb(b"vk", &vk_digest)
+///   ts.absorb(b"U",  U_bridged)        // ← via TranscriptReprTrait below
+///   ts.absorb(b"T_claim", &[T])        // ← Primitive 5 binding
+///   // NO `tau` squeeze — tensor-form (E1, E2) replaces eq-trick
+///   ...
+/// ```
+///
+/// `T` is NOT in the `to_transcript_bytes` body — it is absorbed under a
+/// distinct label `b"T_claim"` to keep the binding observation explicit at
+/// the audit-firm engagement site (`Frozen-Heart`-class adversary inspecting
+/// the FS log can see exactly when T enters the transcript). The struct's
+/// `to_transcript_bytes` mirrors the existing `RelaxedR1CSInstance` discipline
+/// at `r1cs/mod.rs:1255-1265` for the non-T fields, with `comm_E` replaced
+/// by `(comm_E1, comm_E2)` in flat concatenation order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+#[allow(non_snake_case)]
+pub struct BridgedNeutronInstance<E: Engine> {
+  /// Witness commitment, identity-bridged from `FoldedInstance::comm_W`.
+  pub comm_W: Commitment<E>,
+  /// First half of the rank-1 split-E commitment per Corrigendum #8 §1.2(a):
+  /// `comm_E1 = MSM(E1, ck.ck[..left]) + h * r_E1`.
+  pub comm_E1: Commitment<E>,
+  /// Second half of the rank-1 split-E commitment:
+  /// `comm_E2 = MSM(E2, ck.ck[left..left+right]) + h * r_E2`.
+  pub comm_E2: Commitment<E>,
+  /// Running relaxation scalar, identity-bridged from `FoldedInstance::u`.
+  pub u: E::Scalar,
+  /// Public input vector, identity-bridged from `FoldedInstance::X`.
+  pub X: Vec<E::Scalar>,
+  /// Running neutron-form sumcheck claim, identity-bridged from
+  /// `FoldedInstance::T` (`relation.rs:254`). The fold-step lineage at
+  /// `nifs.rs:519 → relation.rs:748` flows `T_out` from `poly.evaluate(&r_b)
+  /// * eq_rho_r_b.invert()` directly into `U.T` via `U1.fold()` — Falsifier E
+  /// verified-absent at vendor HEAD per Corrigendum #10.
+  pub T: E::Scalar,
+}
+
+impl<E: Engine> TranscriptReprTrait<E::GE> for BridgedNeutronInstance<E> {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    // Mirrors `RelaxedR1CSInstance::to_transcript_bytes` at
+    // `r1cs/mod.rs:1255-1265`, with `comm_E` replaced by the flat
+    // concatenation `comm_E1 || comm_E2`. `T` is absorbed separately
+    // under `b"T_claim"` by the prover/verifier (NOT in this body), to
+    // keep the Primitive 5 binding observation explicit.
+    [
+      self.comm_W.to_transcript_bytes(),
+      self.comm_E1.to_transcript_bytes(),
+      self.comm_E2.to_transcript_bytes(),
+      self.u.to_transcript_bytes(),
+      self.X.as_slice().to_transcript_bytes(),
+    ]
+    .concat()
+  }
+}
 
 /// Pedersen MSM-linearity split-E commitment helper (M.GH7.0.1 per
 /// Corrigendum #8 §1.2(a)).

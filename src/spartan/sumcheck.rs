@@ -506,6 +506,236 @@ impl<E: Engine> SumcheckProof<E> {
     ))
   }
 
+  // ---------------------------------------------------------------------------
+  // M.GH7.0.0b — Spartan neutron-outer sumcheck engine (Corrigendum #10)
+  //
+  // Proves the *neutron-form* claim
+  //   sum_x full_E(x) · (Az(x) · Bz(x) − Cz(x)) = claim
+  // where `full_E[i*left + j] = E2[i] · E1[j]` per Corrigendum #9 (2-A) layout
+  // (matching `vendor/nova/src/neutron/lookup_sumcheck.rs:308-322` byte-for-byte).
+  //
+  // Structurally mirrors `prove_cubic_with_three_inputs` above:
+  //   - degree-3 univariate per round
+  //   - `bind_poly_var_top(&r_i)` per round (TOP/MSB first)
+  //   - claim-per-round accumulator (initialised to the prover's `claim`)
+  //
+  // Two divergences from `prove_cubic_with_three_inputs`:
+  //   (i) weighting polynomial: tensor-form `full_E = E1 ⊗ E2` instead of the
+  //       `EqSumCheckInstance::<E>::new(taus)` built from fresh `tau` squeezes.
+  //       Vendor-grounded by `lookup_sumcheck.rs:46-55` `LookupSumcheckInstance::
+  //       verify_step` at the fold-step granularity analogue (tensor `eq_left ·
+  //       eq_right` weighting with non-zero running claim).
+  //   (ii) residue body: degree-3 `A · B − C` (NO `u`-factor on Cz — Δ2
+  //        absorbed structurally; the slack lives in T).
+  //
+  // Per Corrigendum #9 (3-A) precedent (already used in `prove_with_split_error`
+  // at M.GH7.0.0), the engine materialises `full_E` once at the start as a flat
+  // `MultilinearPolynomial<E::Scalar>` of length `left * right = 2^ell`, then
+  // runs the per-round binding against the flat polynomial. The tensor-form
+  // factorisation is enforced ONLY at the verifier (which reconstructs
+  // `eval_E_combined = eval_E1 · eval_E2` from independently-PCS-opened
+  // evaluations `eval_E1 = E1_MLE(r_x_low)` and `eval_E2 = E2_MLE(r_x_high)`).
+  //
+  // Returns `(proof, r_x, (claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2))`
+  // — five-tuple of final evaluations the Spartan-close sibling needs to
+  // reconstruct `claim_outer_final` and absorb into the post-outer-sumcheck
+  // transcript.
+  // ---------------------------------------------------------------------------
+  /// Prove `sum_x full_E(x) · (Az(x) · Bz(x) − Cz(x)) = claim`, where
+  /// `full_E = E1 ⊗ E2` is the rank-1 tensor product weighting per Corrigendum
+  /// #9 (2-A) layout `full_E[i*left + j] = E2[i] · E1[j]`. Non-zero claims
+  /// supported (the running neutron-form claim `T` from the IVC layer).
+  ///
+  /// See module-level documentation for the soundness anchor (Primitives 1, 2)
+  /// and the structural divergence from `prove_cubic_with_three_inputs`.
+  #[allow(non_snake_case)]
+  pub fn prove_neutron_outer(
+    claim: E::Scalar,
+    E1: &[E::Scalar],
+    E2: &[E::Scalar],
+    poly_Az: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Bz: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Cz: &mut MultilinearPolynomial<E::Scalar>,
+    transcript: &mut E::TE,
+  ) -> Result<
+    (
+      Self,
+      Vec<E::Scalar>,
+      (E::Scalar, E::Scalar, E::Scalar, E::Scalar, E::Scalar),
+    ),
+    NovaError,
+  > {
+    let left = E1.len();
+    let right = E2.len();
+    let num_rounds_total = poly_Az.len().trailing_zeros() as usize;
+    assert_eq!(
+      left * right,
+      poly_Az.len(),
+      "prove_neutron_outer: left*right must equal poly_Az.len() (== num_cons)",
+    );
+    assert_eq!(poly_Az.len(), poly_Bz.len());
+    assert_eq!(poly_Az.len(), poly_Cz.len());
+    assert!(left.is_power_of_two() && right.is_power_of_two());
+
+    // Corrigendum #9 (3-A): materialise `full_E[i*left + j] = E2[i] · E1[j]`
+    // once at the start of the engine. Sumcheck runs UNCHANGED against this
+    // flat polynomial — the rank-1 factorisation is enforced ONLY at the
+    // verifier. Memory cost: `num_cons * 32` bytes parallel to existing
+    // Az/Bz/Cz allocations.
+    let mut poly_E: MultilinearPolynomial<E::Scalar> = {
+      let mut full_E: Vec<E::Scalar> = Vec::with_capacity(left * right);
+      for i in 0..right {
+        for j in 0..left {
+          full_E.push(E2[i] * E1[j]);
+        }
+      }
+      debug_assert_eq!(full_E.len(), left * right);
+      MultilinearPolynomial::new(full_E)
+    };
+
+    // For determinism vs the M.GH7.0.0 binding direction: bind_poly_var_top
+    // binds the TOP (MSB) variable first. Round 0 binds the MSB; under the
+    // flat layout `k = i*left + j` (Corrigendum #9 (2-A)), the TOP ell2 bits
+    // are `i ∈ [0, right)` (E2's outer index). After ell2 rounds, E2's index
+    // is bound; the remaining ell1 rounds bind E1's inner index `j`. The
+    // accumulated `r_x` therefore partitions as
+    //   r_x_high = r_x[..ell2] (top, binds E2),
+    //   r_x_low  = r_x[ell2..] (bottom, binds E1).
+    // The Spartan-close sibling consumes this partition convention verbatim.
+
+    let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds_total);
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::with_capacity(num_rounds_total);
+    let mut claim_per_round = claim;
+
+    for _round in 0..num_rounds_total {
+      // Compute the per-round univariate `g_round(t)` of degree 3:
+      //   g_round(t) = sum_{x∈{0,1}^remaining} E(t,x) · (A(t,x)·B(t,x) − C(t,x))
+      // After the top variable is bound to `t`, each multilinear `P ∈ {E, A, B, C}`
+      // is linear in `t`:
+      //   P(t, x) = P_lo[x] + t · (P_hi[x] − P_lo[x])  =  P_lo[x] + t · dP[x]
+      // The body has degree 3 in `t` (E is degree-1, A·B − C is degree-2;
+      // product is degree-3).
+      //
+      // We evaluate `g_round` at 4 points {0, 1, ∞, −1} to interpolate via
+      // `UniPoly::from_evals_deg3`. Per BDDT-style claim derivation
+      // (used by `prove_cubic_with_three_inputs` above), the value at t=1 is
+      // derived from the running claim: `g_round(1) = claim_per_round − g_round(0)`.
+      // We compute 3 N-scaling sums directly: eval_at_0, leading_coeff (eval@∞),
+      // and eval_at_minus_one.
+      let (eval_0, leading_coeff, eval_neg1) = {
+        let n = poly_Az.len() / 2;
+        debug_assert_eq!(n, poly_E.len() / 2);
+
+        (0..n)
+          .into_par_iter()
+          .map(|i| {
+            let a_lo = poly_Az[i];
+            let b_lo = poly_Bz[i];
+            let c_lo = poly_Cz[i];
+            let e_lo = poly_E[i];
+
+            let a_hi = poly_Az[n + i];
+            let b_hi = poly_Bz[n + i];
+            let c_hi = poly_Cz[n + i];
+            let e_hi = poly_E[n + i];
+
+            // g(0) = E_lo · (A_lo · B_lo − C_lo)
+            let g0 = e_lo * (a_lo * b_lo - c_lo);
+
+            // Leading coefficient (= g(∞)): coefficient of t^3 in
+            //   (e_lo + t·dE) · ((a_lo + t·dA)(b_lo + t·dB) − (c_lo + t·dC))
+            // The Cz part contributes 0 to t^3 (it's only degree 1 in t,
+            // multiplied by E gives degree 2). The A·B·E part contributes
+            // `dE · dA · dB` to t^3.
+            let d_a = a_hi - a_lo;
+            let d_b = b_hi - b_lo;
+            let d_e = e_hi - e_lo;
+            let leading = d_e * d_a * d_b;
+
+            // g(−1): each polynomial at t=−1: P(−1) = P_lo − dP = 2·P_lo − P_hi.
+            let a_m1 = a_lo + a_lo - a_hi;
+            let b_m1 = b_lo + b_lo - b_hi;
+            let c_m1 = c_lo + c_lo - c_hi;
+            let e_m1 = e_lo + e_lo - e_hi;
+            let g_m1 = e_m1 * (a_m1 * b_m1 - c_m1);
+
+            (g0, leading, g_m1)
+          })
+          .reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+          )
+      };
+
+      // g(1) = claim_per_round − g(0) (claim-derivation hint).
+      let evals = vec![
+        eval_0,
+        claim_per_round - eval_0,
+        leading_coeff,
+        eval_neg1,
+      ];
+      let poly = UniPoly::from_evals_deg3(&evals);
+
+      // append the prover's message to the transcript
+      transcript.absorb(b"p", &poly);
+
+      // derive the verifier's challenge for the next round
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+
+      // Set up next round: claim_per_round ← g(r_i)
+      claim_per_round = poly.evaluate(&r_i);
+
+      // Bind all four polynomials at the top variable.
+      rayon::join(
+        || poly_Az.bind_poly_var_top(&r_i),
+        || poly_Bz.bind_poly_var_top(&r_i),
+      );
+      rayon::join(
+        || poly_Cz.bind_poly_var_top(&r_i),
+        || poly_E.bind_poly_var_top(&r_i),
+      );
+    }
+
+    // After `num_rounds_total = ell` rounds, all four polynomials are reduced
+    // to a single scalar each.
+    let claim_Az = poly_Az[0];
+    let claim_Bz = poly_Bz[0];
+    let claim_Cz = poly_Cz[0];
+
+    // Reconstruct the tensor-form factorisation at the verifier's evaluation
+    // point. Per Corrigendum #9 (2-A): r_x_high = r[..ell2] (binds E2);
+    // r_x_low = r[ell2..] (binds E1). We do not need ell1/ell2 inside the
+    // engine — left.log_2() and right.log_2() recover them.
+    let ell2 = right.trailing_zeros() as usize;
+    let r_x_high = &r[..ell2];
+    let r_x_low = &r[ell2..];
+
+    let eval_E1 = MultilinearPolynomial::new(E1.to_vec()).evaluate(r_x_low);
+    let eval_E2 = MultilinearPolynomial::new(E2.to_vec()).evaluate(r_x_high);
+
+    // Soundness consistency check (debug-only): the flat reduction matches the
+    // tensor reconstruction. This is the Primitive 2 byte-equivalence at the
+    // single evaluation point that the M.GH7.0.0b weighting differential
+    // already covers across 1000-iter RNG sweeps. Kept as `debug_assert!` so
+    // release-mode parity tests are not slowed.
+    debug_assert_eq!(
+      poly_E[0],
+      eval_E1 * eval_E2,
+      "Corrigendum #9 (2-A) tensor factorisation byte-divergence at end of \
+       outer-sumcheck — Falsifier D"
+    );
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      (claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2),
+    ))
+  }
+
   /// Prove sum_x eq(tau,x) * sum_i alpha_i * (A_i(x)*B_i(x) - C_i(x)) = claim
   /// for K instance triples sharing the same sumcheck structure.
   ///

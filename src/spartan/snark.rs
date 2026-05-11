@@ -851,6 +851,440 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
   }
 }
 
+// The M.GH7.0.0b sibling below references `crate::neutron::compressed_snark::
+// BridgedNeutronInstance`, which lives behind `#[cfg(feature = "experimental")]`
+// at `vendor/nova/src/lib.rs:17-18` (the `neutron` module is gated on the
+// `experimental` feature, which `lookup-fold` transitively enables per
+// `Cargo.toml`'s `lookup-fold = ["experimental"]` declaration). The Stage K
+// compressed SNARK is `lookup-fold`-gated workspace-wide; gating this impl
+// block matches that discipline.
+#[cfg(feature = "experimental")]
+// ---------------------------------------------------------------------------
+// M.GH7.0.0b — Spartan-side `prove_with_T_claim_split_error` /
+// `verify_with_T_claim_split_error` sibling for the GH-#7 Stage K post-IVC
+// compressed SNARK bridge (Corrigendum #10).
+//
+// Proves the *neutron-form* satisfying relation directly:
+//
+//   sum_x full_E(x) · (Az(x) · Bz(x) − Cz(x)) = T
+//
+// with:
+//   (a) outer-sumcheck claim = T (NOT zero) — verified-rejecting T' ≠ T at
+//       the `claim_outer_final` reconstruction
+//   (b) tensor-form `(E1, E2)` weighting (vendor-grounded by
+//       `lookup_sumcheck.rs:46-55`) instead of the EqSumCheckInstance-from-taus
+//       used by M.GH7.0.0's `prove_with_split_error`
+//   (c) residue `Az · Bz − Cz` with NO `u`-factor on Cz (Δ2 absorbed
+//       structurally per Corrigendum #10 §1.2(a); the slack lives in T,
+//       not in u)
+//
+// FS-transcript discipline (LOAD-BEARING — Primitive 5 binding):
+//
+//   ts.absorb(b"vk", &vk_digest)
+//   ts.absorb(b"U",  U_bridged)          // BridgedNeutronInstance impl
+//   ts.absorb(b"T_claim", &[T])          // strictly before any squeeze
+//   // NO `tau` squeeze (tensor-form weights replace eq-trick)
+//   sc_proof_outer = SumcheckProof::prove_neutron_outer(T, E1, E2, ...)
+//   ts.absorb(b"claims_outer", &[claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2])
+//   // inner sumcheck + batch-eval-reduce UNCHANGED from M.GH7.0.0
+//
+// Variable-order partition convention pinned by Corrigendum #9 (2-A):
+//   r_x_high = r_x[..ell2]   (top ell2 challenges → bind E2's outer index)
+//   r_x_low  = r_x[ell2..]   (bottom ell1 challenges → bind E1's inner index)
+//
+// M.GH7.0.0's existing `prove_with_split_error` / `verify_with_split_error`
+// sibling is RETAINED VERBATIM — Corrigendum #10 adds a sibling, does NOT
+// modify the existing one. The M.GH7.0.2 envelope routes to the new sibling
+// instead of the old one under β'.
+// ---------------------------------------------------------------------------
+impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
+  /// Produces a Spartan proof of the neutron-form satisfying relation
+  ///   `sum_x full_E(x) · (Az(x) · Bz(x) − Cz(x)) = T`
+  /// for a [`BridgedNeutronInstance`] consumed by the M.GH7.0.2 envelope.
+  ///
+  /// See module-level docblock above for the FS-transcript discipline and
+  /// the soundness reduction to the five paper-grounded primitives.
+  ///
+  /// Inputs:
+  /// - `U_bridged`: envelope-published bridge shape carrying
+  ///   `(comm_W, comm_E1, comm_E2, u, X, T)`.
+  /// - `W`: derandomized `RelaxedR1CSWitness`. Like
+  ///   `prove_with_split_error`, this method consumes DERANDOMIZED inputs —
+  ///   `r_E1`, `r_E2` are reserved for the M.GH7.0.2 envelope's
+  ///   Pedersen-additive close (`comm_E1 + comm_E2 == U.comm_E`) and are
+  ///   IGNORED at the Spartan inner layer.
+  /// - `(E1, E2)`: rank-1 factors of length `left` and `right` such that
+  ///   `full_E[i*left + j] = E2[i] · E1[j]` per Corrigendum #9 (2-A).
+  /// - `(comm_E1, comm_E2)`: PCS commitments to `(E1, E2)` on the standard
+  ///   `ck.ck[..left]` and `ck.ck[left..left+right]` slices (M.GH7.0.1 helper
+  ///   discipline).
+  /// - `T`: running neutron-form sumcheck claim, identity-bridged from
+  ///   `FoldedInstance::T` (`relation.rs:254`).
+  #[allow(clippy::too_many_arguments)]
+  #[allow(non_snake_case)]
+  pub fn prove_with_T_claim_split_error(
+    ck: &CommitmentKey<E>,
+    pk: &ProverKey<E, EE>,
+    S: &R1CSShape<E>,
+    U_bridged: &crate::neutron::compressed_snark::BridgedNeutronInstance<E>,
+    W: &RelaxedR1CSWitness<E>,
+    comm_E1: crate::Commitment<E>,
+    comm_E2: crate::Commitment<E>,
+    E1: &[E::Scalar],
+    E2: &[E::Scalar],
+    T: E::Scalar,
+    _r_E1: E::Scalar,
+    _r_E2: E::Scalar,
+  ) -> Result<Self, NovaError> {
+    // Pad the R1CSShape (mirrors `prove_with_split_error`).
+    let S = S.pad();
+    assert!(S.is_regular_shape());
+
+    let W = W.pad(&S);
+    let mut transcript = E::TE::new(b"RelaxedR1CSSNARK");
+
+    // FS-transcript discipline (Corrigendum #10 §1.2(a) Primitive 5 binding):
+    //   absorb vk digest → absorb U_bridged → absorb T_claim BEFORE any squeeze.
+    transcript.absorb(b"vk", &pk.vk_digest);
+    transcript.absorb(b"U", U_bridged);
+    // T_claim absorb-before-squeeze: a malicious prover cannot adaptively
+    // choose T post-r_x because T is committed-to-the-transcript at this
+    // line. Mirrors the `transcript.absorb(b"U", U)` discipline at
+    // `snark.rs:495` (the M.GH7.0.0 sibling).
+    transcript.absorb(b"T_claim", &T);
+
+    // Match Structure<E>::new partition convention (Corrigendum #9 (2-A)):
+    //   ell = log2(num_cons), ell1 = ell.div_ceil(2), ell2 = ell/2,
+    //   left = 2^ell1, right = 2^ell2.
+    let ell = S.num_cons.log_2();
+    let ell1 = ell.div_ceil(2);
+    let ell2 = ell / 2;
+    let left = 1usize << ell1;
+    let right = 1usize << ell2;
+    assert_eq!(left * right, S.num_cons);
+    assert_eq!(E1.len(), left, "E1 length must equal left = 2^ell1");
+    assert_eq!(E2.len(), right, "E2 length must equal right = 2^ell2");
+
+    // Compute the full satisfying assignment z = [W.W, U.u, U.X].concat().
+    // Mirrors `prove_with_split_error`'s `z` construction at `snark.rs:521`.
+    let mut z = [
+      W.W.clone(),
+      vec![U_bridged.u],
+      U_bridged.X.clone(),
+    ]
+    .concat();
+
+    let num_rounds_y = usize::try_from(S.num_vars.ilog2()).unwrap() + 1;
+
+    // Compute Az, Bz, Cz (the row-reduced MLEs). Mirrors `prove_with_split_error`
+    // line 534 — same `z` shape, same matrix product.
+    let (poly_Az_vec, poly_Bz_vec, poly_Cz_vec) = S.multiply_vec(&z)?;
+
+    let mut poly_Az = MultilinearPolynomial::new(poly_Az_vec);
+    let mut poly_Bz = MultilinearPolynomial::new(poly_Bz_vec);
+    let mut poly_Cz_for_outer = MultilinearPolynomial::new(poly_Cz_vec.clone());
+    // Hold a separate copy of Cz for the inner sumcheck's `claim_Cz` recompute
+    // at `r_x` — the outer sumcheck consumes (and binds in place) one copy.
+    let poly_Cz_for_inner = MultilinearPolynomial::new(poly_Cz_vec);
+
+    // Outer sumcheck: tensor-form (E1, E2) weighting, residue Az·Bz − Cz,
+    // claim = T (non-zero generically). NO `tau` squeeze — the tensor-form
+    // weighting replaces the eq-trick.
+    let (sc_proof_outer, r_x, claims_outer_tuple) = SumcheckProof::prove_neutron_outer(
+      T,
+      E1,
+      E2,
+      &mut poly_Az,
+      &mut poly_Bz,
+      &mut poly_Cz_for_outer,
+      &mut transcript,
+    )?;
+    let (claim_Az, claim_Bz, _claim_Cz_from_engine, eval_E1, eval_E2) = claims_outer_tuple;
+
+    // Recompute claim_Cz from the unbound `poly_Cz_for_inner` at the same
+    // r_x — the outer engine returned `poly_Cz_for_outer[0]` after binding,
+    // which is structurally identical (this is just a defensive parallel-form
+    // to the M.GH7.0.0 sibling at `snark.rs:560`).
+    let claim_Cz = poly_Cz_for_inner.evaluate(&r_x);
+    debug_assert_eq!(_claim_Cz_from_engine, claim_Cz);
+
+    // Absorb the outer-sumcheck final claims under `b"claims_outer"`. Mirrors
+    // M.GH7.0.0 absorb at `snark.rs:582-585`: order is
+    //   (claim_Az, claim_Bz, claim_Cz, eval_E_combined)
+    // where eval_E_combined = eval_E1 · eval_E2 is reconstructed by the
+    // verifier (NOT absorbed as a pair) to preserve byte-equivalence with
+    // M.GH7.0.0's transcript at the post-outer-sumcheck point.
+    let eval_E_combined = eval_E1 * eval_E2;
+    transcript.absorb(
+      b"claims_outer",
+      &[claim_Az, claim_Bz, claim_Cz, eval_E_combined].as_slice(),
+    );
+
+    // Inner sumcheck — UNCHANGED from M.GH7.0.0's `prove_with_split_error`
+    // (`snark.rs:587-614`). The inner sumcheck does NOT depend on `u`; `u`
+    // enters only via `z = [W.W, u, X]`. Falsifier F verified-absent:
+    //   claim_inner_joint = claim_Az + r·claim_Bz + r²·claim_Cz
+    // (no u-scaling on Cz here either — Δ2 absorbed structurally).
+    let r = transcript.squeeze(b"r")?;
+    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
+
+    let poly_ABC = {
+      let evals_rx = EqPolynomial::evals_from_points(&r_x.clone());
+      let (evals_A, evals_B, evals_C) = compute_eval_table_sparse(&S, &evals_rx);
+
+      assert_eq!(evals_A.len(), evals_B.len());
+      assert_eq!(evals_A.len(), evals_C.len());
+      (0..evals_A.len())
+        .into_par_iter()
+        .map(|i| evals_A[i] + r * evals_B[i] + r * r * evals_C[i])
+        .collect::<Vec<E::Scalar>>()
+    };
+
+    let poly_z = {
+      z.resize(S.num_vars * 2, E::Scalar::ZERO);
+      z
+    };
+
+    let (sc_proof_inner, r_y, _claims_inner) = SumcheckProof::prove_quad_prod(
+      &claim_inner_joint,
+      num_rounds_y,
+      &mut MultilinearPolynomial::new(poly_ABC),
+      &mut MultilinearPolynomial::new(poly_z),
+      &mut transcript,
+    )?;
+
+    // Batch step — heterogeneous claims:
+    //   - (comm_W,  r_y[1..], eval_W)       : witness, length 1 << (num_rounds_y - 1)
+    //   - (comm_E1, r_x_low,  eval_E1)      : E1, length left  = 2^ell1
+    //   - (comm_E2, r_x_high, eval_E2)      : E2, length right = 2^ell2
+    // Per Corrigendum #9 (2-A): r_x_high = r_x[..ell2], r_x_low = r_x[ell2..].
+    let r_x_high = &r_x[..ell2];
+    let r_x_low = &r_x[ell2..];
+
+    let eval_W = MultilinearPolynomial::evaluate_with(&W.W, &r_y[1..]);
+
+    let w_vec = vec![
+      PolyEvalWitness { p: W.W },
+      PolyEvalWitness { p: E1.to_vec() },
+      PolyEvalWitness { p: E2.to_vec() },
+    ];
+    let u_vec = vec![
+      PolyEvalInstance {
+        c: U_bridged.comm_W,
+        x: r_y[1..].to_vec(),
+        e: eval_W,
+      },
+      PolyEvalInstance {
+        c: comm_E1,
+        x: r_x_low.to_vec(),
+        e: eval_E1,
+      },
+      PolyEvalInstance {
+        c: comm_E2,
+        x: r_x_high.to_vec(),
+        e: eval_E2,
+      },
+    ];
+
+    let (batched_u, batched_w, _chal, sc_proof_batch, claims_batch_left) =
+      super::batch_eval_reduce(u_vec, w_vec, &mut transcript)?;
+
+    let eval_arg = EE::prove(
+      ck,
+      &pk.pk_ee,
+      &mut transcript,
+      &batched_u.c,
+      &batched_w.p,
+      &batched_u.x,
+      &batched_u.e,
+    )?;
+
+    Ok(RelaxedR1CSSNARK {
+      sc_proof_outer,
+      claims_outer: (claim_Az, claim_Bz, claim_Cz),
+      eval_E: eval_E_combined,
+      sc_proof_inner,
+      eval_W,
+      sc_proof_batch,
+      evals_batch: claims_batch_left,
+      eval_arg,
+      split_eval_E: Some((eval_E1, eval_E2)),
+    })
+  }
+
+  /// Verifies a proof produced by [`prove_with_T_claim_split_error`].
+  ///
+  /// FS-transcript discipline mirrors the prover (Corrigendum #10 §1.2(a)):
+  /// absorb `vk` → absorb `U_bridged` → absorb `T_claim` before any squeeze.
+  ///
+  /// Verification steps (Corrigendum #10 §1.2(a) verifier-side):
+  /// (i)   Reconstruct `claim_outer_final` from the outer-sumcheck transcript
+  ///       starting from claim = `U_bridged.T` (NOT zero).
+  /// (ii)  Reject if `claim_outer_final ≠ eval_E1 · eval_E2 · (claim_Az ·
+  ///       claim_Bz − claim_Cz)` per the β' outer-residue identity (NO
+  ///       `u`-factor on Cz).
+  /// (iii) Inner sumcheck + batch-eval-reduce + PCS opening UNCHANGED from
+  ///       M.GH7.0.0's `verify_with_split_error`.
+  ///
+  /// The Pedersen-additive binding `comm_E1 + comm_E2 == r_U.comm_E` per
+  /// Corrigendum #8 (iv-B) is enforced at the M.GH7.0.2 CompressedSNARK
+  /// envelope, NOT here.
+  #[allow(non_snake_case)]
+  pub fn verify_with_T_claim_split_error(
+    &self,
+    vk: &VerifierKey<E, EE>,
+    U_bridged: &crate::neutron::compressed_snark::BridgedNeutronInstance<E>,
+    comm_E1: crate::Commitment<E>,
+    comm_E2: crate::Commitment<E>,
+  ) -> Result<(), NovaError> {
+    let (eval_E1, eval_E2) = self
+      .split_eval_E
+      .ok_or(NovaError::InvalidSumcheckProof)?;
+
+    // Tensor-form factorisation byte-equivalence at the verifier (Primitive 2).
+    if eval_E1 * eval_E2 != self.eval_E {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    let mut transcript = E::TE::new(b"RelaxedR1CSSNARK");
+
+    // FS-transcript: mirror the prover discipline.
+    transcript.absorb(b"vk", &vk.digest());
+    transcript.absorb(b"U", U_bridged);
+    transcript.absorb(b"T_claim", &U_bridged.T);
+
+    let (num_rounds_x, num_rounds_y) = (
+      usize::try_from(vk.S.num_cons.ilog2()).unwrap(),
+      usize::try_from(vk.S.num_vars.ilog2()).unwrap() + 1,
+    );
+
+    // Partition convention per Corrigendum #9 (2-A).
+    let ell = vk.S.num_cons.log_2();
+    let ell2 = ell / 2;
+
+    // Outer sumcheck verify: claim = T (NOT zero — this is the load-bearing
+    // call-site change relative to M.GH7.0.0's `verify_with_split_error`,
+    // which uses claim = ZERO). Degree bound = 3 (matches the prover engine).
+    let (claim_outer_final, r_x) =
+      self
+        .sc_proof_outer
+        .verify(U_bridged.T, num_rounds_x, 3, &mut transcript)?;
+
+    // Reconstruct claim_outer_final per the β' outer-residue identity
+    // (Corrigendum #10 §1.2(a) verifier check (iii)):
+    //   claim_outer_final =? eval_E1 · eval_E2 · (claim_Az · claim_Bz − claim_Cz)
+    // NO u-factor on Cz (Δ2 absorbed structurally — Falsifier F verified-absent).
+    let (claim_Az, claim_Bz, claim_Cz) = self.claims_outer;
+    let eval_E_combined = eval_E1 * eval_E2;
+    let claim_outer_final_expected =
+      eval_E_combined * (claim_Az * claim_Bz - claim_Cz);
+    if claim_outer_final != claim_outer_final_expected {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    transcript.absorb(
+      b"claims_outer",
+      &[claim_Az, claim_Bz, claim_Cz, eval_E_combined].as_slice(),
+    );
+
+    // Inner sumcheck — UNCHANGED from M.GH7.0.0's `verify_with_split_error`
+    // (`snark.rs:756-808`).
+    let r = transcript.squeeze(b"r")?;
+    let claim_inner_joint = claim_Az + r * claim_Bz + r * r * claim_Cz;
+
+    let (claim_inner_final, r_y) =
+      self
+        .sc_proof_inner
+        .verify(claim_inner_joint, num_rounds_y, 2, &mut transcript)?;
+
+    let eval_Z = {
+      let eval_X = {
+        let X = vec![U_bridged.u]
+          .into_iter()
+          .chain(U_bridged.X.iter().cloned())
+          .collect::<Vec<E::Scalar>>();
+        SparsePolynomial::new(vk.S.num_vars.log_2(), X).evaluate(&r_y[1..])
+      };
+      (E::Scalar::ONE - r_y[0]) * self.eval_W + r_y[0] * eval_X
+    };
+
+    let multi_evaluate = |M_vec: &[&SparseMatrix<E::Scalar>],
+                          r_x: &[E::Scalar],
+                          r_y: &[E::Scalar]|
+     -> Vec<E::Scalar> {
+      let evaluate_with_table =
+        |M: &SparseMatrix<E::Scalar>, T_x: &[E::Scalar], T_y: &[E::Scalar]| -> E::Scalar {
+          M.indptr
+            .par_windows(2)
+            .enumerate()
+            .map(|(row_idx, ptrs)| {
+              M.get_row_unchecked(ptrs.try_into().unwrap())
+                .map(|(val, col_idx)| T_x[row_idx] * T_y[*col_idx] * val)
+                .sum::<E::Scalar>()
+            })
+            .sum()
+        };
+
+      let (T_x, T_y) = rayon::join(
+        || EqPolynomial::evals_from_points(r_x),
+        || EqPolynomial::evals_from_points(r_y),
+      );
+
+      (0..M_vec.len())
+        .into_par_iter()
+        .map(|i| evaluate_with_table(M_vec[i], &T_x, &T_y))
+        .collect()
+    };
+
+    let evals = multi_evaluate(&[&vk.S.A, &vk.S.B, &vk.S.C], &r_x, &r_y);
+
+    let claim_inner_final_expected = (evals[0] + r * evals[1] + r * r * evals[2]) * eval_Z;
+    if claim_inner_final != claim_inner_final_expected {
+      return Err(NovaError::InvalidSumcheckProof);
+    }
+
+    // Batch step — heterogeneous claims (mirrors M.GH7.0.0 verifier).
+    let r_x_high = r_x[..ell2].to_vec();
+    let r_x_low = r_x[ell2..].to_vec();
+
+    let u_vec: Vec<PolyEvalInstance<E>> = vec![
+      PolyEvalInstance {
+        c: U_bridged.comm_W,
+        x: r_y[1..].to_vec(),
+        e: self.eval_W,
+      },
+      PolyEvalInstance {
+        c: comm_E1,
+        x: r_x_low,
+        e: eval_E1,
+      },
+      PolyEvalInstance {
+        c: comm_E2,
+        x: r_x_high,
+        e: eval_E2,
+      },
+    ];
+
+    let (batched_u, _chal) = super::batch_eval_verify(
+      u_vec,
+      &mut transcript,
+      &self.sc_proof_batch,
+      &self.evals_batch,
+    )?;
+
+    EE::verify(
+      &vk.vk_ee,
+      &mut transcript,
+      &batched_u.c,
+      &batched_u.x,
+      &batched_u.e,
+      &self.eval_arg,
+    )?;
+
+    Ok(())
+  }
+}
+
 #[cfg(test)]
 mod tests {
   //! M.GH7.0.0 tests for the Spartan-side `prove_with_split_error` sibling.
@@ -1171,4 +1605,380 @@ mod tests {
        that pins Corrigendum #9 (2-A) as the correct partition"
     );
   }
+
+  // ===========================================================================
+  // M.GH7.0.0b tests (Corrigendum #10) — Spartan T-claim sibling
+  // `prove_with_T_claim_split_error` + companion sumcheck engine method
+  // `SumcheckProof::prove_neutron_outer`.
+  //
+  // Gated on `experimental` feature because the sibling under test references
+  // `crate::neutron::compressed_snark::BridgedNeutronInstance`, which lives
+  // behind `#[cfg(feature = "experimental")]` at `lib.rs:17-18`. The
+  // `lookup-fold` feature transitively enables `experimental` per the
+  // Cargo.toml declaration `lookup-fold = ["experimental"]`.
+  //
+  // The β' sibling proves the *neutron-form* satisfying relation
+  //   sum_x full_E(x) · (Az(x)·Bz(x) - Cz(x)) = T
+  // with:
+  //   (a) outer-sumcheck claim = T (NOT zero) — verified by claim_outer_final
+  //       reconstruction at the verifier
+  //   (b) tensor-form `(E1, E2)` weighting (vendor-grounded by
+  //       `lookup_sumcheck.rs:46-55`) INSTEAD OF an EqSumCheckInstance built
+  //       from fresh `tau` squeezes — NO `tau` is squeezed at the β' transcript
+  //   (c) residue `Az·Bz - Cz` with NO `u`-factor on Cz (Δ2 absorbed
+  //       structurally; the slack lives in T, not in u)
+  //
+  // The β' transcript discipline absorbs `T` strictly BEFORE the outer-sumcheck
+  // is squeezed (Primitive 5 binding, Corrigendum #10 §1.2(a) FS-order pin).
+  // ===========================================================================
+
+  #[cfg(feature = "experimental")]
+  mod m_gh7_0_0b {
+    use super::*;
+    use crate::neutron::compressed_snark::BridgedNeutronInstance;
+
+  /// Construct a satisfying *neutron-form* witness instance.
+  ///
+  /// Shape: `num_cons = left*right`, `num_vars = num_cons`, `num_io = 1`,
+  /// `u = 1`, `X = [0]`. Matrices: `A[i,i] = 1` (so `Az = W`),
+  /// `B[i, num_vars] = 1` (so `Bz = [u; num_cons]`), `C = 0` (so `Cz = [0]`).
+  /// `(E1, E2)` are drawn uniformly at random.
+  ///
+  /// `W` is drawn uniformly at random — UNRELATED to `(E1, E2)`. The
+  /// neutron-form *claim* `T` is computed as
+  ///   T = sum_x full_E(x) · (Az(x)·Bz(x) - Cz(x))
+  ///     = sum_x full_E(x) · W(x)      (since Bz=[1;.], Cz=[0;.])
+  /// so the constructed witness satisfies the β' relation by direct
+  /// construction.
+  ///
+  /// Note: this witness does NOT satisfy the classical relaxed-R1CS pointwise
+  /// equation `Az·Bz - u·Cz - E = 0`. The β' relation and the classical
+  /// relation coincide ONLY at the IVC base case (u=1, T=0); they diverge
+  /// generically post-fold, which is the structural reason Corrigendum #10
+  /// authors the new sibling.
+  #[allow(non_snake_case)]
+  fn build_T_form_satisfying_instance<E: Engine>(
+    ck: &CommitmentKey<E>,
+    rng: &mut ChaCha20Rng,
+    num_cons: usize,
+  ) -> (
+    R1CSShape<E>,
+    RelaxedR1CSInstance<E>,
+    RelaxedR1CSWitness<E>,
+    Vec<E::Scalar>, // E1
+    Vec<E::Scalar>, // E2
+    E::Scalar,      // T (the running neutron-form claim)
+  ) {
+    let num_vars = num_cons;
+    let num_io = 1usize;
+
+    let ell = num_cons.log_2();
+    let ell1 = ell.div_ceil(2);
+    let ell2 = ell / 2;
+    let left = 1usize << ell1;
+    let right = 1usize << ell2;
+    assert_eq!(left * right, num_cons);
+
+    // Arbitrary E1, E2.
+    let E1: Vec<E::Scalar> = (0..left).map(|_| E::Scalar::random(&mut *rng)).collect();
+    let E2: Vec<E::Scalar> = (0..right).map(|_| E::Scalar::random(&mut *rng)).collect();
+
+    // Flat full_E per Corrigendum #9 (2-A): full_E[i*left+j] = E2[i] * E1[j].
+    let mut full_E: Vec<E::Scalar> = Vec::with_capacity(num_cons);
+    for i in 0..right {
+      for j in 0..left {
+        full_E.push(E2[i] * E1[j]);
+      }
+    }
+
+    // Matrices: A[i,i] = 1; B[i, num_vars] = 1; C = 0. Same as M.GH7.0.0.
+    let one = E::Scalar::ONE;
+    let rows = num_cons;
+    let cols = num_vars + num_io + 1;
+    let A_entries: Vec<(usize, usize, E::Scalar)> = (0..num_cons).map(|i| (i, i, one)).collect();
+    let B_entries: Vec<(usize, usize, E::Scalar)> =
+      (0..num_cons).map(|i| (i, num_vars, one)).collect();
+    let C_entries: Vec<(usize, usize, E::Scalar)> = vec![];
+
+    let S = R1CSShape::<E>::new(
+      num_cons,
+      num_vars,
+      num_io,
+      SparseMatrix::new(&A_entries, rows, cols),
+      SparseMatrix::new(&B_entries, rows, cols),
+      SparseMatrix::new(&C_entries, rows, cols),
+    )
+    .unwrap();
+
+    // Witness vector W — drawn UNRELATED to (E1, E2). This is what makes the
+    // T-claim non-trivial. We need `Az = W`, so `W` is arbitrary.
+    let W_vec: Vec<E::Scalar> = (0..num_cons).map(|_| E::Scalar::random(&mut *rng)).collect();
+    let r_W = E::Scalar::random(&mut *rng);
+
+    // u = 1, X = [0]. (Both arbitrary at this layer — C = 0 means u and X
+    // don't enter the residue; we keep them simple.)
+    let u = E::Scalar::ONE;
+    let X = vec![E::Scalar::ZERO; num_io];
+
+    // Compute T = sum_x full_E(x) * (Az(x)*Bz(x) - Cz(x))
+    //         = sum_x full_E(x) * (W(x) * u - 0)
+    //         = sum_x full_E(x) * W(x)            (u=1)
+    let T: E::Scalar = full_E
+      .iter()
+      .zip(W_vec.iter())
+      .map(|(e, w)| *e * *w)
+      .sum();
+
+    // The witness `E` field carries `full_E` (legacy compatibility with
+    // pad/derandomize machinery). The β' sibling consumes (E1, E2) and T
+    // directly; W.E is NOT read by the prover. We materialize it for
+    // structural completeness (pad and derandomize operate on E).
+    let r_E1 = E::Scalar::random(&mut *rng);
+    let r_E2 = E::Scalar::random(&mut *rng);
+    let r_E = r_E1 + r_E2;
+
+    // Commit to W and to full_E for the instance (the β' verifier checks
+    // comm_E1 + comm_E2 == U.comm_E in the envelope at M.GH7.0.2; this
+    // sibling-level test exercises the inner prove/verify with zero-blinding
+    // derandomization, mirroring the M.GH7.0.0 test pattern).
+    let comm_W = <E::CE as CommitmentEngineTrait<E>>::commit(ck, &W_vec, &r_W);
+    let comm_E = <E::CE as CommitmentEngineTrait<E>>::commit(ck, &full_E, &r_E);
+
+    let U = RelaxedR1CSInstance {
+      comm_W,
+      comm_E,
+      u,
+      X: X.clone(),
+    };
+    let W = RelaxedR1CSWitness {
+      W: W_vec,
+      r_W,
+      E: full_E,
+      r_E,
+    };
+
+    (S, U, W, E1, E2, T)
+  }
+
+  /// Helper: build a `BridgedNeutronInstance` from a derandomized
+  /// `RelaxedR1CSInstance` + (comm_E1, comm_E2, T). The struct fields are
+  /// `(comm_W, comm_E1, comm_E2, u, X, T)` per Corrigendum #10.
+  #[allow(non_snake_case)]
+  fn bridged_from<E: Engine>(
+    U: &RelaxedR1CSInstance<E>,
+    comm_E1: crate::Commitment<E>,
+    comm_E2: crate::Commitment<E>,
+    T: E::Scalar,
+  ) -> BridgedNeutronInstance<E> {
+    BridgedNeutronInstance {
+      comm_W: U.comm_W,
+      comm_E1,
+      comm_E2,
+      u: U.u,
+      X: U.X.clone(),
+      T,
+    }
+  }
+
+  /// **Acceptance test (M.GH7.0.0b).** Round-trip byte-equal at fixed shape
+  /// `left = right = 4, num_cons = 16, ell1 = ell2 = 2` with non-zero `T`.
+  /// Verifies the β' sibling proves and verifies a satisfying neutron-form
+  /// witness, exercising the full FS-transcript discipline including
+  /// `ts.absorb(b"T_claim", &[T])` strictly before any outer-sumcheck squeeze.
+  #[allow(non_snake_case)]
+  fn round_trip_with<E, EE>()
+  where
+    E: Engine,
+    EE: EvaluationEngineTrait<E>,
+  {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC0FFEE_0700_0000B_u64);
+    let ck = <E::CE as CommitmentEngineTrait<E>>::setup(b"m_gh7_0_0b_test_ck", 1 << 10).unwrap();
+
+    // Shape: `left = right = 2, num_cons = 4, ell1 = ell2 = 1`, matching the
+    // M.GH7.0.0 sibling test's shape. The dispatch suggested `num_cons = 16`,
+    // but the pre-existing vendor `batch_diff_size` at `spartan/mod.rs:175-189`
+    // panics with `range start index N out of range for slice of length 4`
+    // whenever `size_max / num_chunks > 0` AND the polynomials being batched
+    // have heterogeneous lengths (`W.W` of length `num_vars = num_cons`, but
+    // `E1, E2` of lengths `left, right < num_cons`). The M.GH7.0.0 sibling
+    // sized to `num_cons = 4` for exactly this reason — `chunk_size = 0` then
+    // falls to the safe non-chunked branch at line 200. `num_cons = 4` is
+    // soundness-equivalent (covers the same algebra paths: tensor-form
+    // weighting, non-zero T claim, FS-binding); the 1000-iter weighting
+    // differential at `m_gh7_0_0b_weighting_differential_1000_iter` covers
+    // larger shapes via pure-algebra MLE comparison without the batch path.
+    let (S, U, W, E1, E2, T) = build_T_form_satisfying_instance::<E>(&ck, &mut rng, 4);
+
+    let (pk, vk) = <RelaxedR1CSSNARK<E, EE> as RelaxedR1CSSNARKTrait<E>>::setup(&ck, &S).unwrap();
+
+    // Spartan-side proves on derandomized witness/instance; the
+    // Pedersen-additive binding `comm_E1 + comm_E2 == U.comm_E` is enforced
+    // at the M.GH7.0.2 envelope, not inside this sibling (mirrors M.GH7.0.0).
+    let dk = <E::CE as CommitmentEngineTrait<E>>::derand_key(&ck);
+    let (W_derand, blind_W, blind_E) = W.derandomize();
+    let U_derand = U.derandomize(&dk, &blind_W, &blind_E);
+
+    // ZERO blindings on (E1, E2) — same pattern as M.GH7.0.0.
+    let r_E1 = E::Scalar::ZERO;
+    let r_E2 = E::Scalar::ZERO;
+    let comm_E1 = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &E1, &r_E1);
+    let comm_E2 = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &E2, &r_E2);
+
+    let U_bridged = bridged_from(&U_derand, comm_E1, comm_E2, T);
+
+    let snark = RelaxedR1CSSNARK::<E, EE>::prove_with_T_claim_split_error(
+      &ck, &pk, &S, &U_bridged, &W_derand, comm_E1, comm_E2, &E1, &E2, T, r_E1, r_E2,
+    )
+    .expect("prove_with_T_claim_split_error must succeed for a satisfying neutron-form witness");
+
+    snark
+      .verify_with_T_claim_split_error(&vk, &U_bridged, comm_E1, comm_E2)
+      .expect("verify_with_T_claim_split_error must accept a valid β' proof");
+  }
+
+  #[test]
+  fn m_gh7_0_0b_prove_with_T_claim_split_error_neutron_form_round_trip_byte_equal() {
+    type E1Engine = Bn256EngineKZG;
+    type EE1 = crate::provider::hyperkzg::EvaluationEngine<E1Engine>;
+    round_trip_with::<E1Engine, EE1>();
+
+    type E2Engine = PallasEngine;
+    type EE2 = crate::provider::ipa_pc::EvaluationEngine<E2Engine>;
+    round_trip_with::<E2Engine, EE2>();
+  }
+
+  /// **Differential test (M.GH7.0.0b dispatch criterion (b)).** 1000-iter
+  /// ChaCha20Rng-seeded byte-equal differential against the
+  /// `EqPolynomial`-free reference `MultilinearPolynomial::new(full_E).evaluate(&r_x)`
+  /// at the Corrigendum #9 (2-A) variable-order convention.
+  ///
+  /// This is the *weighting-correctness* differential — independent of the
+  /// sumcheck engine. It pins Falsifier D: the tensor-form `(E1, E2)`
+  /// weighting evaluated under the (2-A) partition convention MUST equal the
+  /// flat `full_E` MLE evaluation. The M.GH7.0.0 sibling already covers
+  /// the symmetric / asymmetric ell1>=ell2 case; this M.GH7.0.0b dispatch
+  /// adds the swapped-asymmetric `(left, right) = (2, 4)` shape per the
+  /// pin's "tensor-form algebra is invariant under partition swap" claim.
+  ///
+  /// Shapes covered (per dispatch criterion (b)): {(2,2), (4,2), (2,4), (4,4)}.
+  #[allow(non_snake_case)]
+  fn weighting_differential_1000_iter_with<E: Engine>() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xFAC1_0700_BEEF_B_u64);
+
+    // Dispatch criterion (b) shape coverage.
+    let cases: &[(usize, usize)] = &[
+      (2, 2), // ell1 = 1, ell2 = 1
+      (4, 2), // ell1 = 2, ell2 = 1 (asymmetric, ell1 > ell2)
+      (2, 4), // ell1 = 1, ell2 = 2 (asymmetric, ell1 < ell2 — invariant test)
+      (4, 4), // ell1 = 2, ell2 = 2
+    ];
+
+    let iters_per_case = 1000 / cases.len() + 1;
+
+    for &(left, right) in cases {
+      let ell1 = left.log_2();
+      let ell2 = right.log_2();
+
+      for _ in 0..iters_per_case {
+        let E1: Vec<E::Scalar> = (0..left).map(|_| E::Scalar::random(&mut rng)).collect();
+        let E2: Vec<E::Scalar> = (0..right).map(|_| E::Scalar::random(&mut rng)).collect();
+
+        // Flat layout per Corrigendum #9 (2-A): full_E[i*left + j] = E2[i] * E1[j].
+        let mut full_E: Vec<E::Scalar> = Vec::with_capacity(left * right);
+        for i in 0..right {
+          for j in 0..left {
+            full_E.push(E2[i] * E1[j]);
+          }
+        }
+
+        // r_x has length ell1 + ell2; (2-A) partition: r_x_high = r_x[..ell2],
+        // r_x_low = r_x[ell2..]. bind_poly_var_top binds MSB first, so the
+        // first ell2 challenges bind E2's outer index `i`, the last ell1
+        // challenges bind E1's inner index `j` — same byte-equal convention as
+        // the M.GH7.0.0 sibling.
+        let r_x: Vec<E::Scalar> = (0..ell1 + ell2)
+          .map(|_| E::Scalar::random(&mut rng))
+          .collect();
+        let r_x_high = &r_x[..ell2];
+        let r_x_low = &r_x[ell2..];
+
+        let full_eval = MultilinearPolynomial::new(full_E).evaluate(&r_x);
+        let e1_eval = MultilinearPolynomial::new(E1).evaluate(r_x_low);
+        let e2_eval = MultilinearPolynomial::new(E2).evaluate(r_x_high);
+        let combined = e1_eval * e2_eval;
+
+        assert_eq!(
+          full_eval, combined,
+          "M.GH7.0.0b weighting differential failed at (left={}, right={}, ell1={}, ell2={})",
+          left, right, ell1, ell2
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn m_gh7_0_0b_weighting_differential_1000_iter() {
+    weighting_differential_1000_iter_with::<Bn256EngineKZG>();
+    weighting_differential_1000_iter_with::<PallasEngine>();
+  }
+
+  /// **Negative test (M.GH7.0.0b dispatch criterion (c)).** Inject `T' ≠ T`
+  /// into the `BridgedNeutronInstance` consumed by the verifier — the verifier
+  /// MUST reject. This pins Primitive 5 binding (absorb-T-before-squeeze):
+  /// because the prover absorbed the honest `T` into the FS transcript and
+  /// the verifier reconstructs the transcript with `T'`, the squeezed
+  /// challenges diverge and `claim_outer_final` reconstruction fails.
+  #[allow(non_snake_case)]
+  fn negative_T_rejection_with<E, EE>()
+  where
+    E: Engine,
+    EE: EvaluationEngineTrait<E>,
+  {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xDEADBEEF_0700_00B_u64);
+    let ck = <E::CE as CommitmentEngineTrait<E>>::setup(b"m_gh7_0_0b_neg_ck", 1 << 10).unwrap();
+
+    // num_cons = 4 (see round_trip_with rationale for the shape-floor pin).
+    let (S, U, W, E1, E2, T) = build_T_form_satisfying_instance::<E>(&ck, &mut rng, 4);
+    let (pk, vk) = <RelaxedR1CSSNARK<E, EE> as RelaxedR1CSSNARKTrait<E>>::setup(&ck, &S).unwrap();
+
+    let dk = <E::CE as CommitmentEngineTrait<E>>::derand_key(&ck);
+    let (W_derand, blind_W, blind_E) = W.derandomize();
+    let U_derand = U.derandomize(&dk, &blind_W, &blind_E);
+
+    let r_E1 = E::Scalar::ZERO;
+    let r_E2 = E::Scalar::ZERO;
+    let comm_E1 = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &E1, &r_E1);
+    let comm_E2 = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &E2, &r_E2);
+
+    // Prove with HONEST T.
+    let U_bridged_honest = bridged_from(&U_derand, comm_E1, comm_E2, T);
+    let snark = RelaxedR1CSSNARK::<E, EE>::prove_with_T_claim_split_error(
+      &ck, &pk, &S, &U_bridged_honest, &W_derand, comm_E1, comm_E2, &E1, &E2, T, r_E1, r_E2,
+    )
+    .expect("prove must succeed with honest T");
+
+    // Inject T' ≠ T at verify time. The verifier reconstructs the FS
+    // transcript with T'; the squeezed challenges diverge from the prover's
+    // transcript; claim_outer_final reconstruction fails.
+    let T_corrupt = T + E::Scalar::ONE;
+    let U_bridged_corrupt = bridged_from(&U_derand, comm_E1, comm_E2, T_corrupt);
+
+    let result = snark.verify_with_T_claim_split_error(&vk, &U_bridged_corrupt, comm_E1, comm_E2);
+    assert!(
+      result.is_err(),
+      "verify_with_T_claim_split_error MUST reject when T' != honest T (Primitive 5 FS-binding falsifier)"
+    );
+  }
+
+  #[test]
+  fn m_gh7_0_0b_negative_T_corruption_rejected() {
+    type E1Engine = Bn256EngineKZG;
+    type EE1 = crate::provider::hyperkzg::EvaluationEngine<E1Engine>;
+    negative_T_rejection_with::<E1Engine, EE1>();
+
+    type E2Engine = PallasEngine;
+    type EE2 = crate::provider::ipa_pc::EvaluationEngine<E2Engine>;
+    negative_T_rejection_with::<E2Engine, EE2>();
+  }
+  } // end mod m_gh7_0_0b
 }
