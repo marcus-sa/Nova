@@ -44,6 +44,36 @@ pub struct SumcheckProof<E: Engine> {
   compressed_polys: Vec<CompressedUniPoly<E::Scalar>>,
 }
 
+/// Per-table evaluation tuple returned by
+/// [`SumcheckProof::prove_neutron_outer_with_logup`] (GH-#7 M.GH7.4a, Corrigendum #16).
+///
+/// Each field is the value of the corresponding per-table multilinear polynomial
+/// at the outer-sumcheck challenge `r_x` (i.e., the polynomial bound through all
+/// `ell = log2(num_cons)` rounds). The M.GH7.4b dispatch consumes these as
+/// `PolyEvalInstance::e` values when extending the batch-eval-reduce u_vec/w_vec.
+///
+/// All seven polynomials are bound to length 1 after the outer sumcheck; the
+/// engine reads `poly[0]` for each (mirroring how the R1CS-side
+/// `(claim_Az, claim_Bz, claim_Cz)` are recovered at `sumcheck.rs:703-705`).
+#[derive(Clone, Debug)]
+#[allow(non_snake_case)]
+pub struct PerTableOuterEvals<F: ff::PrimeField> {
+  /// Value of the witness polynomial `w_j(r_x)`.
+  pub eval_w: F,
+  /// Value of the timestamp polynomial `ts_j(r_x)`.
+  pub eval_ts: F,
+  /// Value of the witness-side inverse polynomial `inv_w_j(r_x)`.
+  pub eval_inv_w: F,
+  /// Value of the table-side inverse polynomial `inv_t_j(r_x)`.
+  pub eval_inv_t: F,
+  /// Value of the table-data polynomial `T_j(r_x)`.
+  pub eval_T: F,
+  /// Value of the witness-side eq-factor `eq_w_j(r_x)`.
+  pub eval_eq_w: F,
+  /// Value of the table-side eq-factor `eq_t_j(r_x)`.
+  pub eval_eq_t: F,
+}
+
 impl<E: Engine> SumcheckProof<E> {
   /// Creates a new `SumcheckProof` from compressed univariate polynomials.
   pub fn new(compressed_polys: Vec<CompressedUniPoly<E::Scalar>>) -> Self {
@@ -733,6 +763,516 @@ impl<E: Engine> SumcheckProof<E> {
       },
       r,
       (claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2),
+    ))
+  }
+
+  // ---------------------------------------------------------------------------
+  // GH-#7 M.GH7.4a (Corrigendum #16) — Spartan-close outer-sumcheck SIBLING with
+  // per-table LogUp (A)+(B) residue composition.
+  //
+  // Algebra (Corrigendum #16 Finding B + Finding C):
+  //
+  //   Outer claim:
+  //     T = sum_x [ full_E(x) · (Az(x)·Bz(x) − Cz(x))
+  //              + Σ_j eq_w_j(x) · (inv_w_j(x)·(w_j(x) + r_logup_j) − 1)
+  //              + Σ_j eq_t_j(x) · (inv_t_j(x)·(T_j(x) + r_logup_j) − ts_j(x))  ]
+  //
+  //   On honestly-constructed LogUp inputs (`inv_w_j[i] = 1/(w_j[i] + r_logup_j)`,
+  //   `inv_t_j[i] = ts_j[i]/(T_j[i] + r_logup_j)`), each (A) and (B) summand is
+  //   identically zero (the inner factor vanishes pointwise on the hypercube), so
+  //   the running claim collapses to the R1CS-side `T` carried in from
+  //   `FoldedInstance::T` — the per-table additive contribution is zero by the
+  //   honest-LogUp construction (see Haböck eprint 2022/1530 §3 (A)+(B) identities;
+  //   `vendor/nova/src/neutron/lookup_sumcheck.rs:240-243` documents the same
+  //   pointwise-zero collapse at fold-step granularity).
+  //
+  //   Per-round degree (Finding C disposition: degree-3 under additive composition):
+  //     - R1CS-side body:     eq_w-factor=full_E·(Az·Bz − Cz) is degree-3 in `t`
+  //       (full_E degree-1, Az·Bz degree-2, Cz degree-1 — degree-1×degree-2 = 3).
+  //     - (A) per-table body: eq_w_j(t)·(inv_w_j(t)·(w_j(t) + r) − 1) is degree-3
+  //       (eq_w_j degree-1; inv_w_j·(w_j+r) degree-2; minus 1 is degree-2;
+  //       degree-1×degree-2 = degree-3).
+  //     - (B) per-table body: eq_t_j(t)·(inv_t_j(t)·(T_j(t) + r) − ts_j(t)) is
+  //       degree-3 (symmetric to (A); subtracting a degree-1 from a degree-2 is
+  //       still degree-2; degree-1×degree-2 = degree-3).
+  //     - Additive composition of degree-3 terms is degree-3.
+  //
+  //   Per-round evaluation point set `{0, 1, ∞, −1}` (same 4 points as
+  //   `prove_neutron_outer`); `g(1) = claim_per_round − g(0)` reconstructed via
+  //   the BDDT-style sumcheck claim hint.
+  //
+  //   Per-table variable partition (Finding F disposition): the caller passes
+  //   per-table polynomials `(w_j, ts_j, inv_w_j, inv_t_j, T_j)` and per-table
+  //   eq-factors `(eq_w_j, eq_t_j)` PRE-FLATTENED onto the R1CS variable space at
+  //   length `num_cons = left * right`. Per-round binding via
+  //   `bind_poly_var_top` applies in parallel to ALL polynomials (R1CS-side AND
+  //   per-table) — the Corrigendum #9 (2-A) `r_x_high`/`r_x_low` partition is
+  //   preserved verbatim for the R1CS-side `full_E` factorisation; per-table
+  //   polys are additive residue terms and do NOT factor through E1/E2.
+  //
+  //   (C)-identity per table reduces to a per-table inner-sumcheck batched-eval
+  //   claim per Corrigendum #16 Finding B. NOT closed by this method — closed
+  //   at M.GH7.4b via the extended `batch_eval_reduce` machinery.
+  //
+  // Returns (proof, r_x, claims_outer_with_logup) where
+  //   claims_outer_with_logup = (
+  //     claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2,
+  //     per_table_outer_evals: Vec<PerTableOuterEvals>,
+  //   )
+  // and `PerTableOuterEvals { eval_w_j, eval_ts_j, eval_inv_w_j, eval_inv_t_j,
+  // eval_T_j, eval_eq_w_j, eval_eq_t_j }` is the post-binding value of each
+  // per-table polynomial at `r_x`. These per-table evals are the inputs the
+  // M.GH7.4b dispatch wires into `batch_eval_reduce` for PCS-opening; M.GH7.4a
+  // returns them but does not consume them at the Spartan-side batch.
+  //
+  // STOP-AND-ASK disposition (Corrigendum #16 §5.5 row M.GH7.4a):
+  //   Gate #1 (sibling vs extend-in-place): SIBLING — `prove_neutron_outer` at
+  //     `sumcheck.rs:552-737` is preserved verbatim, M.GH7.0.0b STAGE-0
+  //     byte-equivalence guaranteed.
+  //   Gate #2 (degree-3 empirical close): algebra-verified at degree-3 above;
+  //     empirically closed by the M.GH7.4a acceptance test below
+  //     (`m_gh7_4a_prove_neutron_outer_with_logup_degree_3_additive_composition_closes_correctly`).
+  //   Gate #3 (per-table variable partition): resolved via flat embedding
+  //     onto R1CS variable space (length `num_cons` per per-table poly); caller
+  //     at M.GH7.4c performs the lift; per-round binding applies uniformly via
+  //     `bind_poly_var_top`. Corrigendum #9 (2-A) partition preserved verbatim.
+  // ---------------------------------------------------------------------------
+
+  /// Prove the M.GH7.4 unified outer-sumcheck claim
+  ///   `sum_x g(x) = claim`
+  /// where
+  ///   `g(x) = full_E(x)·(Az(x)·Bz(x) − Cz(x))
+  ///         + Σ_j eq_w_j(x)·(inv_w_j(x)·(w_j(x) + r_logup_j) − 1)
+  ///         + Σ_j eq_t_j(x)·(inv_t_j(x)·(T_j(x) + r_logup_j) − ts_j(x))`
+  /// under simple additive composition per Corrigendum #16 Finding B (no gamma-RLC).
+  ///
+  /// See module-level documentation above for the soundness anchor and the
+  /// per-round degree-3 derivation under additive composition. See `sumcheck.rs`
+  /// module documentation for the engine-level primitives.
+  ///
+  /// ## Inputs
+  ///
+  /// - `claim`: the running unified outer-sumcheck claim `T` (R1CS-side T;
+  ///   per-table contribution is zero on honest LogUp inputs by construction).
+  /// - `(E1, E2)`: R1CS-side rank-1 tensor factors of length `left`, `right`
+  ///   per Corrigendum #9 (2-A).
+  /// - `(poly_Az, poly_Bz, poly_Cz)`: R1CS-side MLEs of length `num_cons = left*right`.
+  /// - `per_table_eq_w[j]`, `per_table_eq_t[j]`: per-table eq-factors pre-flattened
+  ///   onto the R1CS variable space, length `num_cons` each (Finding F disposition).
+  /// - `per_table_inv_w[j]`, `per_table_inv_t[j]`, `per_table_w[j]`,
+  ///   `per_table_ts[j]`, `per_table_T[j]`: per-table polynomial data
+  ///   pre-flattened onto the R1CS variable space, length `num_cons` each.
+  /// - `r_logup_per_table[j]`: per-table LogUp challenge, squeezed at envelope-side
+  ///   BEFORE the Spartan-close transcript begins (preserving Corrigendum #11
+  ///   envelope-Spartan FS isolation — per-table `r_logup_j` are scalar inputs
+  ///   here, NOT transcript squeezes).
+  /// - `transcript`: the Spartan-close FS transcript (already absorbed `vk`, `U`,
+  ///   `T_claim` per Corrigendum #10 §1.2(a) discipline).
+  ///
+  /// ## Output
+  ///
+  /// `(proof, r_x, (claim_Az, claim_Bz, claim_Cz, eval_E1, eval_E2,
+  ///   per_table_outer_evals))` where `per_table_outer_evals[j]` is a
+  /// `PerTableOuterEvals` carrying the seven per-table polynomial values at `r_x`.
+  #[allow(clippy::too_many_arguments)]
+  #[allow(non_snake_case)]
+  pub fn prove_neutron_outer_with_logup(
+    claim: E::Scalar,
+    E1: &[E::Scalar],
+    E2: &[E::Scalar],
+    poly_Az: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Bz: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Cz: &mut MultilinearPolynomial<E::Scalar>,
+    per_table_eq_w: &[Vec<E::Scalar>],
+    per_table_eq_t: &[Vec<E::Scalar>],
+    per_table_inv_w: &[Vec<E::Scalar>],
+    per_table_inv_t: &[Vec<E::Scalar>],
+    per_table_w: &[Vec<E::Scalar>],
+    per_table_ts: &[Vec<E::Scalar>],
+    per_table_T: &[Vec<E::Scalar>],
+    r_logup_per_table: &[E::Scalar],
+    transcript: &mut E::TE,
+  ) -> Result<
+    (
+      Self,
+      Vec<E::Scalar>,
+      (
+        E::Scalar,
+        E::Scalar,
+        E::Scalar,
+        E::Scalar,
+        E::Scalar,
+        Vec<PerTableOuterEvals<E::Scalar>>,
+      ),
+    ),
+    NovaError,
+  > {
+    let left = E1.len();
+    let right = E2.len();
+    let num_cons = left * right;
+    let num_rounds_total = poly_Az.len().trailing_zeros() as usize;
+
+    // Shape coherence — R1CS-side. Mirrors `prove_neutron_outer` at
+    // `sumcheck.rs:571-578` byte-for-byte.
+    assert_eq!(
+      num_cons,
+      poly_Az.len(),
+      "prove_neutron_outer_with_logup: left*right must equal poly_Az.len() (== num_cons)",
+    );
+    assert_eq!(poly_Az.len(), poly_Bz.len());
+    assert_eq!(poly_Az.len(), poly_Cz.len());
+    assert!(left.is_power_of_two() && right.is_power_of_two());
+
+    // Shape coherence — per-table (Finding F flat-embedding disposition).
+    // All per-table polys live on the R1CS variable space at length `num_cons`.
+    let k = r_logup_per_table.len();
+    assert_eq!(
+      per_table_eq_w.len(),
+      k,
+      "per_table_eq_w cardinality must equal k = r_logup_per_table.len()",
+    );
+    assert_eq!(per_table_eq_t.len(), k);
+    assert_eq!(per_table_inv_w.len(), k);
+    assert_eq!(per_table_inv_t.len(), k);
+    assert_eq!(per_table_w.len(), k);
+    assert_eq!(per_table_ts.len(), k);
+    assert_eq!(per_table_T.len(), k);
+    for j in 0..k {
+      assert_eq!(
+        per_table_eq_w[j].len(), num_cons,
+        "per_table_eq_w[{}] must be pre-flattened to num_cons = {} (Corrigendum #16 Finding F)",
+        j, num_cons,
+      );
+      assert_eq!(per_table_eq_t[j].len(), num_cons);
+      assert_eq!(per_table_inv_w[j].len(), num_cons);
+      assert_eq!(per_table_inv_t[j].len(), num_cons);
+      assert_eq!(per_table_w[j].len(), num_cons);
+      assert_eq!(per_table_ts[j].len(), num_cons);
+      assert_eq!(per_table_T[j].len(), num_cons);
+    }
+
+    // Materialise `full_E` once at the start (Corrigendum #9 (3-A)). Same shape
+    // as `prove_neutron_outer:585-594` byte-for-byte.
+    let mut poly_E: MultilinearPolynomial<E::Scalar> = {
+      let mut full_E: Vec<E::Scalar> = Vec::with_capacity(num_cons);
+      for i in 0..right {
+        for j in 0..left {
+          full_E.push(E2[i] * E1[j]);
+        }
+      }
+      debug_assert_eq!(full_E.len(), num_cons);
+      MultilinearPolynomial::new(full_E)
+    };
+
+    // Wrap per-table polynomials in `MultilinearPolynomial` so we can apply
+    // `bind_poly_var_top` per round in parallel with the R1CS-side polys.
+    let mut polys_eq_w: Vec<MultilinearPolynomial<E::Scalar>> = per_table_eq_w
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_eq_t: Vec<MultilinearPolynomial<E::Scalar>> = per_table_eq_t
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_inv_w: Vec<MultilinearPolynomial<E::Scalar>> = per_table_inv_w
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_inv_t: Vec<MultilinearPolynomial<E::Scalar>> = per_table_inv_t
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_w: Vec<MultilinearPolynomial<E::Scalar>> = per_table_w
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_ts: Vec<MultilinearPolynomial<E::Scalar>> = per_table_ts
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+    let mut polys_T: Vec<MultilinearPolynomial<E::Scalar>> = per_table_T
+      .iter()
+      .map(|v| MultilinearPolynomial::new(v.clone()))
+      .collect();
+
+    let mut r: Vec<E::Scalar> = Vec::with_capacity(num_rounds_total);
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::with_capacity(num_rounds_total);
+    let mut claim_per_round = claim;
+
+    for _round in 0..num_rounds_total {
+      // Compute the per-round univariate `g_round(t)` of degree 3 under additive
+      // composition. We evaluate at `{0, ∞, −1}` directly; `g(1)` is reconstructed
+      // from the running claim via `g(1) = claim_per_round − g(0)` per the
+      // BDDT-style sumcheck hint (mirrors `prove_neutron_outer:670-676`).
+      //
+      // After binding the top variable to `t`, each multilinear `P` is linear:
+      //   P(t, x) = P_lo[x] + t · (P_hi[x] − P_lo[x])  =  P_lo[x] + t · dP[x]
+      //
+      // We exploit the additive structure: the per-round sum is
+      //   g(t) = sum_x [ R1CS_body(t, x) + Σ_j A_body_j(t, x) + Σ_j B_body_j(t, x) ]
+      // We sum over `x` inside the half-hypercube (`n = poly_Az.len() / 2`) in
+      // parallel, accumulating (eval_0, leading, eval_neg1) per residue family.
+
+      let n = poly_Az.len() / 2;
+      debug_assert_eq!(n, poly_E.len() / 2);
+      for j in 0..k {
+        debug_assert_eq!(polys_eq_w[j].len() / 2, n);
+        debug_assert_eq!(polys_eq_t[j].len() / 2, n);
+        debug_assert_eq!(polys_inv_w[j].len() / 2, n);
+        debug_assert_eq!(polys_inv_t[j].len() / 2, n);
+        debug_assert_eq!(polys_w[j].len() / 2, n);
+        debug_assert_eq!(polys_ts[j].len() / 2, n);
+        debug_assert_eq!(polys_T[j].len() / 2, n);
+      }
+
+      // -----------------------------------------------------------------------
+      // R1CS-side contribution — mirrors `prove_neutron_outer:625-668` exactly.
+      // -----------------------------------------------------------------------
+      let (r1cs_eval_0, r1cs_leading, r1cs_eval_neg1) = (0..n)
+        .into_par_iter()
+        .map(|i| {
+          let a_lo = poly_Az[i];
+          let b_lo = poly_Bz[i];
+          let c_lo = poly_Cz[i];
+          let e_lo = poly_E[i];
+
+          let a_hi = poly_Az[n + i];
+          let b_hi = poly_Bz[n + i];
+          let c_hi = poly_Cz[n + i];
+          let e_hi = poly_E[n + i];
+
+          let g0 = e_lo * (a_lo * b_lo - c_lo);
+
+          let d_a = a_hi - a_lo;
+          let d_b = b_hi - b_lo;
+          let d_e = e_hi - e_lo;
+          let leading = d_e * d_a * d_b;
+
+          let a_m1 = a_lo + a_lo - a_hi;
+          let b_m1 = b_lo + b_lo - b_hi;
+          let c_m1 = c_lo + c_lo - c_hi;
+          let e_m1 = e_lo + e_lo - e_hi;
+          let g_m1 = e_m1 * (a_m1 * b_m1 - c_m1);
+
+          (g0, leading, g_m1)
+        })
+        .reduce(
+          || (E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO),
+          |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+        );
+
+      // -----------------------------------------------------------------------
+      // Per-table (A) and (B) contributions — additive composition (Finding B).
+      //
+      // (A) per j: eq_w_j(t,x) · (inv_w_j(t,x) · (w_j(t,x) + r_logup_j) − 1)
+      // (B) per j: eq_t_j(t,x) · (inv_t_j(t,x) · (T_j(t,x) + r_logup_j) − ts_j(t,x))
+      //
+      // Per-round degree-3 derivation (Finding C):
+      //   eq · (inv · (poly + r) − const)
+      //     = eq · (inv·poly + inv·r − const)
+      // After binding to `t`, each base poly is degree-1 in `t`. The product
+      // `inv(t)·poly(t)` is degree-2; `inv(t)·r` is degree-1; sum is degree-2;
+      // minus a degree-1 (`ts_j` for (B)) or const-1 (for (A)) keeps it degree-2;
+      // multiplied by `eq(t)` (degree-1) gives degree-3.
+      //
+      // Eval-point closed-form values:
+      //   - g(0)   = eq_lo · (inv_lo·(poly_lo + r) − sub_lo)
+      //   - g(−1): P(−1) = 2·P_lo − P_hi for every base poly P, then compose.
+      //   - g(∞) = leading coefficient of t^3 in the expansion.
+      //     The cubic-in-t expansion of eq(t)·(inv(t)·(poly(t)+r) − sub(t)) is
+      //       eq(t)·inv(t)·poly(t)  −  eq(t)·(sub(t) − r·inv(t))
+      //     The first term is degree 1×1×1=3, with leading coefficient
+      //       d_eq · d_inv · d_poly
+      //     The second term is degree 1×1=2 (NO t^3 contribution).
+      //     For (A): `sub(t) − r·inv(t) = 1 − r·inv(t)` (sub is the constant 1);
+      //     for (B): `sub(t) − r·inv(t) = ts(t) − r·inv(t)`. Both are degree ≤ 2.
+      //   So `leading = d_eq · d_inv · d_poly` for both (A) and (B).
+      // -----------------------------------------------------------------------
+      let mut per_table_eval_0 = E::Scalar::ZERO;
+      let mut per_table_leading = E::Scalar::ZERO;
+      let mut per_table_eval_neg1 = E::Scalar::ZERO;
+
+      for j in 0..k {
+        let r_j = r_logup_per_table[j];
+
+        // -------- (A) per j: eq_w_j · (inv_w_j · (w_j + r_j) − 1) -------------
+        let (a_eval_0, a_leading, a_eval_neg1) = (0..n)
+          .into_par_iter()
+          .map(|i| {
+            let eq_lo = polys_eq_w[j][i];
+            let iw_lo = polys_inv_w[j][i];
+            let w_lo = polys_w[j][i];
+
+            let eq_hi = polys_eq_w[j][n + i];
+            let iw_hi = polys_inv_w[j][n + i];
+            let w_hi = polys_w[j][n + i];
+
+            // g(0) = eq_lo · (iw_lo · (w_lo + r_j) − 1)
+            let g0 = eq_lo * (iw_lo * (w_lo + r_j) - E::Scalar::ONE);
+
+            // leading (g(∞)) = d_eq · d_iw · d_w
+            let d_eq = eq_hi - eq_lo;
+            let d_iw = iw_hi - iw_lo;
+            let d_w = w_hi - w_lo;
+            let leading = d_eq * d_iw * d_w;
+
+            // g(−1): each P(−1) = 2·P_lo − P_hi
+            let eq_m1 = eq_lo + eq_lo - eq_hi;
+            let iw_m1 = iw_lo + iw_lo - iw_hi;
+            let w_m1 = w_lo + w_lo - w_hi;
+            let g_m1 = eq_m1 * (iw_m1 * (w_m1 + r_j) - E::Scalar::ONE);
+
+            (g0, leading, g_m1)
+          })
+          .reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+          );
+
+        per_table_eval_0 += a_eval_0;
+        per_table_leading += a_leading;
+        per_table_eval_neg1 += a_eval_neg1;
+
+        // -------- (B) per j: eq_t_j · (inv_t_j · (T_j + r_j) − ts_j) ----------
+        let (b_eval_0, b_leading, b_eval_neg1) = (0..n)
+          .into_par_iter()
+          .map(|i| {
+            let eq_lo = polys_eq_t[j][i];
+            let it_lo = polys_inv_t[j][i];
+            let T_lo = polys_T[j][i];
+            let ts_lo = polys_ts[j][i];
+
+            let eq_hi = polys_eq_t[j][n + i];
+            let it_hi = polys_inv_t[j][n + i];
+            let T_hi = polys_T[j][n + i];
+            let ts_hi = polys_ts[j][n + i];
+
+            // g(0) = eq_lo · (it_lo · (T_lo + r_j) − ts_lo)
+            let g0 = eq_lo * (it_lo * (T_lo + r_j) - ts_lo);
+
+            // leading (g(∞)) = d_eq · d_it · d_T
+            let d_eq = eq_hi - eq_lo;
+            let d_it = it_hi - it_lo;
+            let d_T = T_hi - T_lo;
+            let leading = d_eq * d_it * d_T;
+
+            // g(−1)
+            let eq_m1 = eq_lo + eq_lo - eq_hi;
+            let it_m1 = it_lo + it_lo - it_hi;
+            let T_m1 = T_lo + T_lo - T_hi;
+            let ts_m1 = ts_lo + ts_lo - ts_hi;
+            let g_m1 = eq_m1 * (it_m1 * (T_m1 + r_j) - ts_m1);
+
+            (g0, leading, g_m1)
+          })
+          .reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+          );
+
+        per_table_eval_0 += b_eval_0;
+        per_table_leading += b_leading;
+        per_table_eval_neg1 += b_eval_neg1;
+      }
+
+      // -----------------------------------------------------------------------
+      // Combine R1CS-side + per-table additive composition into the per-round
+      // univariate (Finding B disposition: no gamma-RLC).
+      // -----------------------------------------------------------------------
+      let eval_0 = r1cs_eval_0 + per_table_eval_0;
+      let leading_coeff = r1cs_leading + per_table_leading;
+      let eval_neg1 = r1cs_eval_neg1 + per_table_eval_neg1;
+
+      // Reconstruct g(1) from running claim per BDDT-style hint.
+      let evals = vec![
+        eval_0,
+        claim_per_round - eval_0,
+        leading_coeff,
+        eval_neg1,
+      ];
+      let poly = UniPoly::from_evals_deg3(&evals);
+
+      // Append prover's message; derive next-round challenge.
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+
+      claim_per_round = poly.evaluate(&r_i);
+
+      // Bind all polynomials at the top variable. R1CS-side bound in pairs via
+      // `rayon::join` (mirrors `prove_neutron_outer:691-698`); per-table polys
+      // bound sequentially per j (the per-j binds are independent so could be
+      // parallelised, but the simpler sequential loop matches the engine-level
+      // memory-access pattern of `lookup_sumcheck.rs:46-55`).
+      rayon::join(
+        || poly_Az.bind_poly_var_top(&r_i),
+        || poly_Bz.bind_poly_var_top(&r_i),
+      );
+      rayon::join(
+        || poly_Cz.bind_poly_var_top(&r_i),
+        || poly_E.bind_poly_var_top(&r_i),
+      );
+      for j in 0..k {
+        polys_eq_w[j].bind_poly_var_top(&r_i);
+        polys_eq_t[j].bind_poly_var_top(&r_i);
+        polys_inv_w[j].bind_poly_var_top(&r_i);
+        polys_inv_t[j].bind_poly_var_top(&r_i);
+        polys_w[j].bind_poly_var_top(&r_i);
+        polys_ts[j].bind_poly_var_top(&r_i);
+        polys_T[j].bind_poly_var_top(&r_i);
+      }
+    }
+
+    // After `num_rounds_total = ell` rounds, all polynomials are reduced to a
+    // single scalar each. Recover R1CS-side claims (mirrors
+    // `prove_neutron_outer:703-705`).
+    let claim_Az = poly_Az[0];
+    let claim_Bz = poly_Bz[0];
+    let claim_Cz = poly_Cz[0];
+
+    // Reconstruct R1CS-side tensor factorisation at the verifier evaluation
+    // point per Corrigendum #9 (2-A). Mirrors `prove_neutron_outer:711-716`.
+    let ell2 = right.trailing_zeros() as usize;
+    let r_x_high = &r[..ell2];
+    let r_x_low = &r[ell2..];
+    let eval_E1 = MultilinearPolynomial::new(E1.to_vec()).evaluate(r_x_low);
+    let eval_E2 = MultilinearPolynomial::new(E2.to_vec()).evaluate(r_x_high);
+
+    debug_assert_eq!(
+      poly_E[0],
+      eval_E1 * eval_E2,
+      "Corrigendum #9 (2-A) tensor factorisation byte-divergence at end of \
+       outer-sumcheck (with-logup path) — Falsifier D",
+    );
+
+    // Recover per-table evaluations at `r_x`. Each per-table poly was bound to
+    // length-1 across the `num_rounds_total` rounds; the final value is `[0]`.
+    let per_table_outer_evals: Vec<PerTableOuterEvals<E::Scalar>> = (0..k)
+      .map(|j| PerTableOuterEvals {
+        eval_w: polys_w[j][0],
+        eval_ts: polys_ts[j][0],
+        eval_inv_w: polys_inv_w[j][0],
+        eval_inv_t: polys_inv_t[j][0],
+        eval_T: polys_T[j][0],
+        eval_eq_w: polys_eq_w[j][0],
+        eval_eq_t: polys_eq_t[j][0],
+      })
+      .collect();
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      (
+        claim_Az,
+        claim_Bz,
+        claim_Cz,
+        eval_E1,
+        eval_E2,
+        per_table_outer_evals,
+      ),
     ))
   }
 
