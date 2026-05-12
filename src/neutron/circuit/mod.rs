@@ -611,6 +611,7 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       return self.synthesize_non_base_case_lookup_fold(
         cs.namespace(|| "synthesize non base case lookup-fold"),
         pp_digest,
+        z_i,
         U,
         u,
         nifs,
@@ -647,9 +648,20 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
   /// verifier's output via [`AllocatedFoldedInstance::from_lookup_fold_output`].
   ///
   /// Soundness anchors:
-  /// - `chunk_index_in_z = U.X[0]`: the augmented-circuit's running-instance
-  ///   chunk-position index is carried in public IO `X` (per ADR-0021 +
-  ///   pin §1.4 Corrigendum #3 single-IO invariant).
+  /// - `chunk_index_in_z = z_i[F_arity - 1]`: GH-#7 M.GH7.2 routing per
+  ///   pin §3.2 + Corrigendum #4. The augmented-circuit's running-instance
+  ///   chunk-position index is carried in the IVC step input slot `z` at
+  ///   the last position (`z_i[F_arity - 1]`), threaded per the *extension*
+  ///   of ADR-0021's NIVC dispatcher z-carry pattern (the specific
+  ///   reservation `z[F_arity-1] = chunk_index` is a NEW authoring decision
+  ///   at GH-#7 covered by pin ratification, not directly ratified by
+  ///   ADR-0021 — see pin Corrigendum #4 lines 1198-1210). Prior interim
+  ///   (Corrigendum #9 era) sourced `chunk_index_in_z` from `U.X[0]`; the
+  ///   M.GH7.2 reroute moves the read-site to the `z` slot to align with
+  ///   the NIVC dispatcher model. The single-IO invariant on `U.X` (pin
+  ///   §1.4 Corrigendum #3, `num_io == 1`) is no longer load-bearing for
+  ///   the read-site; the defensive `U.X.is_empty()` check below is
+  ///   retained as a structural assertion of the single-IO invariant.
   /// - `t_lookup_running_per_table = U.T_lookup_per_table.as_deref()`:
   ///   per pin §3.3, the augmented circuit consumes the running U's
   ///   per-table running scalars directly. The Phase-1 hash check above
@@ -658,13 +670,19 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
   /// - M.7 shape-registry assertion fires INTERNAL to
   ///   `verify_with_multi_table_lookup` BEFORE `pp_digest.absorb` per pin
   ///   §2.5 / §3.4 (vendor `nifs.rs:689-695` + line 698). The augmented-
-  ///   circuit caller does NOT fire it separately.
+  ///   circuit caller does NOT fire it separately. The M.GH7.2 read-site
+  ///   reroute preserves this architectural FS-transcript point (the M.7
+  ///   annotation still emits at the same internal site, before the
+  ///   `pp_digest.absorb`-then-`squeeze` sequence; the only change is the
+  ///   *source* of the `chunk_index_in_z` AllocatedNum — now `z_i[F_arity-1]`
+  ///   instead of `U.X[0]`).
   #[cfg(feature = "lookup-fold")]
   #[allow(clippy::too_many_arguments)]
   fn synthesize_non_base_case_lookup_fold<CS: ConstraintSystem<E::Scalar>>(
     &self,
     mut cs: CS,
     pp_digest: &AllocatedNum<E::Scalar>,
+    z_i: &[AllocatedNum<E::Scalar>],
     U: &AllocatedFoldedInstance<E>,
     u: &AllocatedNonnativeR1CSInstance<E>,
     nifs: &AllocatedNIFS<E>,
@@ -689,10 +707,15 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       ));
     }
 
-    // chunk_index_in_z := U.X[0] per ADR-0021 + pin §1.4 Corrigendum #3
-    // single-IO invariant. The augmented-circuit's `num_io == 1` is
-    // enforced by `AllocatedFoldedInstance::fold` (γ.1 fail-close at
-    // `relation.rs:354-364`); reading `U.X[0]` is well-defined.
+    // GH-#7 M.GH7.2 / pin §3.2 + Corrigendum #4: route `chunk_index_in_z`
+    // via `z_i[F_arity - 1]` per the *extension* of ADR-0021's NIVC
+    // dispatcher z-carry pattern. The augmented-circuit's structural
+    // `num_io == 1` invariant (pin §1.4 Corrigendum #3) is no longer
+    // load-bearing for this read-site, but the defensive check below
+    // is retained as a structural assertion of the single-IO invariant
+    // (an `U.X` of length 0 would indicate a wire-up bug in `alloc` or
+    // `default*`; the `synthesize_non_base_case` Phase-1 hash check
+    // also assumes `u.X` is single-IO).
     if U.X.is_empty() {
       return Err(SynthesisError::Unsatisfiable(
         "synthesize_non_base_case_lookup_fold: U.X is empty (num_io == 0); \
@@ -701,7 +724,15 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
           .to_string(),
       ));
     }
-    let chunk_index_in_z = &U.X[0];
+    if z_i.is_empty() {
+      return Err(SynthesisError::Unsatisfiable(
+        "synthesize_non_base_case_lookup_fold: z_i is empty (F_arity == 0); \
+         GH-#7 M.GH7.2 routing requires F_arity ≥ 1 with z_i[F_arity - 1] \
+         reserved for chunk_index per pin §3.2 + Corrigendum #4"
+          .to_string(),
+      ));
+    }
+    let chunk_index_in_z = &z_i[z_i.len() - 1];
 
     // Allocate the per-position shape registry as in-circuit AllocatedNums.
     // The `assert_pp_digest_matches_registry` consumer at `nifs.rs:689-695`

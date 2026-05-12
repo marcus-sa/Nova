@@ -931,3 +931,169 @@ mod lookup_verify {
 #[cfg(feature = "lookup-fold")]
 #[allow(unused_imports)]
 pub use lookup_verify::{LookupVerifyOutput, LookupVerifyOutputMultiTable};
+
+/// GH-#7 M.GH7.2 regression tests for the `chunk_index_in_z` routing
+/// reroute at `circuit/mod.rs:704` (`U.X[0]` → `z_i[F_arity - 1]` per
+/// pin §3.2 + Corrigendum #4 lines 1184-1210).
+///
+/// The amended acceptance criteria (Halpert ratified 2026-05-12; see
+/// `docs/feature/gh-7-stage-k-compressed-snark/deliver/roadmap.json`
+/// step `02-01`) reframe the regression invariant from byte-equal
+/// `pp_digest` to **architectural M.7 binding-chain preservation**:
+/// after the read-site reroute, the M.7 shape-registry assertion
+/// (`crate::shape_registry::assert_pp_digest_matches_registry`) MUST
+/// still fire at the same internal site at the same FS-transcript
+/// point — specifically, BEFORE the first constraint emission that
+/// follows `ro.absorb(pp_digest)` inside
+/// `verify_with_multi_table_lookup` (vendor `nifs.rs:689-695` +
+/// line 698; first post-absorb constraint emission is the
+/// `cs.namespace(|| "absorb U2")` block at line 700).
+///
+/// The byte-equal-`pp_digest`-under-`lookup_fold_k > 0` invariant
+/// from the original pre-amendment criteria was an over-pin: the
+/// `pp_digest = H(Structure<E>)` digest of an R1CS-shape topology
+/// necessarily changes when the chunk_index AllocatedNum is sourced
+/// from a different witness slot (`z_i[F_arity-1]` allocates earlier
+/// in `alloc_witness` than `U.X[0]`). The amended invariant
+/// (architectural ordering preservation) is the load-bearing
+/// soundness property; the topological pp_digest delta is mechanical.
+#[cfg(all(test, feature = "lookup-fold"))]
+mod m_gh7_2_chunk_index_in_z_routing_tests {
+  use crate::{
+    frontend::test_shape_cs::TestShapeCS,
+    neutron::circuit::NeutronAugmentedCircuit,
+    provider::{Bn256EngineKZG, GrumpkinEngine},
+    traits::{circuit::TrivialCircuit, Engine, RO2ConstantsCircuit},
+  };
+  use ff::Field;
+
+  /// GH-#7 M.GH7.2 / pin §3.2 + Corrigendum #4: architectural regression
+  /// invariant for the `chunk_index_in_z` routing reroute.
+  ///
+  /// **What this test binds.** Synthesises the lookup-fold-active branch
+  /// of the augmented circuit (`NeutronAugmentedCircuit::synthesize` →
+  /// `synthesize_non_base_case` → `synthesize_non_base_case_lookup_fold`
+  /// → `verify_with_multi_table_lookup`) under a `TestShapeCS` (shape-only
+  /// synthesis; the value closures for witness slots are never invoked
+  /// because the shape system does not materialise witness values). The
+  /// resulting constraint trace is walked in declaration order and the
+  /// path indices of (i) the first constraint whose path contains
+  /// `"M.7 shape-registry assertion"` and (ii) the first constraint
+  /// whose path contains `"absorb U2"` are extracted. The architectural
+  /// invariant asserts `m7_index < absorb_u2_index`: the M.7 assertion
+  /// MUST emit constraints BEFORE the first post-`ro.absorb(pp_digest)`
+  /// constraint-emitting transcript operation.
+  ///
+  /// **Why this is the right shape for the M.GH7.2 regression invariant.**
+  /// `ro.absorb(pp_digest)` at `circuit/nifs.rs:697-698` is a stateful
+  /// RO update that emits NO constraints; the first post-`pp_digest`-
+  /// absorb constraint emission is the U2 absorption block at
+  /// `circuit/nifs.rs:700`. The M.7 assertion sits at
+  /// `circuit/nifs.rs:689-695` and emits ~50 constraints (range-check +
+  /// constant-time conditional-select chain + equality assert, per
+  /// `shape_registry::circuit`'s cost estimate). The architectural
+  /// `pp_digest`-binding chain (pin §3.4 / §2.5) requires the M.7
+  /// assertion to fire BEFORE the FS transcript starts consuming
+  /// `pp_digest`-derived state, which corresponds to BEFORE the first
+  /// post-absorb constraint emission. The `absorb U2` namespace is the
+  /// load-bearing landmark for this point in the constraint trace.
+  ///
+  /// **What this test does NOT bind.** It does NOT verify byte-equal
+  /// `pp_digest` (R1CS-shape topology) under the reroute — see the
+  /// amended-criteria rationale in the module doc-comment above.
+  /// `test_pp_digest` at `neutron/mod.rs:826-842` covers `pp_digest`
+  /// byte-equality but runs against `TrivialCircuit::default()` with
+  /// `lookup_fold_k = 0`, where the lookup-fold branch is unreachable
+  /// and the byte-equality holds trivially (verified post-change).
+  ///
+  /// **Fixture shape.** `NeutronAugmentedCircuit` with
+  /// `TrivialCircuit` (`arity = 1`) and `.with_lookup_fold(k=2,
+  /// shape_registry=&[ZERO], index_n_bits=1)` — the smallest valid
+  /// `lookup_fold_k > 0` configuration. With `inputs = None`,
+  /// `TestShapeCS` derives the R1CS shape without invoking witness
+  /// value closures, so the namespace tree is reproduced verbatim
+  /// against the production code-path. `z_i.len() == 1` here, so the
+  /// rerouted read-site (`z_i[z_i.len() - 1] = z_i[0]`) is exercised.
+  ///
+  /// Parametrised across both production engine choices
+  /// (`Bn256EngineKZG`, `GrumpkinEngine`) per the
+  /// `test_recursive_circuit_with` pattern at
+  /// `circuit/mod.rs:931-969` — input variations of the same
+  /// architectural behavior per Mandate M5.
+  fn assert_m7_precedes_absorb_u2_under_z_routing<E1, E2>()
+  where
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
+  {
+    let ro_consts = RO2ConstantsCircuit::<E1>::default();
+    let tc = TrivialCircuit::<E1::Scalar>::default();
+
+    // Minimal valid lookup-fold-active configuration:
+    //   - lookup_fold_k = 2 (production k per ADR-0021)
+    //   - shape_registry = &[ZERO] (single-entry; the constant-time
+    //     conditional-select chain still walks i ∈ 1..len = empty range,
+    //     so the chain reduces to `selected = registry[0]`; the M.7
+    //     equality assert still fires)
+    //   - index_n_bits = 1 (smallest valid; the range-check still
+    //     emits ~3 cons for the 1-bit decomposition + complement)
+    let shape_registry = vec![<E1::Scalar as Field>::ZERO];
+    let circuit: NeutronAugmentedCircuit<'_, E1, TrivialCircuit<E1::Scalar>> =
+      NeutronAugmentedCircuit::new(None, &tc, ro_consts)
+        .with_lookup_fold(2, &shape_registry, 1);
+
+    let mut cs: TestShapeCS<E1> = TestShapeCS::new();
+    let _ = circuit.synthesize(&mut cs);
+
+    // Walk `cs.constraints` in declaration order. The namespace path
+    // for the M.7 assertion is rooted at
+    //   "synthesize non base case/synthesize non base case lookup-fold/\
+    //    verify_with_multi_table_lookup/M.7 shape-registry assertion/..."
+    // and for the first post-`ro.absorb(pp_digest)` constraint-emitting
+    // transcript operation at
+    //   "synthesize non base case/synthesize non base case lookup-fold/\
+    //    verify_with_multi_table_lookup/absorb U2/...".
+    let m7_index = cs
+      .constraints
+      .iter()
+      .position(|(_, _, _, path)| path.contains("M.7 shape-registry assertion"))
+      .expect(
+        "M.7 shape-registry assertion namespace MUST appear in the constraint \
+         trace under lookup_fold_k > 0 — its absence indicates the lookup-fold \
+         branch was not taken (cfg gate or runtime gate) or \
+         verify_with_multi_table_lookup is not invoked",
+      );
+    let absorb_u2_index = cs
+      .constraints
+      .iter()
+      .position(|(_, _, _, path)| path.contains("absorb U2"))
+      .expect(
+        "absorb U2 namespace MUST appear in the constraint trace under \
+         lookup_fold_k > 0 — the verify_with_multi_table_lookup invocation \
+         absorbs U2 into the RO right after ro.absorb(pp_digest) at \
+         circuit/nifs.rs:700",
+      );
+
+    // Architectural M.7 binding-chain preservation (pin §3.2 +
+    // Corrigendum #4): the M.7 assertion's constraints MUST emit BEFORE
+    // the first constraint emission that follows ro.absorb(pp_digest).
+    // The absorb U2 namespace is the load-bearing landmark for that
+    // point in the constraint trace.
+    assert!(
+      m7_index < absorb_u2_index,
+      "GH-#7 M.GH7.2 architectural regression: M.7 shape-registry \
+       assertion (index {}) must precede absorb U2 (index {}) in the \
+       constraint trace under the z_i[F_arity - 1]-routed chunk_index_in_z \
+       per pin §3.2 + Corrigendum #4. A violation indicates the read-site \
+       reroute has perturbed synthesis ordering — STOP-AND-ASK gate per \
+       dispatch.",
+      m7_index,
+      absorb_u2_index,
+    );
+  }
+
+  #[test]
+  fn m_gh7_2_chunk_index_in_z_routing_preserves_m7_binding_chain_architecturally()
+  {
+    assert_m7_precedes_absorb_u2_under_z_routing::<Bn256EngineKZG, GrumpkinEngine>();
+  }
+}
