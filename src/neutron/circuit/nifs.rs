@@ -910,9 +910,27 @@ mod lookup_verify {
         comm_E_fold,
       )?;
 
+      // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): clone the
+      // per-table post-fold commitment hints from the
+      // `AllocatedLookupNIFSMultiTable` (allocated upstream in
+      // `AllocatedLookupNIFSMultiTable::alloc` from the per-step NIFS
+      // message's prover-supplied Vec hints, populated off-circuit at
+      // `NIFS::prove_with_multi_table_lookup_inner`'s
+      // `U.comm_L` / `U.comm_ts` post-fold extraction). NO new constraint
+      // emission at this layer — pure passthrough of the allocated hints
+      // through the verifier output structure; the soundness binding
+      // happens via the IVC hash-chain at the next step's Phase-1 hash
+      // check (M.GH7.5.0a-landed `absorb_in_ro` extension absorbs these
+      // commitments) plus envelope-side off-FS commitment-equality at
+      // `CompressedSNARK::verify` per Corrigendum #17 path (b).
+      let comm_L_fold_per_table = lookups.comm_L_fold_per_table.clone();
+      let comm_ts_fold_per_table = lookups.comm_ts_fold_per_table.clone();
+
       Ok(LookupVerifyOutputMultiTable {
         U_fold,
         T_lookup_out_per_table: t_lookup_out_per_table,
+        comm_L_fold_per_table,
+        comm_ts_fold_per_table,
       })
     }
   }
@@ -922,9 +940,23 @@ mod lookup_verify {
   /// target VECTOR (one entry per registered table). The augmented
   /// circuit attaches `T_lookup_out_per_table` to its public-input hash
   /// per pin §1.3 (T_lookup is a Vec<E::Scalar> in `FoldedInstance`).
+  ///
+  /// GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): widened to
+  /// carry per-table post-fold commitment hints `comm_L_fold_per_table` /
+  /// `comm_ts_fold_per_table`, sourced from the
+  /// `AllocatedLookupNIFSMultiTable`'s NIFS-message-allocated Vecs.
+  /// These propagate to the post-fold `AllocatedFoldedInstance` via the
+  /// widened `from_lookup_fold_output` at `circuit/relation.rs`,
+  /// overriding the M.GH7.5.0a passthrough. Mirrors the existing
+  /// `comm_W_fold` / `comm_E_fold` untrusted-hint discipline at
+  /// `nifs.rs:46-55` / `:649-664`; soundness via IVC hash-chain binding
+  /// (M.GH7.5.0a `absorb_in_ro` extension) + envelope-side off-FS
+  /// commitment-equality (Corrigendum #17 path (b)).
   pub struct LookupVerifyOutputMultiTable<E: Engine> {
     pub U_fold: AllocatedFoldedInstance<E>,
     pub T_lookup_out_per_table: Vec<AllocatedNum<E::Scalar>>,
+    pub comm_L_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
+    pub comm_ts_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
   }
 }
 

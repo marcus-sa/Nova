@@ -826,9 +826,26 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
     // propagates `T_lookup_per_table` from U1 unchanged; we override with
     // `T_lookup_out_per_table` so the new running U carries the correct
     // post-fold per-table running scalars.
+    //
+    // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): ALSO override
+    // the M.GH7.5.0a per-table commitment passthrough with the post-fold
+    // `comm_L_fold_per_table` / `comm_ts_fold_per_table` hint Vecs sourced
+    // off-circuit from the prover's per-step NIFS message (the
+    // `NIFS::prove_with_multi_table_lookup_inner`'s `U.comm_L` / `U.comm_ts`
+    // post-fold extraction; off-circuit fold body at
+    // `vendor/nova/src/neutron/relation.rs:862-884`). This closes the IVC↔
+    // envelope binding by making the in-circuit `Unew.comm_L_per_table[j]`
+    // (absorbed at the final-step hash via M.GH7.5.0a's `absorb_in_ro`
+    // extension) byte-equal to the off-circuit `r_U.comm_L[j]` (absorbed
+    // at off-circuit `RecursiveSNARK::verify` hash reconstruction via
+    // M.GH7.5.0a's `absorb_in_ro2` extension). Soundness by parallel
+    // reasoning to the existing `comm_W_fold` / `comm_E_fold`
+    // untrusted-hint discipline at `circuit/nifs.rs:46-55` / `:649-664`.
     let U_fold = AllocatedFoldedInstance::from_lookup_fold_output(
       lookup_output.U_fold,
       lookup_output.T_lookup_out_per_table,
+      lookup_output.comm_L_fold_per_table,
+      lookup_output.comm_ts_fold_per_table,
     );
 
     Ok((U_fold, check_pass))

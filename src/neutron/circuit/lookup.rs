@@ -221,6 +221,42 @@ pub struct AllocatedLookupNIFSMultiTable<E: Engine> {
   pub(crate) comm_inv_w: Vec<AllocatedNonnativePoint<E>>,
   /// Per-table inverse-table commitment for `1/(T_j + r)`.
   pub(crate) comm_inv_t: Vec<AllocatedNonnativePoint<E>>,
+
+  /// GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): post-fold
+  /// per-table running `comm_L` hints, allocated from the per-step NIFS
+  /// message's `comm_L_fold_per_table` field. The off-circuit prover
+  /// (`NIFS::prove_with_multi_table_lookup_inner`) computes the post-fold
+  /// per-table commitments via `U1.fold_with_lookup`'s per-`j` independent
+  /// fold body at `vendor/nova/src/neutron/relation.rs:862-884` and
+  /// attaches them to the NIFS message; the augmented circuit allocates
+  /// them as `AllocatedNonnativePoint<E>` hints here, then propagates
+  /// them through `verify_with_multi_table_lookup` into the post-fold
+  /// `AllocatedFoldedInstance::comm_L_per_table` via the widened
+  /// `from_lookup_fold_output` consumer at `circuit/relation.rs`.
+  ///
+  /// Soundness via parallel reasoning to the existing `comm_W_fold` /
+  /// `comm_E_fold` untrusted-hint discipline at `circuit/nifs.rs:46-55`
+  /// / `:649-664`: (i) IVC hash-chain binding via M.GH7.5.0a-landed
+  /// `absorb_in_ro` extension (absorbs `comm_L_per_table` into the
+  /// cross-step hash chain — a malicious hint cannot survive the
+  /// hash-chain check at `synthesize_non_base_case` line 580-599 AND
+  /// simultaneously the off-circuit `RecursiveSNARK::verify` hash
+  /// reconstruction at `mod.rs:753-773` without breaking RO2
+  /// collision-resistance); (ii) envelope-side off-FS commitment-equality
+  /// check at `CompressedSNARK::verify` per Corrigendum #17 path (b),
+  /// composed with Spartan-close Pedersen+LogUp identity binding.
+  ///
+  /// Length `k` (the structurally-pinned table count). At
+  /// `nifs.comm_L_fold_per_table == None` (shape-derivation `nifs == None`
+  /// or non-multi-table NIFS message), the entries are
+  /// `AllocatedNonnativePoint::alloc(_, None)` — point-at-infinity
+  /// placeholders mirroring the `comm_inv_w` / `comm_inv_t` allocation
+  /// discipline at line 268-278 above.
+  pub(crate) comm_L_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
+  /// Post-fold per-table running `comm_ts` hints; see
+  /// `comm_L_fold_per_table` doc for the Corrigendum #19 path α.2
+  /// soundness anchor and discipline.
+  pub(crate) comm_ts_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
 }
 
 impl<E: Engine> AllocatedLookupNIFSMultiTable<E> {
@@ -277,10 +313,45 @@ impl<E: Engine> AllocatedLookupNIFSMultiTable<E> {
       })
       .collect::<Result<Vec<_>, _>>()?;
 
+    // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): allocate
+    // post-fold per-table running commitment hints from the per-step
+    // NIFS message's `comm_L_fold_per_table` / `comm_ts_fold_per_table`
+    // Vec hints, populated off-circuit at
+    // `NIFS::prove_with_multi_table_lookup_inner`. Mirrors the
+    // `comm_inv_w` / `comm_inv_t` allocation discipline above; on
+    // `nifs == None` (shape-derivation) the entries default to
+    // point-at-infinity. The k-length shape matches the constant-shape
+    // FS schedule across base / non-base per Corrigendum #6.
+    let comm_L_fold_per_table = (0..k)
+      .map(|j| {
+        AllocatedNonnativePoint::alloc(
+          cs.namespace(|| format!("allocate comm_L_fold_per_table[{}]", j)),
+          nifs
+            .and_then(|n| n.comm_L_fold_per_table.as_ref())
+            .and_then(|v| v.get(j))
+            .map(|c| c.to_coordinates()),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    let comm_ts_fold_per_table = (0..k)
+      .map(|j| {
+        AllocatedNonnativePoint::alloc(
+          cs.namespace(|| format!("allocate comm_ts_fold_per_table[{}]", j)),
+          nifs
+            .and_then(|n| n.comm_ts_fold_per_table.as_ref())
+            .and_then(|v| v.get(j))
+            .map(|c| c.to_coordinates()),
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
     Ok(Self {
       poly_lookup,
       comm_inv_w,
       comm_inv_t,
+      comm_L_fold_per_table,
+      comm_ts_fold_per_table,
     })
   }
 

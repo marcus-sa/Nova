@@ -709,24 +709,45 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
   pub fn from_lookup_fold_output(
     u_fold: Self,
     t_lookup_out_per_table: Vec<AllocatedNum<E::Scalar>>,
+    comm_L_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
+    comm_ts_fold_per_table: Vec<AllocatedNonnativePoint<E>>,
   ) -> Self {
     Self {
       comm_W: u_fold.comm_W,
       comm_E: u_fold.comm_E,
       T: u_fold.T,
       T_lookup_per_table: Some(t_lookup_out_per_table),
-      // GH-#7 design pin Corrigendum #18 M.GH7.5.0a path α: propagate
-      // `comm_L_per_table` / `comm_ts_per_table` through from `u_fold`
-      // unchanged. M.GH7.5.0a defers the signature widening (carrying
-      // explicit `comm_L_fold_per_table` / `comm_ts_fold_per_table` args
-      // analogous to `t_lookup_out_per_table`) to M.GH7.5.0b; at M.GH7.5.0a
-      // the post-fold per-table commitments are NOT yet computed in-circuit
-      // (the `verify_with_multi_table_lookup` in-circuit per-table fold body
-      // is M.GH7.5.0b scope), so the passthrough from `u_fold` (which
-      // inherits from `self.fold`'s `self.comm_L_per_table.clone()` passthrough
-      // above) is the structurally-only-correct choice.
-      comm_L_per_table: u_fold.comm_L_per_table,
-      comm_ts_per_table: u_fold.comm_ts_per_table,
+      // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): OVERRIDE
+      // the M.GH7.5.0a passthrough of `u_fold.comm_L_per_table` /
+      // `u_fold.comm_ts_per_table` (which inherits the PRE-fold per-table
+      // commitments via `AllocatedFoldedInstance::fold`'s
+      // `self.comm_L_per_table.clone()` passthrough) with the POST-fold
+      // hint Vecs supplied by the per-step NIFS message and propagated
+      // through `verify_with_multi_table_lookup`'s
+      // `LookupVerifyOutputMultiTable`. This is the load-bearing fix for
+      // the IVC↔envelope binding closure: the augmented circuit's final-
+      // step hash absorption at `circuit/mod.rs:932` invokes
+      // `Unew.absorb_in_ro` (which absorbs `Unew.comm_L_per_table` per
+      // M.GH7.5.0a `absorb_in_ro` extension), and the off-circuit
+      // `RecursiveSNARK::verify` at `mod.rs:753-773` invokes
+      // `self.r_U.absorb_in_ro2` (which absorbs `self.r_U.comm_L` per
+      // M.GH7.5.0a off-circuit mirror at `relation.rs:958-969`); for the
+      // hash-chain check to pass at the next step, the in-circuit
+      // `Unew.comm_L_per_table[j]` MUST equal the off-circuit
+      // `self.r_U.comm_L[j]` byte-for-byte — which is exactly what these
+      // hint Vecs supply (sourced off-circuit from
+      // `NIFS::prove_with_multi_table_lookup_inner`'s `U.comm_L` /
+      // `U.comm_ts` post-fold extraction, where `U = U1.fold_with_lookup`
+      // at `relation.rs:862-884`). Soundness via parallel reasoning to
+      // the existing `comm_W_fold` / `comm_E_fold` discipline at
+      // `circuit/nifs.rs:46-55` / `:649-664`; the rejection mechanism
+      // for malicious hints is (i) IVC hash-chain divergence at the next
+      // step's Phase-1 hash check OR at the off-circuit
+      // `RecursiveSNARK::verify` hash reconstruction, PLUS (ii)
+      // envelope-side Pedersen-binding rejection at Spartan-close LogUp
+      // identity verify per Corrigendum #17 path (b).
+      comm_L_per_table: Some(comm_L_fold_per_table),
+      comm_ts_per_table: Some(comm_ts_fold_per_table),
       u: u_fold.u,
       X: u_fold.X,
     }
@@ -1511,6 +1532,445 @@ mod stage0_byte_equivalence_tests {
        Per pin §6.2 STOP-AND-ASK: the §1.4 absorption-order pin is wrong; \
        halt all further GH-#5 milestones and re-derive.",
       h_native_s2, h_circuit_s2
+    );
+
+    // ===========================================================
+    // M.GH7.5.0b path α.2 — work-item 8 / Corrigendum #19 #M.GH7.5.5
+    //
+    // POST-FOLD PER-TABLE HINT PROPAGATION BYTE-EQUIVALENCE TEST.
+    //
+    // This block discharges Corrigendum #19's empirical-close obligation
+    // for the path α.2 hint-based per-table fold-result propagation.
+    //
+    // Claim under test: the per-step NIFS message's
+    // `comm_L_fold_per_table` / `comm_ts_fold_per_table` Vec hints
+    // (populated off-circuit at `prove_with_multi_table_lookup_inner` from
+    // `U.comm_L` / `U.comm_ts` — the post-fold per-table commitments
+    // produced by the `fold_with_lookup` body at `relation.rs:862-884`)
+    // are byte-equal to the post-fold per-table running commitments on
+    // the verified `FoldedInstance`. Equivalently: the hint vector that
+    // the augmented circuit consumes at allocation time IS the same
+    // commitment that the off-circuit `RecursiveSNARK::verify`
+    // reconstructs at `mod.rs:763` via `self.r_U.absorb_in_ro2`.
+    //
+    // This is THE load-bearing wiring check for path α.2: if the hint
+    // Vec on the NIFS message diverges from the post-fold per-table
+    // commitments on `running_u_after_step_N`, then the in-circuit
+    // `Unew.comm_L_per_table[j]` allocated from the hint (per the new
+    // `from_lookup_fold_output` override at `circuit/relation.rs`) will
+    // NOT byte-equal the off-circuit `r_U.comm_L[j]` absorbed at
+    // `RecursiveSNARK::verify` time, and the IVC hash-chain check at
+    // the next step's Phase-1 hash will reject. Per Corrigendum #19
+    // second-order issue #6, this test fails ONLY if (a) the per-step
+    // NIFS hint Vec is not byte-equal to the off-circuit fold output
+    // (crafter-side bug at hint-attachment locus); (b) the
+    // `from_lookup_fold_output` override does not propagate the hint
+    // Vecs (crafter-side bug at the consumer site); (c) the per-table
+    // absorb sequence in `absorb_in_ro` / `absorb_in_ro2` is not
+    // byte-equivalent (M.GH7.5.0a regression).
+    //
+    // Soundness wiring: at honest synthesis, every hint must equal the
+    // off-circuit fold output by construction of
+    // `prove_with_multi_table_lookup_inner`'s `let
+    // comm_L_fold_per_table = U.comm_L.clone();` at `nifs.rs` (where
+    // `U` IS the off-circuit folded instance). The test asserts the
+    // contract that the prover hint Vec equals the verifier's
+    // post-fold commitment Vec — the structural equality that the
+    // augmented circuit assumes when allocating the hint as
+    // `AllocatedNonnativePoint`.
+
+    // Step 1: hint Vec on `nifs1` must equal `folded_U_s1.comm_L` /
+    // `comm_ts` (Vec of length k=2, table_id-canonical order).
+    let nifs1_hint_comm_L = nifs1
+      .comm_L_fold_per_table
+      .as_ref()
+      .expect(
+        "M.GH7.5.5 (Corrigendum #19 path α.2): NIFS::prove_with_multi_table_lookup must \
+         populate `comm_L_fold_per_table` on the per-step NIFS message under \
+         lookup-fold. If None, the off-circuit hint-attachment locus is broken — \
+         halt at work-item 1 in Corrigendum #19 §'Revised implementation roadmap \
+         under path α.2'.",
+      );
+    let nifs1_hint_comm_ts = nifs1
+      .comm_ts_fold_per_table
+      .as_ref()
+      .expect("M.GH7.5.5: comm_ts_fold_per_table must be populated on per-step NIFS message");
+    let folded_U_s1_comm_L = folded_U_s1
+      .comm_L
+      .as_ref()
+      .expect("M.GH7.0a fold-with-lookup populates folded_U_s1.comm_L");
+    let folded_U_s1_comm_ts = folded_U_s1
+      .comm_ts
+      .as_ref()
+      .expect("M.GH7.0a fold-with-lookup populates folded_U_s1.comm_ts");
+    assert_eq!(
+      nifs1_hint_comm_L.len(),
+      folded_U_s1_comm_L.len(),
+      "M.GH7.5.5: nifs1.comm_L_fold_per_table length must equal folded_U_s1.comm_L length (k=2)"
+    );
+    assert_eq!(
+      nifs1_hint_comm_ts.len(),
+      folded_U_s1_comm_ts.len(),
+      "M.GH7.5.5: nifs1.comm_ts_fold_per_table length must equal folded_U_s1.comm_ts length (k=2)"
+    );
+    for j in 0..nifs1_hint_comm_L.len() {
+      assert_eq!(
+        nifs1_hint_comm_L[j], folded_U_s1_comm_L[j],
+        "M.GH7.5.5 step-1 path α.2 byte-equivalence: nifs1.comm_L_fold_per_table[{j}] \
+         MUST equal folded_U_s1.comm_L[{j}] (the off-circuit fold output at \
+         relation.rs:862-884 produces the SAME per-table commitment that the \
+         augmented circuit consumes as a hint). If this fires, the off-circuit \
+         hint-attachment site at `prove_with_multi_table_lookup_inner` is wired \
+         WRONG — re-verify the `let comm_L_fold_per_table = U.comm_L.clone()` \
+         extraction is sourcing from the POST-fold `U`, not from `U1` or from \
+         any per-step bundle's pre-fold `payload.comm_L`. \
+         Per Corrigendum #19 STOP-AND-ASK trigger #M.GH7.5.5: halt at work-item \
+         1 and re-audit.",
+        j = j
+      );
+      assert_eq!(
+        nifs1_hint_comm_ts[j], folded_U_s1_comm_ts[j],
+        "M.GH7.5.5 step-1 path α.2 byte-equivalence: nifs1.comm_ts_fold_per_table[{j}] \
+         MUST equal folded_U_s1.comm_ts[{j}]. See comm_L assertion above for \
+         disposition.",
+        j = j
+      );
+    }
+    // Non-vacuous fixture: at least one per-table post-fold commitment must
+    // be NON-default (default = point at infinity). Otherwise the
+    // byte-equivalence test holds vacuously (zero on both sides).
+    let zero_commitment = Commitment::<E>::default();
+    assert!(
+      nifs1_hint_comm_L
+        .iter()
+        .any(|c| *c != zero_commitment),
+      "M.GH7.5.5 fixture non-vacuity: at least one nifs1.comm_L_fold_per_table[j] \
+       must be NON-default (the k=2 multi-table fixture queries non-trivial table \
+       entries; the off-circuit `fold_with_lookup` body produces \
+       `r_b * payload.comm_L` at outer base which is non-default for non-zero \
+       payload.comm_L). If all entries are default, the test holds vacuously — \
+       fixture is broken; halt before claiming the path α.2 wiring is sound."
+    );
+
+    // Step 2: hint Vec on `nifs2` must equal `folded_U_s2.comm_L` /
+    // `comm_ts` (post-fold #2 state). This exercises the mid-fold path
+    // where the running side IS non-trivial (folded_U_s1 carries
+    // non-zero per-table commitments).
+    let nifs2_hint_comm_L = nifs2
+      .comm_L_fold_per_table
+      .as_ref()
+      .expect("M.GH7.5.5 step-2: nifs2.comm_L_fold_per_table must be populated");
+    let nifs2_hint_comm_ts = nifs2
+      .comm_ts_fold_per_table
+      .as_ref()
+      .expect("M.GH7.5.5 step-2: nifs2.comm_ts_fold_per_table must be populated");
+    let folded_U_s2_comm_L = folded_U_s2
+      .comm_L
+      .as_ref()
+      .expect("M.GH7.0a fold-with-lookup populates folded_U_s2.comm_L");
+    let folded_U_s2_comm_ts = folded_U_s2
+      .comm_ts
+      .as_ref()
+      .expect("M.GH7.0a fold-with-lookup populates folded_U_s2.comm_ts");
+    for j in 0..nifs2_hint_comm_L.len() {
+      assert_eq!(
+        nifs2_hint_comm_L[j], folded_U_s2_comm_L[j],
+        "M.GH7.5.5 step-2 path α.2 byte-equivalence: nifs2.comm_L_fold_per_table[{j}] \
+         MUST equal folded_U_s2.comm_L[{j}] under non-trivial running-side \
+         (folded_U_s1 carries non-zero per-table commitments per the fold-#1 \
+         output). This exercises the `(1-r_b) * running + r_b * payload` per-`j` \
+         independent fold body at `relation.rs:862-884` (Corrigendum #6 \
+         primitive 3) under non-zero running side. If this fires, the \
+         hint-attachment site is wired wrong OR the off-circuit fold body has \
+         drifted from the Corrigendum #6 algebra.",
+        j = j
+      );
+      assert_eq!(
+        nifs2_hint_comm_ts[j], folded_U_s2_comm_ts[j],
+        "M.GH7.5.5 step-2 path α.2 byte-equivalence: nifs2.comm_ts_fold_per_table[{j}] \
+         MUST equal folded_U_s2.comm_ts[{j}].",
+        j = j
+      );
+    }
+  }
+
+  /// M.GH7.5.0b — Corrigendum #19 path α.2: in-circuit consumer test.
+  ///
+  /// Directly synthesises `AllocatedFoldedInstance::from_lookup_fold_output`
+  /// with non-trivial `comm_L_fold_per_table` / `comm_ts_fold_per_table`
+  /// hint Vecs and asserts:
+  ///
+  /// 1. The resulting `AllocatedFoldedInstance::comm_L_per_table` /
+  ///    `comm_ts_per_table` carry the HINT witness values, NOT the
+  ///    pre-fold passthrough values (which would equal `u_fold.comm_L_per_table`
+  ///    inherited from the pre-fold `fold` body's
+  ///    `self.comm_L_per_table.clone()` passthrough).
+  /// 2. The in-circuit `absorb_in_ro` squeeze on the resulting instance
+  ///    equals the off-circuit `absorb_in_ro2` squeeze on a native
+  ///    `FoldedInstance` constructed with the hint values in the
+  ///    `comm_L` / `comm_ts` Vec slots.
+  ///
+  /// This is the load-bearing wiring check for work-items 4-5 of
+  /// Corrigendum #19's revised implementation roadmap. If this test fails,
+  /// the `from_lookup_fold_output` override at `circuit/relation.rs:709`
+  /// is NOT propagating the hint Vecs — surface as crafter-side bug per
+  /// Corrigendum #19 second-order issue #6 disposition (b).
+  ///
+  /// Distinguishes M.GH7.5.0b from M.GH7.5.0a:
+  /// - M.GH7.5.0a (landed): post-fold `Unew.comm_L_per_table` is the
+  ///   PRE-fold passthrough (`self.comm_L_per_table.clone()`).
+  /// - M.GH7.5.0b (this): post-fold `Unew.comm_L_per_table` is the
+  ///   POST-fold hint Vec (overridden via `from_lookup_fold_output`).
+  ///
+  /// The witness-value comparison below would FAIL under M.GH7.5.0a's
+  /// passthrough (which would put PRE-fold values into
+  /// `result.comm_L_per_table`, NOT the hint values). The pass is
+  /// load-bearing for the IVC↔envelope binding closure.
+  #[test]
+  fn m_gh7_5_0b_path_alpha2_from_lookup_fold_output_overrides_with_hint_vecs() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC1BE_5B_C0DE_5050);
+    let ro_consts = RO2Constants::<E>::default();
+    let ro_consts_circuit = RO2ConstantsCircuit::<E>::default();
+
+    // Build a non-default base CommitmentKey from the augmented shape so
+    // we can produce non-default Commitments. Mirrors stage0 fixture
+    // bootstrapping (lines 1058-1071).
+    use crate::traits::circuit::NonTrivialCircuit;
+    let num_cons = 32usize;
+    let step_circuit = NonTrivialCircuit::<Scalar>::new(num_cons);
+    let augmented_shape_builder: NeutronAugmentedCircuit<'_, E, NonTrivialCircuit<Scalar>> =
+      NeutronAugmentedCircuit::new(None, &step_circuit, ro_consts_circuit.clone());
+    let mut cs: ShapeCS<E> = ShapeCS::new();
+    let _ = augmented_shape_builder.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // Non-trivial hint commitments. k=2 multi-table (production
+    // chunked-Strauss-Shamir shape per ADR-0021).
+    let k = 2usize;
+    let mk_commit = |rng: &mut ChaCha20Rng, len: usize| -> Commitment<E> {
+      let scalars: Vec<Scalar> = (0..len).map(|_| Scalar::random(&mut *rng)).collect();
+      <E as Engine>::CE::commit(&ck, &scalars, &Scalar::ZERO)
+    };
+
+    let comm_L_fold_hint_native: Vec<Commitment<E>> =
+      (0..k).map(|_| mk_commit(&mut rng, 8)).collect();
+    let comm_ts_fold_hint_native: Vec<Commitment<E>> =
+      (0..k).map(|_| mk_commit(&mut rng, 8)).collect();
+
+    // Distinct "pre-fold" passthrough commitments that the M.GH7.5.0a
+    // discipline would have propagated. These MUST be different from the
+    // hint values so the test can falsify a regression where
+    // `from_lookup_fold_output` accidentally restores the passthrough
+    // behaviour.
+    let comm_L_pre_fold_passthrough: Vec<Commitment<E>> =
+      (0..k).map(|_| mk_commit(&mut rng, 8)).collect();
+    let comm_ts_pre_fold_passthrough: Vec<Commitment<E>> =
+      (0..k).map(|_| mk_commit(&mut rng, 8)).collect();
+    let zero_commitment = Commitment::<E>::default();
+    for j in 0..k {
+      assert_ne!(
+        comm_L_fold_hint_native[j], comm_L_pre_fold_passthrough[j],
+        "fixture: hint[{j}] and pre-fold passthrough must differ to falsify a \
+         regression to M.GH7.5.0a passthrough behaviour",
+        j = j
+      );
+      assert_ne!(
+        comm_L_fold_hint_native[j], zero_commitment,
+        "fixture non-vacuity: hint[{j}] must be non-default",
+        j = j
+      );
+    }
+
+    // Build a synthetic `u_fold` carrying the pre-fold passthrough
+    // commitments in its `comm_L_per_table` / `comm_ts_per_table` fields
+    // (this is what `AllocatedFoldedInstance::fold`'s
+    // `self.comm_L_per_table.clone()` would have produced under
+    // M.GH7.5.0a's passthrough discipline).
+    let pre_fold_native = FoldedInstance::<E> {
+      comm_W: Commitment::<E>::default(),
+      comm_E: Commitment::<E>::default(),
+      T: Scalar::ZERO,
+      u: Scalar::ZERO,
+      X: vec![Scalar::ZERO],
+      comm_L: Some(comm_L_pre_fold_passthrough.clone()),
+      comm_ts: Some(comm_ts_pre_fold_passthrough.clone()),
+      comm_inv_w: None,
+      comm_inv_t: None,
+      T_lookup: Some(vec![Scalar::ZERO; k]),
+    };
+
+    // Synthesise: allocate `u_fold` with the pre-fold passthrough,
+    // allocate hint vectors as `AllocatedNonnativePoint`, invoke
+    // `from_lookup_fold_output`, and assert the result's
+    // `comm_L_per_table` witness values match the HINT (not the
+    // passthrough).
+    let mut tcs = TestConstraintSystem::<Scalar>::new();
+    let u_fold_alloc = AllocatedFoldedInstance::<E>::alloc_with_k_hint(
+      tcs.namespace(|| "u_fold (pre-fold passthrough)"),
+      Some(&pre_fold_native),
+      k,
+    )
+    .unwrap();
+    let comm_L_fold_hint_alloc: Vec<AllocatedNonnativePoint<E>> = comm_L_fold_hint_native
+      .iter()
+      .enumerate()
+      .map(|(j, c)| {
+        AllocatedNonnativePoint::alloc(
+          tcs.namespace(|| format!("comm_L_fold_hint[{j}]")),
+          Some(c.to_coordinates()),
+        )
+        .unwrap()
+      })
+      .collect();
+    let comm_ts_fold_hint_alloc: Vec<AllocatedNonnativePoint<E>> = comm_ts_fold_hint_native
+      .iter()
+      .enumerate()
+      .map(|(j, c)| {
+        AllocatedNonnativePoint::alloc(
+          tcs.namespace(|| format!("comm_ts_fold_hint[{j}]")),
+          Some(c.to_coordinates()),
+        )
+        .unwrap()
+      })
+      .collect();
+    let t_lookup_out_alloc: Vec<AllocatedNum<Scalar>> = (0..k)
+      .map(|j| {
+        AllocatedNum::alloc(tcs.namespace(|| format!("t_lookup_out[{j}]")), || {
+          Ok(Scalar::ZERO)
+        })
+        .unwrap()
+      })
+      .collect();
+
+    let result = AllocatedFoldedInstance::<E>::from_lookup_fold_output(
+      u_fold_alloc,
+      t_lookup_out_alloc,
+      comm_L_fold_hint_alloc.clone(),
+      comm_ts_fold_hint_alloc.clone(),
+    );
+
+    // Assertion (1): result's comm_L_per_table / comm_ts_per_table point
+    // to the HINT allocations, NOT the pre-fold passthrough. We compare
+    // BigNat limb witness values (the in-circuit representation).
+    //
+    // Borrow-pattern note: `result` is needed BOTH for the per-`j` witness-
+    // equality assertions below AND for the subsequent `result.absorb_in_ro`
+    // synthesise call in assertion (2). Clone the per-table option-vec
+    // extractions so `result` itself is not partially moved.
+    let result_comm_L = result
+      .comm_L_per_table
+      .clone()
+      .expect("path α.2 sets Some");
+    let result_comm_ts = result
+      .comm_ts_per_table
+      .clone()
+      .expect("path α.2 sets Some");
+    assert_eq!(
+      result_comm_L.len(),
+      k,
+      "M.GH7.5.0b: result.comm_L_per_table.len() must equal k={k}",
+      k = k
+    );
+    for j in 0..k {
+      // Check x-coordinate BigNat limb 0 witness value matches the hint,
+      // NOT the passthrough. This is a structural witness-value equality
+      // check that confirms the OVERRIDE is wired correctly.
+      let hint_x_limb0 = comm_L_fold_hint_alloc[j].x.as_limbs()[0]
+        .value
+        .clone()
+        .expect("hint x limb 0 must have witness value");
+      let result_x_limb0 = result_comm_L[j].x.as_limbs()[0]
+        .value
+        .clone()
+        .expect("result x limb 0 must have witness value");
+      assert_eq!(
+        hint_x_limb0, result_x_limb0,
+        "M.GH7.5.0b path α.2 #M.GH7.5.5 work-item 9: \
+         `from_lookup_fold_output` MUST propagate the hint `comm_L_fold_per_table[{j}]` \
+         into `result.comm_L_per_table[{j}]`, NOT the pre-fold passthrough \
+         `u_fold.comm_L_per_table[{j}]`. The witness x-limb-0 BigInt of the \
+         result MUST equal the hint's witness x-limb-0 BigInt. \
+         If this fires, the override at `circuit/relation.rs:709` regressed to \
+         the M.GH7.5.0a passthrough behaviour — re-audit `comm_L_per_table: \
+         Some(comm_L_fold_per_table)` in the struct literal.",
+        j = j
+      );
+    }
+    for j in 0..k {
+      let hint_x_limb0 = comm_ts_fold_hint_alloc[j].x.as_limbs()[0]
+        .value
+        .clone()
+        .expect("hint comm_ts x limb 0 must have witness value");
+      let result_x_limb0 = result_comm_ts[j].x.as_limbs()[0]
+        .value
+        .clone()
+        .expect("result comm_ts x limb 0 must have witness value");
+      assert_eq!(
+        hint_x_limb0, result_x_limb0,
+        "M.GH7.5.0b path α.2: `from_lookup_fold_output` MUST propagate \
+         `comm_ts_fold_per_table[{j}]` into `result.comm_ts_per_table[{j}]`.",
+        j = j
+      );
+    }
+
+    // Assertion (2): the resulting in-circuit instance's `absorb_in_ro`
+    // squeeze byte-equals the off-circuit `absorb_in_ro2` squeeze on the
+    // SAME hint values. This validates that the OVERRIDE flows through
+    // the IVC hash-chain absorption pattern correctly.
+    let post_fold_native_with_hints = FoldedInstance::<E> {
+      comm_W: Commitment::<E>::default(),
+      comm_E: Commitment::<E>::default(),
+      T: Scalar::ZERO,
+      u: Scalar::ZERO,
+      X: vec![Scalar::ZERO],
+      comm_L: Some(comm_L_fold_hint_native.clone()),
+      comm_ts: Some(comm_ts_fold_hint_native.clone()),
+      comm_inv_w: None,
+      comm_inv_t: None,
+      T_lookup: Some(vec![Scalar::ZERO; k]),
+    };
+    let mut ro = <E as Engine>::RO2::new(ro_consts.clone());
+    post_fold_native_with_hints.absorb_in_ro2(&mut ro);
+    let h_native = ro.squeeze(NUM_HASH_BITS, false);
+
+    let mut ro_circ = <E as Engine>::RO2Circuit::new(ro_consts_circuit.clone());
+    result
+      .absorb_in_ro(tcs.namespace(|| "absorb result"), &mut ro_circ)
+      .expect("in-circuit absorb_in_ro must synthesise cleanly");
+    let h_bits = ro_circ
+      .squeeze(tcs.namespace(|| "squeeze"), NUM_HASH_BITS, false)
+      .expect("squeeze must synthesise");
+    let h_circuit = crate::gadgets::utils::le_bits_to_num(
+      tcs.namespace(|| "bits to num"),
+      &h_bits,
+    )
+    .expect("le_bits_to_num must synthesise");
+    let h_circuit_val = h_circuit
+      .get_value()
+      .expect("hash witness must be assigned");
+
+    assert!(
+      tcs.is_satisfied(),
+      "M.GH7.5.0b: in-circuit absorb_in_ro on the path α.2 result MUST produce a \
+       satisfied CS. First unsatisfied: {:?}",
+      tcs.which_is_unsatisfied()
+    );
+    assert_eq!(
+      h_native, h_circuit_val,
+      "M.GH7.5.0b path α.2 #M.GH7.5.5 byte-equivalence: in-circuit \
+       `result.absorb_in_ro` squeeze MUST byte-equal the off-circuit \
+       `FoldedInstance::absorb_in_ro2` squeeze on a native instance carrying \
+       the SAME hint Vec values in `comm_L` / `comm_ts`. \
+       (h_native, h_circuit) = ({:?}, {:?}). \
+       This is the load-bearing IVC↔envelope binding closure: if these diverge, \
+       the next step's Phase-1 hash check at `circuit/mod.rs:580-599` would \
+       reject the honest fold under path α.2 because in-circuit `Unew` and \
+       off-circuit `r_U` hash to different values. Per Corrigendum #19 \
+       second-order issue #6 disposition (c): re-audit the M.GH7.5.0a-landed \
+       absorb-extension wiring at `circuit/relation.rs:549-560` AND \
+       `relation.rs:958-969` for per-table absorb-order byte-equivalence.",
+      h_native, h_circuit_val
     );
   }
 

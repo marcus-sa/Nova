@@ -258,6 +258,39 @@ pub struct NIFS<E: Engine> {
   /// (one entry per registered table, `table_id`-canonical order).
   #[cfg(feature = "lookup-fold")]
   pub comm_inv_t: Option<Vec<Commitment<E>>>,
+
+  /// GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): post-fold
+  /// per-table running `comm_L` hint, supplied by the off-circuit prover
+  /// from `prove_with_multi_table_lookup_inner`'s `U1.fold_with_lookup`
+  /// output (the per-`j` independent fold body at `relation.rs:862-884`).
+  /// The augmented circuit consumes this hint at allocation time
+  /// (`AllocatedLookupNIFSMultiTable::alloc`) and propagates it through
+  /// `verify_with_multi_table_lookup` into the post-fold
+  /// `AllocatedFoldedInstance::comm_L_per_table` via the widened
+  /// `from_lookup_fold_output` consumer at `circuit/relation.rs`.
+  ///
+  /// Soundness via IVC hash-chain binding (M.GH7.5.0a-landed `absorb_in_ro`
+  /// extension absorbs `comm_L_per_table` into the cross-step hash) +
+  /// envelope-side off-FS commitment-equality check at
+  /// `CompressedSNARK::verify` (Corrigendum #17 path (b)). Mirrors the
+  /// existing `comm_W_fold` / `comm_E_fold` untrusted-hint discipline at
+  /// `circuit/nifs.rs:46-55` / `:649-664`. NOT in-circuit-computed; the
+  /// per-`j` independent fold body lives off-circuit at
+  /// `relation.rs:862-884` (Corrigendum #6 primitive 3).
+  ///
+  /// `None` only on non-lookup-fold steps and at outer base. Length `k`
+  /// when `Some`, in `table_id`-canonical order. The byte-equivalence
+  /// obligation at M.GH7.5.5 (Corrigendum #19) is: the in-circuit
+  /// `Unew.absorb_in_ro` squeeze at the final-step hash absorption MUST
+  /// equal the off-circuit `r_U.absorb_in_ro2` squeeze on the SAME
+  /// `FoldedInstance` content.
+  #[cfg(feature = "lookup-fold")]
+  pub comm_L_fold_per_table: Option<Vec<Commitment<E>>>,
+  /// Post-fold per-table running `comm_ts` hint; see
+  /// `comm_L_fold_per_table` doc for the Corrigendum #19 path α.2
+  /// soundness anchor and discipline.
+  #[cfg(feature = "lookup-fold")]
+  pub comm_ts_fold_per_table: Option<Vec<Commitment<E>>>,
 }
 
 impl<E: Engine> NIFS<E> {
@@ -532,6 +565,16 @@ impl<E: Engine> NIFS<E> {
         comm_inv_w: None,
         #[cfg(feature = "lookup-fold")]
         comm_inv_t: None,
+        // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2):
+        // non-lookup-fold (R1CS-only) prover path; no per-table commitments
+        // exist. The augmented-circuit `lookup_fold_k > 0` gate is what
+        // routes the multi-table path; this constructor is exercised only
+        // by vendor-internal `TrivialCircuit` / `CubicCircuit` tests under
+        // the non-multi-table path.
+        #[cfg(feature = "lookup-fold")]
+        comm_L_fold_per_table: None,
+        #[cfg(feature = "lookup-fold")]
+        comm_ts_fold_per_table: None,
       },
       (U, W),
     ))
@@ -827,6 +870,16 @@ impl<E: Engine> NIFS<E> {
       poly_lookup: Some(vec![poly_lookup]),
       comm_inv_w: Some(vec![comm_inv_w2]),
       comm_inv_t: Some(vec![comm_inv_t2]),
+      // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): post-fold
+      // per-table commitment hints are produced ONLY by the multi-table
+      // path. The single-table multi-column path
+      // (`prove_with_multi_column_lookup`) and this Stage-E single-table
+      // path do not feed the augmented-circuit multi-table verifier; leave
+      // the hint Vecs as `None`. Augmented-circuit allocation guards on
+      // `inputs.nifs.comm_L_fold_per_table.is_some()` via
+      // `AllocatedLookupNIFSMultiTable::alloc`.
+      comm_L_fold_per_table: None,
+      comm_ts_fold_per_table: None,
     };
 
     Ok((nifs, (U, W), folded_lw))
@@ -1227,6 +1280,13 @@ impl<E: Engine> NIFS<E> {
       poly_lookup: Some(vec![poly_lookup]),
       comm_inv_w: Some(vec![comm_inv_w2]),
       comm_inv_t: Some(vec![comm_inv_t2]),
+      // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): single-
+      // table multi-column path does not feed the augmented-circuit
+      // multi-table verifier; leave the hint Vecs as `None`. See the
+      // identical disposition at `prove_with_lookup` above for the
+      // Corrigendum #19 rationale.
+      comm_L_fold_per_table: None,
+      comm_ts_fold_per_table: None,
     };
 
     Ok((nifs, (U, W), folded_lw))
@@ -1724,6 +1784,24 @@ impl<E: Engine> NIFS<E> {
       folded_lw_per_table.push(folded_lw_j);
     }
 
+    // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): extract the
+    // post-fold per-table running commitments from `U` (the folded
+    // `FoldedInstance` produced by `U1.fold_with_lookup` at line 1683-1690
+    // above; that off-circuit fold body at `relation.rs:862-884` per
+    // Corrigendum #6 primitive 3 populates `U.comm_L = Some(comm_L_per_table_new)`
+    // and `U.comm_ts = Some(comm_ts_per_table_new)`). These Vec hints flow
+    // through the NIFS message into the augmented circuit's
+    // `AllocatedLookupNIFSMultiTable::alloc` consumer, which propagates them
+    // through `verify_with_multi_table_lookup` into the post-fold
+    // `AllocatedFoldedInstance::comm_L_per_table` via the widened
+    // `from_lookup_fold_output`. Soundness via IVC hash-chain binding
+    // (M.GH7.5.0a-landed `absorb_in_ro` extension) + envelope-side off-FS
+    // commitment-equality (Corrigendum #17 path (b)). Mirrors the
+    // `comm_W_fold` / `comm_E_fold` untrusted-hint discipline at
+    // `circuit/nifs.rs:46-55` / `:649-664`.
+    let comm_L_fold_per_table = U.comm_L.clone();
+    let comm_ts_fold_per_table = U.comm_ts.clone();
+
     // Per-table NIFS extension fields. The Vec fields carry the full
     // k-tuple; verifier reads them per-table at M.4.
     let nifs = NIFS {
@@ -1732,6 +1810,13 @@ impl<E: Engine> NIFS<E> {
       poly_lookup: Some(poly_lookup_vec),
       comm_inv_w: Some(comm_inv_w_vec),
       comm_inv_t: Some(comm_inv_t_vec),
+      // GH-#7 design pin Corrigendum #19 (M.GH7.5.0b path α.2): attach the
+      // post-fold per-table hints. `U.comm_L` / `U.comm_ts` are
+      // `Some(Vec<Commitment<E>>)` of length `k` whenever this prover path
+      // is taken (off-circuit `fold_with_lookup` body always populates
+      // them post-M.GH7.0a).
+      comm_L_fold_per_table,
+      comm_ts_fold_per_table,
     };
 
     Ok((nifs, (U, W), folded_lw_per_table))
