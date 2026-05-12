@@ -179,12 +179,20 @@
 
 use crate::{
   errors::NovaError,
-  neutron::relation::{FoldedInstance, FoldedWitness, Structure},
-  provider::traits::DlogGroup,
-  traits::{
-    commitment::CommitmentEngineTrait, Engine, TranscriptEngineTrait, TranscriptReprTrait,
+  neutron::{
+    relation::{FoldedInstance, FoldedWitness, Structure},
+    PublicParams, RecursiveSNARK,
   },
-  Commitment, CommitmentKey,
+  provider::traits::DlogGroup,
+  r1cs::{RelaxedR1CSInstance, RelaxedR1CSWitness},
+  spartan::snark::{
+    ProverKey as SpartanProverKey, RelaxedR1CSSNARK, VerifierKey as SpartanVerifierKey,
+  },
+  traits::{
+    circuit::StepCircuit, commitment::CommitmentEngineTrait, evaluation::EvaluationEngineTrait,
+    snark::RelaxedR1CSSNARKTrait, Engine, TranscriptEngineTrait, TranscriptReprTrait,
+  },
+  Commitment, CommitmentKey, DerandKey,
 };
 use ff::Field;
 use rand_core::OsRng;
@@ -240,10 +248,39 @@ pub struct BridgedNeutronInstance<E: Engine> {
   pub comm_W: Commitment<E>,
   /// First half of the rank-1 split-E commitment per Corrigendum #8 §1.2(a):
   /// `comm_E1 = MSM(E1, ck.ck[..left]) + h * r_E1`.
+  ///
+  /// M.GH7.0.2 (Corrigendum #11) — prefix-basis: served by `SplitECommitments::comm_E1`
+  /// without change. The same group element satisfies BOTH the off-FS Pedersen-additive
+  /// binding identity AND the Spartan sibling's PCS-opening shape on the E1 side
+  /// (`ck.ck[..left]` is simultaneously the prefix-of-prefix for `[E1||E2]`'s flat
+  /// commitment and the prefix basis for a standalone `commit(ck, E1, r_E1)`).
   pub comm_E1: Commitment<E>,
-  /// Second half of the rank-1 split-E commitment:
-  /// `comm_E2 = MSM(E2, ck.ck[left..left+right]) + h * r_E2`.
-  pub comm_E2: Commitment<E>,
+  /// PCS-opening-side commitment to `E2`, in the **prefix** basis (Corrigendum #11):
+  /// `comm_E2_pcs = MSM(E2, ck.ck[..right]) + h * r_E2_pcs`.
+  ///
+  /// **Field-rename from `comm_E2` at M.GH7.0.2 (Corrigendum #11 REWIRE).**
+  /// The pre-Corrigendum-#11 single `comm_E2` was suffix-basis and had to serve
+  /// BOTH the off-FS binding check AND the Spartan PCS-opening shape — which
+  /// required different generator slices (`ck.ck[left..left+right]` vs
+  /// `ck.ck[..right]`), an algebraic impossibility. Per Corrigendum #11 the
+  /// envelope now ships THREE commitments via [`SplitECommitments`]:
+  ///
+  /// - `comm_E1` (prefix-basis on E1) — this struct's `comm_E1` field above;
+  /// - `comm_E2_bind` (suffix-basis on E2) — published off-band on
+  ///   [`CompressedSNARK::comm_E2_bind`] and used ONLY for the off-FS
+  ///   Pedersen-additive binding check `comm_E1 + comm_E2_bind == r_U_derand.comm_E`;
+  /// - `comm_E2_pcs` (prefix-basis on E2) — THIS field, consumed by the
+  ///   Spartan T-claim sibling `RelaxedR1CSSNARK::prove_with_T_claim_split_error`
+  ///   as the second `comm_E2` argument (matching the sibling-internal contract
+  ///   at `snark.rs:1824-1825`).
+  ///
+  /// `to_transcript_bytes` byte-stream length is UNCHANGED by this rename
+  /// (still concatenates `comm_W || comm_E1 || comm_E2_pcs || u || X` in the
+  /// same order). The Σ-protocol equality-of-opening proof at M.GH7.0.1b
+  /// (`SigmaE2EqualityProof`) is what ties `comm_E2_bind` and `comm_E2_pcs`
+  /// to the same algebraic `E2` — without that Σ-protocol the envelope would
+  /// be unsound (see module-level documentation).
+  pub comm_E2_pcs: Commitment<E>,
   /// Running relaxation scalar, identity-bridged from `FoldedInstance::u`.
   pub u: E::Scalar,
   /// Public input vector, identity-bridged from `FoldedInstance::X`.
@@ -266,7 +303,7 @@ impl<E: Engine> TranscriptReprTrait<E::GE> for BridgedNeutronInstance<E> {
     [
       self.comm_W.to_transcript_bytes(),
       self.comm_E1.to_transcript_bytes(),
-      self.comm_E2.to_transcript_bytes(),
+      self.comm_E2_pcs.to_transcript_bytes(),
       self.u.to_transcript_bytes(),
       self.X.as_slice().to_transcript_bytes(),
     ]
@@ -779,6 +816,605 @@ where
   }
 
   Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M.GH7.0.2 — `neutron::CompressedSNARK<E, EE>` envelope.
+//
+// Authored per GH-#7 / Stage K design pin Corrigenda #8 + #10 + #11 REWIRE.
+// Single-curve 2-parameter envelope (NOT the classic-Nova 5-parameter shape —
+// the secondary-curve `E2` collapses under the NeutronNova IVC discipline,
+// which runs a single Pasta-style cycle entirely on `E1`).
+//
+// # Bridge architecture (Corrigendum #10 §1.2(a) β′ + Corrigendum #11 REWIRE)
+//
+// The envelope bridges the IVC-final folded state
+// `(r_U: FoldedInstance<E>, r_W: FoldedWitness<E>)` into the
+// `BridgedNeutronInstance<E>` consumed by Spartan's T-claim sibling
+// `RelaxedR1CSSNARK::prove_with_T_claim_split_error`, with a Σ-protocol
+// equality-of-opening proof closing the basis-collision gap between the
+// off-FS binding side (`comm_E2_bind` against the suffix basis
+// `ck.ck[left..left+right]`) and the Spartan PCS-opening side
+// (`comm_E2_pcs` against the prefix basis `ck.ck[..right]`):
+//
+//   1. Build BLINDED `SplitECommitments { comm_E1, comm_E2_bind,
+//      comm_E2_pcs, r_E1, r_E2_bind, r_E2_pcs }` via [`split_E_commitments`]
+//      against the (still-blinded) `(FoldedInstance, FoldedWitness,
+//      Structure)` triple. By M.GH7.0.1 REWORKED helper contract,
+//      `comm_E1 + comm_E2_bind == r_U.comm_E` and `r_E1 + r_E2_bind ==
+//      r_W.r_E`. The third commitment `comm_E2_pcs` opens to the SAME
+//      algebraic E2 in the prefix basis (Corrigendum #11).
+//
+//   2. Bridge `r_W → RelaxedR1CSWitness<E>` by field-copy
+//      (W/r_W/E/r_E). Bridge `r_U → RelaxedR1CSInstance<E>` by field-copy
+//      (comm_W/comm_E/u/X — T is held separately and threaded into
+//      `BridgedNeutronInstance.T`).
+//
+//   3. Derandomize the witness via `RelaxedR1CSWitness::derandomize()`,
+//      yielding `(W_derand, blind_W, blind_E)`. Derandomize the instance
+//      via `RelaxedR1CSInstance::derandomize(&dk, &blind_W, &blind_E)`
+//      against the same dk, mirror of `vendor/nova/src/nova/mod.rs:841-848`.
+//
+//   4. Derandomize all THREE split-E commitments against their respective
+//      blindings via `E::CE::derandomize(&dk, &comm, &r)`. Pedersen-
+//      additive identity is preserved at the derandomized layer:
+//          comm_E1_derand + comm_E2_bind_derand
+//        = MSM(E1, ck[..left]) + MSM(E2_pad, ck[..left+right])
+//        = MSM([E1 || E2], ck[..left+right])
+//        = r_U_derand.comm_E
+//      i.e., the binding check `comm_E1 + comm_E2_bind == r_U_derand.comm_E`
+//      holds against the derandomized envelope's `r_U_derand.comm_E`.
+//
+//   5. Construct an **envelope-side transcript** with the distinct domain
+//      separator `b"NeutronCompressedSNARK_envelope"` (FS-isolation from
+//      the Spartan sibling's `b"RelaxedR1CSSNARK"` transcript per
+//      Falsifier H). Absorb `(vk, ...)` under the SAME ordering pin
+//      §1.2(a) Primitive 6 requires before invoking the Σ-protocol
+//      prover. The Σ-protocol helper itself absorbs `(T_bind, T_pcs)` and
+//      squeezes `α` — the helper requires the caller to absorb
+//      `(vk_digest, r_U_comm_E, comm_E1, comm_E2_bind, comm_E2_pcs)`
+//      BEFORE calling, which we do.
+//
+//   6. Invoke `prove_sigma_E2_equality(...)` over the envelope-side
+//      transcript, producing a `SigmaE2EqualityProof<E>` that ties
+//      `comm_E2_bind` and `comm_E2_pcs` to the SAME algebraic E2.
+//
+//   7. Construct `U_bridged: BridgedNeutronInstance` carrying
+//      `(comm_W: r_U_derand.comm_W, comm_E1: comm_E1_derand,
+//        comm_E2_pcs: comm_E2_pcs_derand, u: r_U.u, X: r_U.X.clone(),
+//        T: r_U.T)`. The scalars `(u, X, T)` are NOT affected by
+//      derandomization (only group elements are).
+//
+//   8. Invoke `RelaxedR1CSSNARK::prove_with_T_claim_split_error(
+//          &ck, &pk.pk_spartan, &S, &U_bridged, &W_derand,
+//          comm_E1_derand, comm_E2_pcs_derand, &E1, &E2,
+//          r_U.T, r_E1, r_E2_pcs)`. The sibling receives `(comm_E1,
+//      comm_E2_pcs)` in the prefix basis on both sides (matches sibling-
+//      internal contract at `snark.rs:1445-1446` + `:1824-1825`); the
+//      sibling initialises its OWN fresh `b"RelaxedR1CSSNARK"` transcript
+//      at entry — FS-isolated from the envelope-side transcript at the
+//      domain-separator stage.
+//
+// # Verifier discipline (Corrigendum #8 (iv-B) + Corrigendum #10 + #11)
+//
+// (1) Off-FS Pedersen-additive binding check (Corrigendum #8 (iv-B)):
+//     `self.U_bridged.comm_E1 + self.comm_E2_bind == self.r_U_derand_comm_E`
+//     at the group level. If false, reject with
+//     `NovaError::ProofVerifyError { reason: "off-FS Pedersen-additive
+//     binding rejected" }`.
+//
+// (2) Σ-protocol equality-of-opening (Corrigendum #11): build a FRESH
+//     `E::TE::new(b"NeutronCompressedSNARK_envelope")` transcript,
+//     absorb `(vk, r_U_derand_comm_E, comm_E1, comm_E2_bind, comm_E2_pcs)`
+//     in the SAME fixed order as the prover, invoke
+//     `verify_sigma_E2_equality(...)`. Rejection delegates to the helper's
+//     own reason strings ("Sigma E2 equality-of-opening rejected at
+//     bind-side" / "pcs-side").
+//
+// (3) Spartan T-claim sibling verify (Corrigendum #10): delegate to
+//     `self.snark_spartan.verify_with_T_claim_split_error(
+//         &vk.vk_spartan, &self.U_bridged,
+//         self.U_bridged.comm_E1, self.U_bridged.comm_E2_pcs)`.
+//     The sibling initialises its OWN fresh `b"RelaxedR1CSSNARK"`
+//     transcript at entry (verify-don't-assume against
+//     `snark.rs::verify_with_T_claim_split_error` body, line 1149) — the
+//     envelope MUST NOT construct a transcript that the sibling reads.
+//
+// (4) IVC final state check: assert `zn == self.zn`.
+//
+// # FS-isolation discipline (Falsifier H)
+//
+// Two independent `E::TE` instances exist in the verify flow:
+//   - envelope-side: `b"NeutronCompressedSNARK_envelope"` (used only for
+//     the Σ-protocol verify; NEVER threaded into the Spartan sibling);
+//   - Spartan-side: `b"RelaxedR1CSSNARK"` (constructed fresh inside
+//     `RelaxedR1CSSNARK::verify_with_T_claim_split_error` line 1149;
+//     NEVER threaded out to the envelope).
+// The two transcripts are byte-independent at the domain-separator stage.
+// A future maintainer who threads a single `E::TE` through both layers
+// would re-bind the Σ-protocol `α` to the Spartan-side absorb log and
+// break FS-soundness — see Falsifier H STOP-AND-ASK at dispatch §"STOP-
+// AND-ASK triggers". The Σ-protocol's b"...envelope" dom-sep test (case
+// (e) at compressed_snark.rs:1387-1432) is the empirical close.
+// ---------------------------------------------------------------------------
+
+/// `CompressedSNARK` envelope for the NeutronNova IVC produced by
+/// [`RecursiveSNARK`]. Wraps a Spartan-side `RelaxedR1CSSNARK<E, EE>` proof
+/// produced via the T-claim sibling
+/// [`RelaxedR1CSSNARK::prove_with_T_claim_split_error`] (Corrigendum #10),
+/// together with the derandomized [`BridgedNeutronInstance`], the off-band
+/// `comm_E2_bind` (suffix-basis binding-side commitment), the
+/// [`SigmaE2EqualityProof`] that ties `comm_E2_bind` to `comm_E2_pcs` at
+/// the same algebraic E2 (Corrigendum #11), and the IVC final state `zn`.
+///
+/// Single-curve 2-parameter (`E`, `EE`) — the secondary curve `E2` of the
+/// classic-Nova 5-parameter envelope collapses under NeutronNova's single-
+/// curve IVC discipline.
+///
+/// # Soundness anchors (Corrigenda #8 + #10 + #11)
+///
+/// - Off-FS Pedersen-additive binding `comm_E1 + comm_E2_bind ==
+///   r_U_derand.comm_E` enforced at the envelope (Corrigendum #8 (iv-B)).
+/// - Σ-protocol equality-of-opening ties `comm_E2_bind` (suffix-basis,
+///   used only for the binding identity) to `comm_E2_pcs` (prefix-basis,
+///   consumed by Spartan PCS-opening) at the same algebraic E2
+///   (Corrigendum #11 Primitive 6).
+/// - Tensor-form factorisation `eval_E1 · eval_E2 == eval_E` enforced
+///   inside the Spartan sibling's verifier (`snark.rs:1144-1147`).
+/// - Neutron-form residue `sum_x full_E(x)·(Az·Bz − Cz) = T` discharged
+///   by the Spartan sibling's outer sumcheck with claim = T (Corrigendum
+///   #10 §1.2(a)).
+/// - `T_claim` absorb-before-squeeze discipline enforced inside the
+///   Spartan sibling (`snark.rs:953-954`).
+// `Clone` / `Debug` not derived to match the upstream Spartan sibling
+// (`spartan::snark::RelaxedR1CSSNARK` does not derive `Clone`; its
+// `EE::EvaluationArgument` associated type is not `Debug`). The M.GH7.1
+// polish step will reconsider if downstream consumers need these.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+#[allow(non_snake_case)]
+pub struct CompressedSNARK<E, EE>
+where
+  E: Engine,
+  EE: EvaluationEngineTrait<E>,
+  E::GE: DlogGroup,
+{
+  /// Derandomized bridged neutron instance consumed by the Spartan sibling.
+  /// Carries `(comm_W_derand, comm_E1_derand, comm_E2_pcs_derand, u, X, T)`.
+  /// The verifier runs the off-FS Pedersen-additive binding `comm_E1 +
+  /// comm_E2_bind == r_U_derand_comm_E` against the envelope-published
+  /// `r_U_derand_comm_E` field below, with `comm_E2_bind` held separately
+  /// (NOT in `U_bridged`, which carries `comm_E2_pcs`).
+  pub U_bridged: BridgedNeutronInstance<E>,
+
+  /// Derandomized R1CS-side error-vector commitment `r_U_derand.comm_E`.
+  /// Published so the verifier can run the off-FS Pedersen-additive
+  /// binding check `comm_E1 + comm_E2_bind == r_U_derand_comm_E` without
+  /// re-deriving the derandomization on the verifier side. (The blinding
+  /// factors used to derandomize are PROVER-SIDE; the verifier cannot
+  /// reconstruct them from `vk` alone.)
+  pub r_U_derand_comm_E: Commitment<E>,
+
+  /// Derandomized SUFFIX-basis commitment to `E2`. Used ONLY for the
+  /// off-FS Pedersen-additive binding identity `comm_E1 + comm_E2_bind ==
+  /// r_U_derand_comm_E` per Corrigendum #8 (iv-B). The Σ-protocol at
+  /// [`Self::sigma_E2_equality`] ties this to `U_bridged.comm_E2_pcs` at
+  /// the same algebraic E2 (Corrigendum #11).
+  pub comm_E2_bind: Commitment<E>,
+
+  /// Σ-protocol equality-of-opening proof (Corrigendum #11 Primitive 6).
+  /// Asserts `comm_E2_bind` and `U_bridged.comm_E2_pcs` open to the same
+  /// `E2 ∈ F^{right}` under their respective bases. Without this proof
+  /// the envelope would be unsound (a malicious prover could supply
+  /// `comm_E2_pcs := MSM(E2', ck.ck[..right]) + h · r_E2_pcs` for any
+  /// `E2' ≠ E2`, and the off-FS binding check would not catch the
+  /// substitution).
+  pub sigma_E2_equality: SigmaE2EqualityProof<E>,
+
+  /// Spartan-side T-claim sibling proof produced by
+  /// [`RelaxedR1CSSNARK::prove_with_T_claim_split_error`].
+  pub snark_spartan: RelaxedR1CSSNARK<E, EE>,
+
+  /// IVC final state, mirrors `nova::CompressedSNARK::zn` precedent.
+  pub zn: Vec<E::Scalar>,
+}
+
+/// Prover key for [`CompressedSNARK`]. Wraps the Spartan-side prover key
+/// produced by `<RelaxedR1CSSNARK<E, EE>>::setup`. Single-curve 2-parameter
+/// minimum surface; M.GH7.1 polishes the surrounding fields.
+// `Clone` / `Debug` not derived: matches upstream `spartan::snark::ProverKey`.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct ProverKey<E, EE>
+where
+  E: Engine,
+  EE: EvaluationEngineTrait<E>,
+{
+  pub(crate) pk_spartan: SpartanProverKey<E, EE>,
+}
+
+/// Verifier key for [`CompressedSNARK`]. Wraps the Spartan-side verifier
+/// key + the `F_arity`/`ro_consts`/`pp_digest` needed for IVC-final-state
+/// validation + the `DerandKey<E>` consumed by the off-FS Pedersen-
+/// additive binding reconstruction.
+///
+/// M.GH7.1 polishes the `pp_digest` / `shape_registry_digest` /
+/// `lookup_fold_k` wiring; for M.GH7.0.2 we carry only the minimum
+/// `(vk_spartan, dk, F_arity)` needed for the binding check + Σ-protocol
+/// verify + Spartan sibling verify.
+// `Clone` / `Debug` not derived: matches upstream `spartan::snark::VerifierKey`.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+#[allow(non_snake_case)]
+pub struct VerifierKey<E, EE>
+where
+  E: Engine,
+  EE: EvaluationEngineTrait<E>,
+  E::GE: DlogGroup,
+{
+  pub(crate) vk_spartan: SpartanVerifierKey<E, EE>,
+  pub(crate) dk: DerandKey<E>,
+  pub(crate) F_arity: usize,
+  /// Carried for the Σ-protocol verify (which needs `structure.left`
+  /// + `structure.right` to perform the zero-padded suffix-basis trick
+  /// inside `verify_sigma_E2_equality`). Cloned from `PublicParams::structure`
+  /// at `setup`.
+  pub(crate) structure: Structure<E>,
+  /// Carried for the off-FS Pedersen-additive binding check (which needs
+  /// access to `ck` for the Σ-protocol verifier's `CE::commit` calls).
+  pub(crate) ck: CommitmentKey<E>,
+}
+
+impl<E, EE> CompressedSNARK<E, EE>
+where
+  E: Engine,
+  EE: EvaluationEngineTrait<E>,
+  E::GE: DlogGroup,
+{
+  /// Creates prover and verifier keys for [`CompressedSNARK`].
+  ///
+  /// Forwards to `<RelaxedR1CSSNARK<E, EE> as RelaxedR1CSSNARKTrait<E>>::setup`
+  /// against the neutron R1CS shape and commitment key, mirroring
+  /// `vendor/nova/src/nova/mod.rs:765-766` for the single-curve case.
+  pub fn setup<E2, C>(
+    pp: &PublicParams<E, E2, C>,
+  ) -> Result<(ProverKey<E, EE>, VerifierKey<E, EE>), NovaError>
+  where
+    E2: Engine<Base = <E as Engine>::Scalar>,
+    E: Engine<Base = <E2 as Engine>::Scalar>,
+    C: StepCircuit<E::Scalar>,
+  {
+    let (pk_spartan, vk_spartan) =
+      <RelaxedR1CSSNARK<E, EE> as RelaxedR1CSSNARKTrait<E>>::setup(&pp.ck, &pp.structure.S)?;
+
+    let pk = ProverKey { pk_spartan };
+    let vk = VerifierKey {
+      vk_spartan,
+      dk: <E::CE as CommitmentEngineTrait<E>>::derand_key(&pp.ck),
+      F_arity: pp.F_arity,
+      structure: pp.structure.clone(),
+      ck: pp.ck.clone(),
+    };
+    Ok((pk, vk))
+  }
+
+  /// Create a new [`CompressedSNARK`] from an IVC-final [`RecursiveSNARK`].
+  ///
+  /// Thin wrapper around [`CompressedSNARK::prove_from_parts`] — extracts
+  /// the final folded state `(r_U, r_W, zi)` from the [`RecursiveSNARK`]
+  /// and forwards to the parts-based prover. M.GH7.1 polishes the
+  /// `RecursiveSNARK` field-access discipline.
+  pub fn prove<E2, C>(
+    pp: &PublicParams<E, E2, C>,
+    pk: &ProverKey<E, EE>,
+    recursive_snark: &RecursiveSNARK<E, E2, C>,
+  ) -> Result<Self, NovaError>
+  where
+    E2: Engine<Base = <E as Engine>::Scalar>,
+    E: Engine<Base = <E2 as Engine>::Scalar>,
+    C: StepCircuit<E::Scalar>,
+  {
+    Self::prove_from_parts(
+      &pp.ck,
+      &pp.structure,
+      pk,
+      &recursive_snark.r_U,
+      &recursive_snark.r_W,
+      recursive_snark.zi.clone(),
+    )
+  }
+
+  /// Parts-based prover (M.GH7.0.2 acceptance-test entry point).
+  ///
+  /// Authored as a `pub(crate)` parts-based prover so the in-crate
+  /// acceptance test can exercise the envelope without needing to drive a
+  /// full `RecursiveSNARK::prove_step` cycle (which hits the pre-existing
+  /// `batch_diff_size` vendor shape issue at `spartan/mod.rs:175-189` when
+  /// `W.W.len() != max(left, right)`). The path through `prove` above is
+  /// the production-facing surface; this is the testable surface.
+  ///
+  /// Executes the Corrigendum #10 §1.2(a) β′ bridge + Corrigendum #11
+  /// Σ-protocol equality-of-opening composition as documented in the
+  /// module-level docblock above.
+  #[allow(non_snake_case)]
+  pub(crate) fn prove_from_parts(
+    ck: &CommitmentKey<E>,
+    structure: &Structure<E>,
+    pk: &ProverKey<E, EE>,
+    r_U: &FoldedInstance<E>,
+    r_W: &FoldedWitness<E>,
+    zn: Vec<E::Scalar>,
+  ) -> Result<Self, NovaError> {
+    // (1) Build BLINDED SplitECommitments via M.GH7.0.1 REWORKED helper.
+    let SplitECommitments {
+      comm_E1: comm_E1_blinded,
+      comm_E2_bind: comm_E2_bind_blinded,
+      comm_E2_pcs: comm_E2_pcs_blinded,
+      r_E1,
+      r_E2_bind,
+      r_E2_pcs,
+    } = split_E_commitments(ck, r_W, r_U, structure);
+
+    // (2) Bridge FoldedWitness → RelaxedR1CSWitness by field-copy.
+    // The `E` field is carried verbatim (flat `[E1 || E2]` of length
+    // `left + right`); `RelaxedR1CSWitness::pad(&S)` extends it with zeros
+    // inside the Spartan sibling. The pad zeros do NOT participate in the
+    // prover's algebra — `prove_with_T_claim_split_error` reads only `W.W`
+    // (for `z`) and the externally-supplied `(E1, E2)` slices; `W.E` is
+    // unused post-pad by the prover (and the verifier never sees it).
+    let bridged_witness: RelaxedR1CSWitness<E> = RelaxedR1CSWitness {
+      W: r_W.W.clone(),
+      r_W: r_W.r_W,
+      E: r_W.E.clone(),
+      r_E: r_W.r_E,
+    };
+
+    // Bridge FoldedInstance → RelaxedR1CSInstance by field-copy. `T` is
+    // NOT carried on `RelaxedR1CSInstance` — it threads through
+    // `U_bridged.T` separately.
+    let bridged_instance: RelaxedR1CSInstance<E> = RelaxedR1CSInstance {
+      comm_W: r_U.comm_W,
+      comm_E: r_U.comm_E,
+      u: r_U.u,
+      X: r_U.X.clone(),
+    };
+
+    // (3) Derandomize the witness and instance (mirror of
+    // `vendor/nova/src/nova/mod.rs:841-848`).
+    let dk = <E::CE as CommitmentEngineTrait<E>>::derand_key(ck);
+    let (W_derand, blind_W, blind_E) = bridged_witness.derandomize();
+    let U_derand = bridged_instance.derandomize(&dk, &blind_W, &blind_E);
+
+    // (4) Derandomize all THREE split-E commitments. The Pedersen-additive
+    // identity is preserved at the derandomized layer because the
+    // derandomize op strips the `h · r_·` term symmetrically across both
+    // halves of the binding sum:
+    //   comm_E1_derand + comm_E2_bind_derand
+    //     = (comm_E1_blinded - h·r_E1) + (comm_E2_bind_blinded - h·r_E2_bind)
+    //     = comm_E1_blinded + comm_E2_bind_blinded - h·(r_E1 + r_E2_bind)
+    //     = U.comm_E - h·W.r_E
+    //     = U_derand.comm_E.
+    let comm_E1_derand =
+      <E::CE as CommitmentEngineTrait<E>>::derandomize(&dk, &comm_E1_blinded, &r_E1);
+    let comm_E2_bind_derand =
+      <E::CE as CommitmentEngineTrait<E>>::derandomize(&dk, &comm_E2_bind_blinded, &r_E2_bind);
+    let comm_E2_pcs_derand =
+      <E::CE as CommitmentEngineTrait<E>>::derandomize(&dk, &comm_E2_pcs_blinded, &r_E2_pcs);
+
+    // Split `(E1, E2)` from the FLAT `r_W.E` per Structure's `left`
+    // partition. The slices are length `structure.left` and
+    // `structure.right` respectively, matching the Σ-protocol's vector-
+    // arithmetic guards (Falsifier J) and the Spartan sibling's
+    // `assert_eq!(E1.len(), left)` / `assert_eq!(E2.len(), right)` at
+    // `snark.rs:965-966`.
+    let (E1_slice, E2_slice) = r_W.E.split_at(structure.left);
+    let E1: Vec<E::Scalar> = E1_slice.to_vec();
+    let E2: Vec<E::Scalar> = E2_slice.to_vec();
+
+    // (5) Initialise the ENVELOPE-side transcript with the distinct
+    // domain separator `b"NeutronCompressedSNARK_envelope"`. This is the
+    // FS-isolation discipline (Falsifier H): the Spartan sibling will
+    // initialise its OWN fresh `b"RelaxedR1CSSNARK"` transcript inside
+    // `prove_with_T_claim_split_error` — the two transcripts NEVER share
+    // bytes.
+    //
+    // Pre-helper absorb order (pin §1.2(a) Primitive 6):
+    //   ts_env.absorb(b"vk",            &pk.vk_spartan.vk_digest)
+    //   ts_env.absorb(b"r_U_comm_E",    &r_U_derand_comm_E)   -- via helper
+    //   ts_env.absorb(b"comm_E1",       &comm_E1_derand)      -- via helper
+    //   ts_env.absorb(b"comm_E2_bind",  &comm_E2_bind_derand) -- via helper
+    //   ts_env.absorb(b"comm_E2_pcs",   &comm_E2_pcs_derand)  -- via helper
+    //   ts_env.absorb(b"sigma_T_bind",  &T_bind)              -- inside helper
+    //   ts_env.absorb(b"sigma_T_pcs",   &T_pcs)               -- inside helper
+    //   α := ts_env.squeeze(b"sigma_E2_equality_alpha")       -- inside helper
+    //
+    // The envelope owns the `b"vk"` absorb (pin line 258). The helper
+    // body owns the rest (compressed_snark.rs:656-662 above).
+    let mut ts_env = <E as Engine>::TE::new(b"NeutronCompressedSNARK_envelope");
+    ts_env.absorb(b"vk", &pk.pk_spartan.vk_digest);
+
+    // (6) Σ-protocol equality-of-opening prove (Corrigendum #11
+    // Primitive 6). Ties `comm_E2_bind_derand` and `comm_E2_pcs_derand` to
+    // the same `E2 ∈ F^{right}` under their respective bases.
+    //
+    // BLINDING CONSISTENCY: the Σ-protocol's bind-side acceptance equation
+    //   MSM(z, ck.ck[left..left+right]) + h·z_r_bind == T_bind + α·comm_E2_bind
+    // requires the published `comm_E2_bind` to be the commit-with-blinding-
+    // `r_E2_bind` Pedersen value. We publish the DERANDOMIZED
+    // `comm_E2_bind_derand` (the h·r_E2_bind term stripped), so the
+    // effective blinding on the published commitment is ZERO. Same logic
+    // on the pcs-side. Threading the original `(r_E2_bind, r_E2_pcs)`
+    // would make LHS exceed RHS by `α·h·r_E2_bind` (resp.
+    // `α·h·r_E2_pcs`) on each equation, and the verifier would reject
+    // honest proofs — empirically observed at the 2026-05-12 GREEN-halt
+    // before the blinding-consistency fix. Pass ZERO blindings to match
+    // the derandomized commitments published in the envelope.
+    let sigma_E2_equality = prove_sigma_E2_equality::<E>(
+      ck,
+      structure,
+      &E2,
+      &E::Scalar::ZERO,
+      &E::Scalar::ZERO,
+      &comm_E1_derand,
+      &comm_E2_bind_derand,
+      &comm_E2_pcs_derand,
+      &U_derand.comm_E,
+      &mut ts_env,
+    )?;
+
+    // (7) Construct U_bridged carrying the derandomized prefix-basis
+    // commitments (comm_E1, comm_E2_pcs) and the running neutron-form
+    // claim T. `(u, X, T)` are unaffected by derandomization.
+    let U_bridged = BridgedNeutronInstance::<E> {
+      comm_W: U_derand.comm_W,
+      comm_E1: comm_E1_derand,
+      comm_E2_pcs: comm_E2_pcs_derand,
+      u: r_U.u,
+      X: r_U.X.clone(),
+      T: r_U.T,
+    };
+
+    // (8) Invoke the Spartan T-claim sibling (Corrigendum #10 + #11).
+    // The sibling consumes `(comm_E1_derand, comm_E2_pcs_derand)` — BOTH
+    // in the prefix basis — matching the sibling-internal contract at
+    // `snark.rs:1824-1825` where the sibling's own tests commit via
+    // `CE::commit(ck, &E2, &r)` against `ck.ck[..right]` with ZERO
+    // blinding. The trailing blinding scalars `(_r_E1, _r_E2)` are
+    // underscored in the sibling body (`snark.rs:936-937`) — they are
+    // formal arguments only and pass ZERO for blinding-consistency with
+    // the derandomized commitments (`comm_E1_derand` and
+    // `comm_E2_pcs_derand` have their `h·r` terms stripped, so the
+    // effective blinding on the published commitment is ZERO; this
+    // matches what the M.GH7.0.0b sibling test passes at `snark.rs:1822-
+    // 1823` where `r_E1 = r_E2 = E::Scalar::ZERO`).
+    let snark_spartan = RelaxedR1CSSNARK::<E, EE>::prove_with_T_claim_split_error(
+      ck,
+      &pk.pk_spartan,
+      &structure.S,
+      &U_bridged,
+      &W_derand,
+      comm_E1_derand,
+      comm_E2_pcs_derand,
+      &E1,
+      &E2,
+      r_U.T,
+      E::Scalar::ZERO,
+      E::Scalar::ZERO,
+    )?;
+
+    Ok(CompressedSNARK {
+      U_bridged,
+      r_U_derand_comm_E: U_derand.comm_E,
+      comm_E2_bind: comm_E2_bind_derand,
+      sigma_E2_equality,
+      snark_spartan,
+      zn,
+    })
+  }
+
+  /// Verify the [`CompressedSNARK`] envelope.
+  ///
+  /// (1) **Off-FS Pedersen-additive binding check** (LOAD-BEARING per
+  ///     Corrigendum #8 (iv-B)): assert
+  ///     `self.U_bridged.comm_E1 + self.comm_E2_bind ==
+  ///      self.r_U_derand_comm_E` at the GROUP level. If false, reject
+  ///     with [`NovaError::ProofVerifyError`].
+  /// (2) **Σ-protocol equality-of-opening verify** (Corrigendum #11
+  ///     Primitive 6): build a FRESH `E::TE` initialised with
+  ///     `b"NeutronCompressedSNARK_envelope"`, absorb `(vk, r_U_derand_comm_E,
+  ///     comm_E1, comm_E2_bind, comm_E2_pcs)` in the SAME fixed order as
+  ///     the prover, invoke
+  ///     [`verify_sigma_E2_equality`]. The helper's own rejections
+  ///     ("bind-side" / "pcs-side") propagate up.
+  /// (3) **Spartan T-claim sibling verify**: delegate to
+  ///     [`RelaxedR1CSSNARK::verify_with_T_claim_split_error`] for the
+  ///     outer-sumcheck-with-claim-T + tensor-factorisation +
+  ///     inner-sumcheck + batch-eval + PCS opening (Corrigendum #10).
+  /// (4) **IVC final state check**: assert `zn == self.zn` (caller-
+  ///     supplied final state matches prover-claimed final state).
+  ///
+  /// Note: full `pp_digest` / `num_steps` / output-hash check (the
+  /// `nova::CompressedSNARK::verify` precedent at `nova/mod.rs:935-960`)
+  /// is M.GH7.1 polish. For M.GH7.0.2 STAGE 0 we check the binding +
+  /// the Σ-protocol + the sibling proof + the zn match — which is
+  /// sufficient for the envelope-shape acceptance gate.
+  ///
+  /// # Arguments
+  /// - `vk`: the verifier key produced by [`CompressedSNARK::setup`].
+  /// - `_num_steps`: reserved for the M.GH7.1 polish; currently unused.
+  /// - `_z0`: reserved for the M.GH7.1 polish; currently unused.
+  /// - `zn`: caller-supplied final state, must match `self.zn`.
+  ///
+  /// # Returns
+  /// `Ok(self.zn.clone())` on success.
+  pub fn verify(
+    &self,
+    vk: &VerifierKey<E, EE>,
+    _num_steps: usize,
+    _z0: &[E::Scalar],
+    zn: &[E::Scalar],
+  ) -> Result<Vec<E::Scalar>, NovaError> {
+    // (1) Off-FS Pedersen-additive binding check (Corrigendum #8 (iv-B)).
+    // The group equation `comm_E1 + comm_E2_bind == r_U_derand_comm_E`
+    // must hold byte-equal — `comm_E1` is the prefix-basis half on E1,
+    // `comm_E2_bind` is the suffix-basis half on E2, and their flat sum
+    // matches `r_U_derand.comm_E = MSM([E1||E2], ck.ck[..left+right])`
+    // at the derandomized layer (no h·r terms remain).
+    if self.U_bridged.comm_E1 + self.comm_E2_bind != self.r_U_derand_comm_E {
+      return Err(NovaError::ProofVerifyError {
+        reason:
+          "off-FS Pedersen-additive binding rejected: comm_E1 + comm_E2_bind != r_U_derand_comm_E"
+            .to_string(),
+      });
+    }
+
+    // (2) Σ-protocol equality-of-opening verify (Corrigendum #11
+    // Primitive 6). Initialise a FRESH envelope-side transcript at the
+    // SAME domain separator as the prover; absorb `vk_digest` under the
+    // SAME `b"vk"` label; the helper continues the absorb sequence in the
+    // fixed order pinned at §1.2(a) lines 259-265.
+    //
+    // FS-isolation discipline: this transcript is NEVER threaded into the
+    // Spartan sibling — the sibling constructs its OWN fresh
+    // `b"RelaxedR1CSSNARK"` transcript at entry to
+    // `verify_with_T_claim_split_error` (snark.rs:1149). Threading a
+    // single instance through both layers would re-bind α to the
+    // Spartan-side absorb log; Falsifier H STOP-AND-ASK in dispatch.
+    use crate::traits::snark::DigestHelperTrait;
+    let mut ts_env = <E as Engine>::TE::new(b"NeutronCompressedSNARK_envelope");
+    ts_env.absorb(b"vk", &vk.vk_spartan.digest());
+    verify_sigma_E2_equality::<E>(
+      &vk.ck,
+      &vk.structure,
+      &self.U_bridged.comm_E1,
+      &self.comm_E2_bind,
+      &self.U_bridged.comm_E2_pcs,
+      &self.r_U_derand_comm_E,
+      &self.sigma_E2_equality,
+      &mut ts_env,
+    )?;
+
+    // (3) Delegate the FS-discipline + sumcheck + PCS verify to the
+    // Spartan sibling. The sibling internally absorbs `vk` → `U_bridged`
+    // → `T_claim` BEFORE any squeeze (Corrigendum #10 Primitive 5
+    // binding). The two commitments threaded are the prefix-basis
+    // `(comm_E1, comm_E2_pcs)` matching the sibling-internal contract.
+    self.snark_spartan.verify_with_T_claim_split_error(
+      &vk.vk_spartan,
+      &self.U_bridged,
+      self.U_bridged.comm_E1,
+      self.U_bridged.comm_E2_pcs,
+    )?;
+
+    // (4) IVC final state check.
+    if zn != self.zn.as_slice() {
+      return Err(NovaError::ProofVerifyError {
+        reason: "Caller-supplied zn does not match prover-claimed self.zn".to_string(),
+      });
+    }
+
+    Ok(self.zn.clone())
+  }
 }
 
 #[cfg(test)]
@@ -1517,6 +2153,433 @@ mod tests {
         &mut verifier_ts,
       )
       .unwrap_or_else(|e| panic!("Σ-verifier rejected honest proof at iter {}: {:?}", iter, e));
+    }
+  }
+
+  // =========================================================================
+  // M.GH7.0.2 tests (Corrigenda #8 + #10 + #11) — `neutron::CompressedSNARK`
+  // envelope round-trip + binding-check + Σ-protocol verify.
+  //
+  // Per roadmap step 01-04 criteria:
+  //
+  // (a) **Acceptance**: round-trip prove/verify against a satisfying
+  //     neutron-form `(FoldedInstance, FoldedWitness, Structure)` triple at
+  //     `left = right = 2, num_cons = 4` (the shape floor that sidesteps the
+  //     pre-existing `batch_diff_size` panic at `spartan/mod.rs:175-189` —
+  //     mirrors the M.GH7.0.0b sibling test's shape choice). Asserts
+  //     `CompressedSNARK::verify` returns `Ok(zn)` AND the off-FS Pedersen-
+  //     additive binding holds as an INDEPENDENT structural assertion (not
+  //     just verify happy-path — pins the binding check is wired).
+  //
+  // (b) **Negative — off-FS binding**: perturb `comm_E2_bind` by `+δ` post-
+  //     prove; assert `verify` rejects at check (1) with the "off-FS
+  //     Pedersen-additive binding rejected" reason. This pins the binding
+  //     check is load-bearing and fires BEFORE the Σ-protocol verify.
+  //
+  // (c) **Negative — Σ-protocol**: perturb `sigma_E2_equality.z[0]` post-
+  //     prove; assert `verify` rejects at check (2) with a Σ-protocol
+  //     reason string ("Sigma E2 equality-of-opening rejected at bind-side"
+  //     or "...pcs-side"). This pins the Σ-protocol verify is wired and
+  //     load-bearing.
+  //
+  // (d) **1000-iter differential** (US-05 reviewer-reproducibility): 1000
+  //     ChaCha20Rng-seeded round-trips at shape `(left=2, right=2)`. The
+  //     shape sweep `{(4,2), (2,4), (4,4)}` is NOT exercised here — those
+  //     shapes hit the `batch_diff_size` panic in the prove path. Coverage
+  //     across shapes is provided by the algebra-only assertions in
+  //     M.GH7.0.1 REWORKED (`msm_linearity_prefix_suffix_decomposition_*`)
+  //     and M.GH7.0.1b (`m_gh7_0_1b_sigma_E2_equality_round_trip_1000_iter`).
+  //
+  // Test budget: 3 distinct behaviors × 2 = 6 unit-test budget; 2 tests
+  // authored (one composite acceptance + 1000-iter differential, one
+  // composite negative covering both rejection paths) — well within
+  // budget.
+  // =========================================================================
+
+  /// Build a satisfying **neutron-form** `(ck, Structure, FoldedInstance,
+  /// FoldedWitness, E1, E2, T)` 7-tuple at a fixed `(left, right)` shape
+  /// with `num_cons = left * right`, `num_vars = num_cons`, `num_io = 1`,
+  /// `u = 1`, `X = [0]`. Matrices: `A[i,i] = 1` (so `Az = W`), `B[i,
+  /// num_vars] = 1` (so `Bz = [u; num_cons]`), `C = 0` (so `Cz = [0;
+  /// num_cons]`). Witness `W` and `(E1, E2)` drawn uniform random; flat
+  /// `W.E = [E1 || E2]` of length `left + right` per the
+  /// `FoldedWitness::default` invariant (`relation.rs:611`). Running claim
+  /// `T = sum_x full_E(x)·(Az·Bz − Cz) = sum_x full_E(x)·W(x)` (since
+  /// `Bz[i] = u = 1` and `Cz = 0`), with `full_E[i*left+j] = E2[i]·E1[j]`
+  /// per Corrigendum #9 (2-A).
+  ///
+  /// Mirrors the Spartan sibling's `build_T_form_satisfying_instance` at
+  /// `vendor/nova/src/spartan/snark.rs:1660-1761`, but produces
+  /// `FoldedInstance`/`FoldedWitness` directly (so the envelope's full
+  /// bridge path is exercised — including
+  /// `RelaxedR1CSWitness::derandomize` + `split_E_commitments` + Σ-protocol
+  /// prove + Spartan T-claim sibling prove).
+  ///
+  /// Shape floor `left = right = 2` (`num_cons = 4`) sidesteps the
+  /// pre-existing vendor `batch_diff_size` panic at
+  /// `spartan/mod.rs:175-189` (`chunk_size = 0` heterogeneous polynomials
+  /// case). The Spartan sibling test (`snark.rs:1797-1810`) makes the
+  /// same shape-floor choice for the same reason.
+  #[allow(non_snake_case)]
+  fn build_T_form_folded_triple<E, S>(
+    rng: &mut ChaCha20Rng,
+    left: usize,
+    right: usize,
+  ) -> (
+    CommitmentKey<E>,
+    Structure<E>,
+    FoldedInstance<E>,
+    FoldedWitness<E>,
+  )
+  where
+    E: Engine,
+    E::GE: DlogGroup,
+    S: RelaxedR1CSSNARKTrait<E>,
+  {
+    use crate::r1cs::SparseMatrix;
+
+    let num_cons = left * right;
+    let num_vars = num_cons;
+    let num_io = 1usize;
+    let ell = num_cons.log_2();
+    let ell1 = ell.div_ceil(2);
+    let ell2 = ell / 2;
+    assert_eq!(1usize << ell1, left, "left must equal 2^ell1");
+    assert_eq!(1usize << ell2, right, "right must equal 2^ell2");
+
+    // Matrices: A[i,i] = 1; B[i, num_vars] = 1 (u column); C = 0.
+    // With these, for any witness W and u = 1:
+    //   (Az · Bz − Cz)[i] = W[i] · 1 − 0 = W[i]
+    // so T = sum_x full_E(x) · W(x) — easy to compute honestly.
+    let one = E::Scalar::ONE;
+    let rows = num_cons;
+    let cols = num_vars + num_io + 1;
+    let A_entries: Vec<(usize, usize, E::Scalar)> = (0..num_cons).map(|i| (i, i, one)).collect();
+    let B_entries: Vec<(usize, usize, E::Scalar)> =
+      (0..num_cons).map(|i| (i, num_vars, one)).collect();
+    let C_entries: Vec<(usize, usize, E::Scalar)> = vec![];
+
+    let shape = R1CSShape::<E>::new(
+      num_cons,
+      num_vars,
+      num_io,
+      SparseMatrix::new(&A_entries, rows, cols),
+      SparseMatrix::new(&B_entries, rows, cols),
+      SparseMatrix::new(&C_entries, rows, cols),
+    )
+    .unwrap();
+
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+    let structure = Structure::new(&shape);
+    assert_eq!(structure.left, left);
+    assert_eq!(structure.right, right);
+
+    // Draw (E1, E2) uniform random.
+    let E1: Vec<E::Scalar> = (0..left).map(|_| E::Scalar::random(&mut *rng)).collect();
+    let E2: Vec<E::Scalar> = (0..right).map(|_| E::Scalar::random(&mut *rng)).collect();
+
+    // Flat W.E = [E1 || E2] of length left + right per the
+    // `FoldedWitness::default` invariant at `relation.rs:611`. The
+    // Pedersen-additive identity ties this to U.comm_E.
+    let mut e_flat: Vec<E::Scalar> = Vec::with_capacity(left + right);
+    e_flat.extend_from_slice(&E1);
+    e_flat.extend_from_slice(&E2);
+
+    // Witness W drawn uniform random (unrelated to (E1, E2)). With Az=W,
+    // Bz=[1;.], Cz=[0;.]: T = sum_x full_E(x) · W(x) is non-degenerate
+    // (generically non-zero), exercising the β′ outer-sumcheck claim path
+    // with claim = T (NOT zero) per Corrigendum #10.
+    let W_vec: Vec<E::Scalar> =
+      (0..num_vars).map(|_| E::Scalar::random(&mut *rng)).collect();
+    let X: Vec<E::Scalar> = vec![E::Scalar::ZERO; num_io];
+
+    // Build full_E in flat layout per Corrigendum #9 (2-A):
+    //   full_E[i * left + j] = E2[i] · E1[j].
+    let mut full_E: Vec<E::Scalar> = Vec::with_capacity(num_cons);
+    for i in 0..right {
+      for j in 0..left {
+        full_E.push(E2[i] * E1[j]);
+      }
+    }
+
+    // T = sum_x full_E(x) · (Az·Bz − Cz)(x) = sum_x full_E(x) · W(x).
+    let T: E::Scalar = full_E
+      .iter()
+      .zip(W_vec.iter())
+      .map(|(e, w)| *e * *w)
+      .sum();
+
+    // Commit to W and to e_flat on `ck`, with random blindings. The
+    // Pedersen-additive identity `comm_E1 + comm_E2_bind == U.comm_E`
+    // is enforced by the M.GH7.0.1 REWORKED helper's blinding-split
+    // discipline `r_E1 + r_E2_bind == W.r_E` against `W.r_E = r_E` here.
+    let r_W = E::Scalar::random(&mut *rng);
+    let r_E = E::Scalar::random(&mut *rng);
+    let comm_W = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &W_vec, &r_W);
+    let comm_E = <E::CE as CommitmentEngineTrait<E>>::commit(&ck, &e_flat, &r_E);
+
+    let W = FoldedWitness::<E> {
+      W: W_vec,
+      r_W,
+      E: e_flat,
+      r_E,
+    };
+
+    let U = FoldedInstance::<E> {
+      comm_W,
+      comm_E,
+      T,
+      X,
+      u: E::Scalar::ONE,
+      #[cfg(feature = "lookup-fold")]
+      comm_L: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_w: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_inv_t: None,
+      #[cfg(feature = "lookup-fold")]
+      T_lookup: None,
+    };
+
+    (ck, structure, U, W)
+  }
+
+  /// **Acceptance + 1000-iter differential test (M.GH7.0.2)**.
+  ///
+  /// Composite test exercising:
+  ///
+  /// 1. **Acceptance round-trip**: build a satisfying neutron-form folded
+  ///    triple at `left=right=2`, run
+  ///    `CompressedSNARK::prove_from_parts → CompressedSNARK::verify`,
+  ///    assert `Ok(zn)`. INDEPENDENTLY assert the off-FS Pedersen-additive
+  ///    binding `comm_E1 + comm_E2_bind == r_U_derand_comm_E` holds at the
+  ///    group level (NOT just inside verify — pins the binding is
+  ///    structurally wired).
+  ///
+  /// 2. **1000-iter differential** (US-05): same shape, 1000 ChaCha20Rng-
+  ///    seeded fresh inputs, each round-trip must verify. The seed
+  ///    `0xC0FFEE_0700_0200u64` is stable for reviewer-reproducibility.
+  ///    Per `.claude/rules/cryptography.md` 1000-iter behavioral earned-
+  ///    trust threshold.
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_0_2_compressed_snark_envelope_off_fs_pedersen_binding_and_sigma_E2_equality() {
+    type E = Bn256EngineKZG;
+    type EE = EvaluationEngine<E>;
+    type S = RelaxedR1CSSNARK<E, EE>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC0FFEE_0700_0200u64);
+
+    // (1) Acceptance round-trip at left=right=2.
+    {
+      let (ck, structure, U, W) =
+        build_T_form_folded_triple::<E, S>(&mut rng, 2, 2);
+
+      // Spartan keys directly — the envelope `setup` reads `PublicParams`,
+      // which we don't construct here. The parts-based test path bypasses
+      // `PublicParams` and exercises `prove_from_parts` against the
+      // structure directly. Build a VerifierKey shape that matches the
+      // envelope's verify path (carries vk_spartan + dk + F_arity +
+      // structure + ck).
+      let (pk_spartan, vk_spartan) =
+        <S as RelaxedR1CSSNARKTrait<E>>::setup(&ck, &structure.S).unwrap();
+
+      let pk = ProverKey::<E, EE> { pk_spartan };
+      let vk = VerifierKey::<E, EE> {
+        vk_spartan,
+        dk: <<E as Engine>::CE as CommitmentEngineTrait<E>>::derand_key(&ck),
+        F_arity: 1,
+        structure: structure.clone(),
+        ck: ck.clone(),
+      };
+
+      // Arbitrary IVC final state — only used by the M.GH7.0.2 verify
+      // body for the `zn == self.zn` check.
+      let zn = vec![<E as Engine>::Scalar::from(42u64)];
+
+      let snark =
+        CompressedSNARK::<E, EE>::prove_from_parts(&ck, &structure, &pk, &U, &W, zn.clone())
+          .expect("CompressedSNARK::prove_from_parts must succeed for honest folded triple");
+
+      // INDEPENDENT structural assertion (LOAD-BEARING off-FS check per
+      // Corrigendum #8 (iv-B)): Pedersen-additive binding holds at the
+      // group level.
+      assert_eq!(
+        snark.U_bridged.comm_E1 + snark.comm_E2_bind,
+        snark.r_U_derand_comm_E,
+        "Pedersen-additive binding violated at envelope: comm_E1 + comm_E2_bind != r_U_derand_comm_E",
+      );
+
+      let z0_unused: Vec<<E as Engine>::Scalar> = vec![<E as Engine>::Scalar::ZERO; 1];
+      let returned_zn = snark
+        .verify(&vk, 1, &z0_unused, &zn)
+        .expect("CompressedSNARK::verify must accept an honest envelope proof");
+
+      assert_eq!(returned_zn, zn, "verify must return self.zn on success");
+    }
+
+    // (2) 1000-iter differential. Per `.claude/rules/cryptography.md`,
+    // ≥1000 ChaCha20Rng-seeded fresh inputs at the shape floor.
+    let mut rng_diff = ChaCha20Rng::seed_from_u64(0xFAC1_0700_0200u64);
+    for iter in 0..1000 {
+      let (ck, structure, U, W) =
+        build_T_form_folded_triple::<E, S>(&mut rng_diff, 2, 2);
+
+      let (pk_spartan, vk_spartan) =
+        <S as RelaxedR1CSSNARKTrait<E>>::setup(&ck, &structure.S).unwrap();
+      let pk = ProverKey::<E, EE> { pk_spartan };
+      let vk = VerifierKey::<E, EE> {
+        vk_spartan,
+        dk: <<E as Engine>::CE as CommitmentEngineTrait<E>>::derand_key(&ck),
+        F_arity: 1,
+        structure: structure.clone(),
+        ck: ck.clone(),
+      };
+
+      let zn = vec![<E as Engine>::Scalar::from(iter as u64)];
+      let snark =
+        CompressedSNARK::<E, EE>::prove_from_parts(&ck, &structure, &pk, &U, &W, zn.clone())
+          .unwrap_or_else(|e| {
+            panic!("prove_from_parts failed at iter={}: {:?}", iter, e)
+          });
+
+      // Pedersen-additive binding at the group level (per iter).
+      assert_eq!(
+        snark.U_bridged.comm_E1 + snark.comm_E2_bind,
+        snark.r_U_derand_comm_E,
+        "Pedersen-additive binding violated at iter={}",
+        iter
+      );
+
+      let z0_unused: Vec<<E as Engine>::Scalar> = vec![<E as Engine>::Scalar::ZERO; 1];
+      snark
+        .verify(&vk, 1, &z0_unused, &zn)
+        .unwrap_or_else(|e| panic!("verify failed at iter={}: {:?}", iter, e));
+    }
+  }
+
+  /// **Negative test (M.GH7.0.2) — composite rejection paths**.
+  ///
+  /// Two perturbations against an honest proof:
+  ///
+  /// (b) Off-FS binding: perturb `comm_E2_bind` by `+δ` (fresh group
+  ///     element). Assert `verify` rejects at check (1) with reason
+  ///     containing "off-FS Pedersen-additive binding rejected". Pins the
+  ///     binding check is wired and fires BEFORE the Σ-protocol verify.
+  ///
+  /// (c) Σ-protocol: perturb `sigma_E2_equality.z[0]` by `+ONE`. Assert
+  ///     `verify` rejects at check (2) with a Σ-protocol reason string
+  ///     ("Sigma E2 equality-of-opening rejected at bind-side" or
+  ///     "...pcs-side"). The response perturbation breaks BOTH equations
+  ///     deterministically with overwhelming probability.
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_0_2_compressed_snark_envelope_rejects_corrupted_binding_and_sigma() {
+    type E = Bn256EngineKZG;
+    type EE = EvaluationEngine<E>;
+    type S = RelaxedR1CSSNARK<E, EE>;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xDEADBEEF_0700_0200u64);
+    let (ck, structure, U, W) = build_T_form_folded_triple::<E, S>(&mut rng, 2, 2);
+
+    let (pk_spartan, vk_spartan) =
+      <S as RelaxedR1CSSNARKTrait<E>>::setup(&ck, &structure.S).unwrap();
+    let pk = ProverKey::<E, EE> { pk_spartan };
+    let vk = VerifierKey::<E, EE> {
+      vk_spartan,
+      dk: <<E as Engine>::CE as CommitmentEngineTrait<E>>::derand_key(&ck),
+      F_arity: 1,
+      structure: structure.clone(),
+      ck: ck.clone(),
+    };
+    let zn = vec![<E as Engine>::Scalar::from(7u64)];
+
+    // Sanity: honest proof verifies before perturbation.
+    let z0_unused: Vec<<E as Engine>::Scalar> = vec![<E as Engine>::Scalar::ZERO; 1];
+    {
+      let snark =
+        CompressedSNARK::<E, EE>::prove_from_parts(&ck, &structure, &pk, &U, &W, zn.clone())
+          .expect("honest prove must succeed");
+      snark
+        .verify(&vk, 1, &z0_unused, &zn)
+        .expect("honest proof must verify before perturbation");
+    }
+
+    // (b) NEGATIVE — off-FS binding. Perturb `comm_E2_bind` by adding a
+    // fresh non-identity group element. The binding-check at envelope-
+    // verify step (1) MUST reject.
+    {
+      let mut snark =
+        CompressedSNARK::<E, EE>::prove_from_parts(&ck, &structure, &pk, &U, &W, zn.clone())
+          .expect("honest prove must succeed");
+
+      // Build a fresh non-identity Commitment by committing a non-zero
+      // scalar with zero blinding — produces a `MSM([delta], ck.ck[..1])`
+      // group element.
+      let delta_scalar = <E as Engine>::Scalar::random(&mut rng);
+      let delta: Commitment<E> = <<E as Engine>::CE as CommitmentEngineTrait<E>>::commit(
+        &ck,
+        &[delta_scalar],
+        &<E as Engine>::Scalar::ZERO,
+      );
+      snark.comm_E2_bind = snark.comm_E2_bind + delta;
+
+      let result = snark.verify(&vk, 1, &z0_unused, &zn);
+      match result {
+        Err(NovaError::ProofVerifyError { reason }) => {
+          assert!(
+            reason.contains("off-FS Pedersen-additive binding rejected"),
+            "Rejection must be from the off-FS Pedersen-additive binding \
+             check (envelope verify step 1); got reason: {}",
+            reason,
+          );
+        }
+        Ok(_) => panic!(
+          "CompressedSNARK::verify MUST reject when comm_E2_bind is perturbed off-binding"
+        ),
+        Err(other) => panic!(
+          "Unexpected error variant on binding-check rejection: {:?}",
+          other
+        ),
+      }
+    }
+
+    // (c) NEGATIVE — Σ-protocol. Perturb `sigma_E2_equality.z[0]` by
+    // adding `ONE` to it. The verifier squeezes the SAME α from the
+    // transcript (identical absorb stream as the honest case — only the
+    // response field changes), so the bind-side acceptance equation
+    //   MSM(z, ck.ck[left..left+right]) + h·z_r_bind == T_bind +
+    //   α·comm_E2_bind
+    // diverges by exactly `MSM([ONE, 0, ...], ck.ck[left..left+right]) =
+    // ck.ck[left]` on the LHS — a non-zero non-identity group element —
+    // breaking the equation. Asserts the verifier rejects with a
+    // Σ-protocol-side reason string.
+    {
+      let mut snark =
+        CompressedSNARK::<E, EE>::prove_from_parts(&ck, &structure, &pk, &U, &W, zn.clone())
+          .expect("honest prove must succeed");
+      snark.sigma_E2_equality.z[0] = snark.sigma_E2_equality.z[0] + <E as Engine>::Scalar::ONE;
+
+      let result = snark.verify(&vk, 1, &z0_unused, &zn);
+      match result {
+        Err(NovaError::ProofVerifyError { reason }) => {
+          assert!(
+            reason.contains("Sigma E2 equality-of-opening rejected"),
+            "Rejection must be from the Σ-protocol verify (envelope verify \
+             step 2); got reason: {}",
+            reason,
+          );
+        }
+        Ok(_) => panic!(
+          "CompressedSNARK::verify MUST reject when sigma_E2_equality.z[0] is perturbed"
+        ),
+        Err(other) => panic!(
+          "Unexpected error variant on Σ-protocol rejection: {:?}",
+          other
+        ),
+      }
     }
   }
 }

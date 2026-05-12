@@ -88,12 +88,21 @@ where
   E2: Engine<Base = <E1 as Engine>::Scalar>,
   C: StepCircuit<E1::Scalar>,
 {
-  F_arity: usize,
+  // GH-#7 M.GH7.0.2 visibility bumps (Corrigendum #10 + #11): `F_arity`,
+  // `ro_consts`, `ck`, `structure` bumped from fully-private to `pub(crate)`
+  // so the sibling `neutron::compressed_snark` module can construct
+  // `CompressedSNARK::setup` and `CompressedSNARK::prove` against the
+  // underlying R1CS shape, commitment key, and IVC F_arity / ro_consts. The
+  // fields remain crate-private from the inumbra side; only the in-crate
+  // envelope reads them. Co-classified with the M.GH7.0.1 `r_W/r_E` bump
+  // bracket at `relation.rs:233/245` and the M.GH5.1 / M.GH5.7 lookup-fold-
+  // surface bracket noted at `neutron/mod.rs:30-32`.
+  pub(crate) F_arity: usize,
 
-  ro_consts: RO2Constants<E1>,
+  pub(crate) ro_consts: RO2Constants<E1>,
   ro_consts_circuit: RO2ConstantsCircuit<E1>,
-  ck: CommitmentKey<E1>,
-  structure: Structure<E1>,
+  pub(crate) ck: CommitmentKey<E1>,
+  pub(crate) structure: Structure<E1>,
 
   /// GH-#5 M.GH5.4 / pin §3.1: per-position `pp_digest` registry, in
   /// chunk-position-canonical order (NOT `table_id` order). Length pinned
@@ -457,8 +466,16 @@ where
 {
   z0: Vec<E1::Scalar>,
 
-  r_W: FoldedWitness<E1>,
-  r_U: FoldedInstance<E1>,
+  // GH-#7 M.GH7.0.2 visibility bumps (Corrigendum #10 + #11): `r_W`, `r_U`,
+  // `zi` bumped from fully-private to `pub(crate)` so the sibling
+  // `neutron::compressed_snark` module can construct
+  // `CompressedSNARK::prove` against the IVC-final folded state. Co-classified
+  // with the M.GH7.0.1 `FoldedWitness::{r_W, r_E}` visibility bump bracket
+  // (relation.rs:233/245) and the M.GH5.1 / M.GH5.7 lookup-fold-surface
+  // bracket noted at `neutron/mod.rs:30-32`. Fields remain crate-private
+  // from the inumbra side; only the in-crate envelope reads them.
+  pub(crate) r_W: FoldedWitness<E1>,
+  pub(crate) r_U: FoldedInstance<E1>,
   ri: E1::Scalar,
 
   l_w: R1CSWitness<E1>,
@@ -466,7 +483,7 @@ where
 
   i: usize,
 
-  zi: Vec<E1::Scalar>,
+  pub(crate) zi: Vec<E1::Scalar>,
 
   _p: PhantomData<(C, E2)>,
 }

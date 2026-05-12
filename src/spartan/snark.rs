@@ -32,7 +32,15 @@ use serde::{Deserialize, Serialize};
 #[serde(bound = "")]
 pub struct ProverKey<E: Engine, EE: EvaluationEngineTrait<E>> {
   pk_ee: EE::ProverKey,
-  vk_digest: E::Scalar, // digest of the verifier's key
+  // GH-#7 M.GH7.0.2 visibility bump (Corrigendum #11): `vk_digest` bumped
+  // from fully-private to `pub(crate)` so the `neutron::compressed_snark`
+  // envelope can absorb it into the envelope-side transcript at the fixed
+  // ordering pin §1.2(a) Primitive 6 requires (b"vk" → b"r_U_comm_E" →
+  // b"comm_E1" → b"comm_E2_bind" → b"comm_E2_pcs" → ...) BEFORE invoking the
+  // Σ-protocol prove helper. The verifier side reads via `vk.digest()`
+  // (already callable). Co-classified with the M.GH7.0.2 visibility-bump
+  // bracket on `neutron::PublicParams` and `neutron::RecursiveSNARK`.
+  pub(crate) vk_digest: E::Scalar, // digest of the verifier's key
 }
 
 /// A type that represents the verifier's key
@@ -1761,8 +1769,17 @@ mod tests {
   }
 
   /// Helper: build a `BridgedNeutronInstance` from a derandomized
-  /// `RelaxedR1CSInstance` + (comm_E1, comm_E2, T). The struct fields are
-  /// `(comm_W, comm_E1, comm_E2, u, X, T)` per Corrigendum #10.
+  /// `RelaxedR1CSInstance` + (comm_E1, comm_E2_pcs, T). The struct fields
+  /// are `(comm_W, comm_E1, comm_E2_pcs, u, X, T)` per Corrigendum #10 +
+  /// Corrigendum #11 (field-rename `comm_E2 → comm_E2_pcs` at M.GH7.0.2).
+  ///
+  /// The local parameter retains the legacy `comm_E2` name (test plumbing)
+  /// and is assigned into the `comm_E2_pcs` field — the sibling-internal
+  /// tests at `snark.rs:1824-1825` always commit `E2` against the prefix
+  /// basis `ck.ck[..right]`, which is the PCS-opening shape exactly. So at
+  /// the sibling-level test boundary, the value the local `comm_E2`
+  /// carries is already the prefix-basis `comm_E2_pcs` — the rename is
+  /// purely structural with no algebra change.
   #[allow(non_snake_case)]
   fn bridged_from<E: Engine>(
     U: &RelaxedR1CSInstance<E>,
@@ -1773,7 +1790,7 @@ mod tests {
     BridgedNeutronInstance {
       comm_W: U.comm_W,
       comm_E1,
-      comm_E2,
+      comm_E2_pcs: comm_E2,
       u: U.u,
       X: U.X.clone(),
       T,
