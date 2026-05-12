@@ -183,9 +183,18 @@ impl<E: Engine> PolyEvalWitness<E> {
         .flat_map_iter(|chunk_index| {
           let mut chunk = vec![E::Scalar::ZERO; chunk_size];
           for (coeff, poly) in powers.iter().zip(W.iter()) {
+            // Corrigendum #12 fix: heterogeneous-size inputs were
+            // panicking when a smaller polynomial's length did not
+            // extend to this chunk's start. The function's docstring
+            // (lines 166-171) and the non-chunked fallback below
+            // promise zero-pad-to-`size_max` semantics; bounds-safe
+            // indexing here honours that contract structurally — chunks
+            // past a smaller poly's end yield an empty iterator (the
+            // `chunk` accumulator already holds zeros), and chunks
+            // straddling the boundary use natural `.zip` truncation.
             for (rlc, poly_eval) in chunk
               .iter_mut()
-              .zip(poly.p[chunk_index * chunk_size..].iter())
+              .zip(poly.p.get(chunk_index * chunk_size..).unwrap_or(&[]).iter())
             {
               if *coeff == E::Scalar::ONE {
                 *rlc += *poly_eval;
@@ -563,5 +572,106 @@ mod batch_invert_tests {
     let res_2 = batch_invert(&v);
 
     assert_eq!(res_1, res_2)
+  }
+}
+
+/// Regression tests for `PolyEvalWitness::batch_diff_size` heterogeneous-input
+/// behaviour per Corrigendum #12.
+///
+/// Anchors:
+/// - The function's docstring at lines 166-171 promises zero-pad-to-size_max
+///   semantics for heterogeneous input polynomials.
+/// - The non-chunked fallback (lines 200-227) honours this via `vec![ZERO;
+///   size_max]` + length-aware accumulation.
+/// - Prior to Corrigendum #12 the chunked fast path (lines 180-199) indexed
+///   `poly.p[chunk_index * chunk_size..]` unconditionally, panicking when a
+///   smaller polynomial's tail did not extend to a chunk start. The fix
+///   replaces that index with a bounds-safe `.get(..).unwrap_or(&[])` so
+///   chunks past a smaller polynomial's end yield empty iterators (zero-pad
+///   semantic structurally honoured) and chunks straddling the boundary use
+///   natural `.zip` truncation.
+///
+/// The test below constructs a heterogeneous-length witness vector
+/// `[16, 4, 4]` that forces `chunk_size > 0` on any reasonable host
+/// (`num_chunks = current_num_threads().next_power_of_two()`; for
+/// `size_max = 16`, `chunk_size > 0` whenever `num_chunks <= 16`).
+/// It compares the chunked result byte-for-byte against an explicit
+/// zero-pad-then-RLC reference, swept under a 1000-iter ChaCha20Rng-seeded
+/// loop per the cryptography Gadget-contract behavioural earned-trust
+/// threshold (.claude/rules/cryptography.md).
+#[cfg(test)]
+mod batch_diff_size_tests {
+  use super::{powers, PolyEvalWitness};
+  use crate::{
+    provider::{Bn256EngineKZG, PallasEngine},
+    traits::Engine,
+  };
+  use ff::Field;
+  use rand_chacha::ChaCha20Rng;
+  use rand_core::SeedableRng;
+
+  /// Differential: the chunked path's output must agree byte-for-byte
+  /// with an explicit zero-pad-then-RLC reference for heterogeneous input
+  /// sizes. Reseeded ChaCha20Rng per US-05 reviewer reproducibility.
+  fn m_gh7_0_2c_batch_diff_size_heterogeneous_size_zero_pad_byte_equal_with<E>()
+  where
+    E: Engine,
+  {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xC0FFEE_0702_C000u64);
+
+    // Heterogeneous sizes [16, 4, 4]: size_max = 16, smaller polys are
+    // length-4. Under any reasonable num_chunks (<=16), chunk_size >= 1,
+    // so the chunked branch fires AND chunks past index 4 of the smaller
+    // polys must zero-pad.
+    let sizes: [usize; 3] = [16, 4, 4];
+
+    for _ in 0..1000 {
+      // Sample heterogeneous-length polynomials with random coefficients.
+      let polys: Vec<Vec<E::Scalar>> = sizes
+        .iter()
+        .map(|&n| (0..n).map(|_| E::Scalar::random(&mut rng)).collect())
+        .collect();
+      let s = E::Scalar::random(&mut rng);
+
+      // Reference: explicit zero-pad-to-size_max then RLC.
+      let size_max = sizes.iter().copied().max().unwrap();
+      let powers_of_s = powers::<E>(&s, polys.len());
+      let p_reference: Vec<E::Scalar> = (0..size_max)
+        .map(|k| {
+          polys
+            .iter()
+            .zip(powers_of_s.iter())
+            .map(|(p, s_i)| {
+              if k < p.len() {
+                *s_i * p[k]
+              } else {
+                E::Scalar::ZERO
+              }
+            })
+            .sum()
+        })
+        .collect();
+
+      // Subject under test: chunked path via `batch_diff_size`.
+      let w_vec: Vec<PolyEvalWitness<E>> = polys
+        .into_iter()
+        .map(|p| PolyEvalWitness { p })
+        .collect();
+      let result = PolyEvalWitness::<E>::batch_diff_size(w_vec, s);
+
+      assert_eq!(
+        result.p(),
+        p_reference.as_slice(),
+        "chunked batch_diff_size must agree byte-for-byte with the zero-pad-then-RLC reference on heterogeneous sizes"
+      );
+    }
+  }
+
+  #[test]
+  fn m_gh7_0_2c_batch_diff_size_heterogeneous_size_zero_pad_byte_equal() {
+    // HyperKZG path (Bn256).
+    m_gh7_0_2c_batch_diff_size_heterogeneous_size_zero_pad_byte_equal_with::<Bn256EngineKZG>();
+    // IPA-PC path (Pallas).
+    m_gh7_0_2c_batch_diff_size_heterogeneous_size_zero_pad_byte_equal_with::<PallasEngine>();
   }
 }
