@@ -66,6 +66,21 @@ pub mod relation;
 /// composition).
 pub mod compressed_snark;
 
+// GH-#7 M.GH7.1 module export hygiene: surface the envelope's public
+// items at the `neutron::` path so downstream consumers (e.g. the
+// `inumbra-spend-harness` integration tests in
+// `crates/inumbra-spend-harness/tests/gh7_stage_k_compressor.rs`) can
+// reach them without typing the `compressed_snark::` submodule prefix.
+// The fully-qualified path `neutron::compressed_snark::CompressedSNARK`
+// remains valid — these re-exports are additive, mirroring the upstream
+// `nova::CompressedSNARK` precedent at `nova/mod.rs` where the envelope
+// items sit at the `nova::` path directly.
+#[doc(inline)]
+pub use compressed_snark::{
+  BridgedNeutronInstance, CompressedSNARK, ProverKey as CompressedSNARKProverKey,
+  SigmaE2EqualityProof, SplitECommitments, VerifierKey as CompressedSNARKVerifierKey,
+};
+
 /// Closed-form, fold-step-collapsed sumcheck instance for the C1-β
 /// lookup-fold extension. Pinned by §B of the spike implementation
 /// outline (amendment 2026-05-07).
@@ -118,9 +133,17 @@ where
   /// inumbra-side artifact the M.7 shape-registry assertion fires
   /// against (`circuit/nifs.rs:689-695` in `verify_with_multi_table_lookup`),
   /// orthogonal to `pp_digest` itself.
+  // GH-#7 M.GH7.1 visibility bump: `shape_registry` and `lookup_fold_k`
+  // bumped from fully-private to `pub(crate)` so the sibling
+  // `neutron::compressed_snark` module can read them at
+  // `CompressedSNARK::setup` to populate `VerifierKey::lookup_fold_k`
+  // and (later, M.GH7.2 / M.GH7.4) bind `shape_registry_digest` into
+  // the verifier key per pin §3.3. Co-classified with the M.GH7.0.2
+  // `F_arity` / `ro_consts` / `ck` / `structure` visibility bumps in
+  // the bracket above.
   #[cfg(feature = "lookup-fold")]
   #[serde(skip, default)]
-  shape_registry: Vec<E1::Scalar>,
+  pub(crate) shape_registry: Vec<E1::Scalar>,
 
   /// GH-#5 M.GH5.4 / pin §3.1: structurally-pinned per-table count
   /// (`LookupShape::multi_column_tables.len()`). Production: k=2 per
@@ -129,7 +152,7 @@ where
   /// `#[serde(skip)]` for the same reason as `shape_registry`.
   #[cfg(feature = "lookup-fold")]
   #[serde(skip, default)]
-  lookup_fold_k: usize,
+  pub(crate) lookup_fold_k: usize,
 
   /// GH-#5 M.GH5.4 / pin §3.1: bit-width for the `chunk_index_in_z`
   /// range-check inside the M.7 shape-registry assertion. Must be
