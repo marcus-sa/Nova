@@ -1862,4 +1862,607 @@ mod tests {
     // sub-ratification-#2 baseline. No additional in-test assertion
     // here — the regression is in the test suite as a whole.
   }
+
+  // ===========================================================================
+  // M.GH7.3b — negative-test triple
+  //
+  // Discharges `.claude/rules/cryptography.md` §70-78 (Constraint hygiene —
+  // "a missing constraint is a forgery vector") for the M.GH7.3a public prover
+  // API surface (`RecursiveSNARK::prove_step_with_lookup_fold` sibling +
+  // `LookupStepCircuit<E>` trait + `RecursiveSNARK::running_lws` + the
+  // `PublicParams::setup` `lookup_shape` extension), per Corrigendum #15 +
+  // 2026-05-12 late-evening Sub-ratification in
+  // `docs/research/cryptography/gh-7-stage-k-compressed-snark-design-pin-2026-05-11.md`
+  // §0 entry 15 + §3.1.1 + §5.5 row M.GH7.3b.
+  //
+  // Sub-ratification disposition (fifth Halpert-class verify-don't-assume
+  // failure named): Corrigendum #15's original test (i) corruption target
+  // `bundles[j].running_lw = LookupRunningWitness::default(&shape)` is
+  // structurally inadequate at the (C)-binding rejection mechanism because
+  // `LookupSumcheckInstance::prove_step` at `vendor/nova/src/neutron/lookup_sumcheck.rs:278-285`
+  // sets `evals[1] := t_lookup_running - evals[0]` BY CONSTRUCTION, making
+  // `poly_lookup_j(0) + poly_lookup_j(1) = t_lookup_running_j` a TAUTOLOGY
+  // for any honestly-produced polynomial regardless of U1-side internal state
+  // corruption. The sub-ratification re-targets test (i) to the R1CS-side
+  // (C)-binding (a structurally-distinct rejection mechanism in the same
+  // `verify_with_multi_table_lookup` body, returning the same
+  // `NovaError::InvalidSumcheckProof` variant). Test (ii)'s mutation shape is
+  // amended from multiplicative `× 2` (preserves the (C)-binding tautology
+  // under all-zero `T_lookup_running = 0`) to additive `coeffs[0] += ONE`
+  // (breaks the (C)-binding equation in any field of characteristic ≠ 2;
+  // BN254 scalar field characteristic is odd, verified). Test (iii) STANDS
+  // verbatim modulo function-name suffix.
+  //
+  // Implementation pattern: all three tests follow the M.14 precedent at
+  // `vendor/nova/src/neutron/nifs.rs:5719-6149`
+  // (`m14_cross_table_cancellation_hard_rejects`): direct
+  // `NIFS::prove_with_multi_table_lookup` invocation at vendor-test scope.
+  // The sibling-method `prove_step_with_lookup_fold` consumes its produced
+  // NIFS inline at `mod.rs:985` (verified at vendor HEAD `e3fe75d`;
+  // `RecursiveSNARK` has no `nifs` field at `:520-569`) so post-prove NIFS
+  // extraction from `RecursiveSNARK` state is structurally impossible — the
+  // direct-NIFS-at-vendor-test-scope pattern is the structurally-valid
+  // discipline that the (C)-binding-rejection detection mechanism for the
+  // M.GH7.3a-introduced public prover API surfaces through. The (C)-binding
+  // algebra at `nifs.rs:2000-2001` (R1CS-side) and `:2025-2028` (lookup-side)
+  // is the SAME path `prove_step_with_lookup_fold` invokes internally;
+  // M.GH7.3a's positive-path acceptance test at `:1466-1900` IS the
+  // empirical-close that the sibling-method routes through the same NIFS
+  // construction.
+  //
+  // Fixture: AbsentTableStepCircuit shape inherited from M.GH7.3a positive
+  // path (K=1, TABLE_SIZE=4, TABLE_LOG2=2, Bn256EngineKZG + GrumpkinEngine).
+  // Per Sub-ratification fixture pin, no fixture amendment required — the
+  // three algebraic preconditions (BN254 scalar field characteristic odd;
+  // rho ≠ ONE w.o.p. under RO-squeeze; prime field of size ≥ 2) hold under
+  // this fixture. R1CS shape uses `DirectCircuit<E, NonTrivialCircuit>` per
+  // M.14 precedent — what matters for the (C)-binding rejection is the
+  // bundle/lookup-side construction, not the R1CS body content.
+  //
+  // Deterministic seeds (US-05 reviewer-reproducibility):
+  //   SEED_M_GH7_3B_TEST_I  = 0xC1BE_5BAD_C0DE_7031
+  //   SEED_M_GH7_3B_TEST_II = 0xC1BE_5BAD_C0DE_7032
+  //   SEED_M_GH7_3B_TEST_III= 0xC1BE_5BAD_C0DE_7033
+  // ===========================================================================
+
+  /// Shared honest-baseline fixture builder for the M.GH7.3b negative-test
+  /// triple. Mirrors the M.14 precedent at `nifs.rs:5719-6149` but with the
+  /// AbsentTableStepCircuit lookup-shape per M.GH7.3a (`K = 1`, `TABLE_SIZE = 4`,
+  /// `TABLE_LOG2 = 2`, empty `multi_column_tables` columns).
+  ///
+  /// Runs two honest direct `NIFS::prove_with_multi_table_lookup` folds:
+  ///   - Fold #1: `default(&str_local) → (nifs1, (folded_U_s1, folded_W_s1), lws_s1)`
+  ///   - Fold #2: `folded_U_s1 → (nifs2, _, _)` with `bundle_s2.running_lw =
+  ///     lws_s1[0]`
+  ///
+  /// The honest fold #2 verify must accept (positive control, asserted
+  /// before the per-test corruption pattern fires). The fixture's
+  /// `t_lookup_running_j` at fold #2's verifier-input boundary
+  /// (`folded_U_s1.T_lookup[0]`) is generically non-trivial after fold #1
+  /// (per M.GH7.3a's `assert_ne!(next_running_lws_after_fold_1,
+  /// bootstrap_running_lws, ...)` at `mod.rs:1802-1806`).
+  #[cfg(feature = "lookup-fold")]
+  fn m_gh7_3b_build_honest_two_step_fixture(seed: u64) -> Bn256EngineKZGFixture {
+    use crate::frontend::{
+      r1cs::{NovaShape, NovaWitness},
+      shape_cs::ShapeCS,
+      solver::SatisfyingAssignment,
+      Circuit,
+    };
+    use crate::neutron::nifs::PerTableBundle;
+    use crate::neutron::relation::{
+      LookupPayload, LookupPayloadPublicMultiTable, LookupRunningWitness, LookupShape,
+      LookupTableHandle, MultiColumnLookupTable,
+    };
+    use crate::neutron::{FoldedInstance, FoldedWitness, Structure, NIFS};
+    use crate::provider::hyperkzg::EvaluationEngine as HyperKZGEE;
+    use crate::r1cs::R1CSShape;
+    use crate::spartan::{direct::DirectCircuit, snark::RelaxedR1CSSNARK};
+    use crate::traits::{
+      circuit::NonTrivialCircuit, commitment::CommitmentEngineTrait,
+      snark::RelaxedR1CSSNARKTrait, RO2Constants,
+    };
+    use crate::Commitment;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    type E1Eng = Bn256EngineKZG;
+    type Scalar = <E1Eng as Engine>::Scalar;
+    type S = RelaxedR1CSSNARK<E1Eng, HyperKZGEE<E1Eng>>;
+
+    const TABLE_SIZE: usize = 4;
+    const TABLE_LOG2: usize = 2;
+
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let ro_consts = RO2Constants::<E1Eng>::default();
+    let pp_digest = Scalar::ZERO;
+
+    // R1CS shape: NonTrivialCircuit per M.14 precedent at `nifs.rs:5736-5742`.
+    // The body content is immaterial to the (C)-binding rejection mechanism;
+    // what matters is that we have a satisfying R1CS instance-witness pair to
+    // feed `prove_with_multi_table_lookup` so the prover does not reject at
+    // a pre-(C)-binding structural gate.
+    let num_cons = 32usize;
+    let circuit_shape: DirectCircuit<E1Eng, NonTrivialCircuit<Scalar>> =
+      DirectCircuit::new(None, NonTrivialCircuit::<Scalar>::new(num_cons));
+    let mut cs: ShapeCS<E1Eng> = ShapeCS::new();
+    let _ = circuit_shape.synthesize(&mut cs);
+    let shape = cs.r1cs_shape().unwrap();
+    let ck = R1CSShape::commitment_key(&[&shape], &[&*S::ck_floor()]).unwrap();
+
+    // AbsentTableStepCircuit-style lookup shape: single table, empty value
+    // columns (single-column-degenerate path per `nifs.rs:57-70`). The
+    // `tables[0]` `LookupTableHandle.commitment` is an arbitrary identity
+    // commitment to keep `pp_digest` deterministic across invocations.
+    let identity: Vec<Scalar> = (0..TABLE_SIZE).map(|i| Scalar::from(i as u64)).collect();
+    let lookup_shape = LookupShape::<E1Eng> {
+      tables: vec![LookupTableHandle {
+        table_id: 0,
+        size: TABLE_SIZE,
+        commitment: <E1Eng as Engine>::CE::commit(&ck, &identity, &Scalar::ZERO),
+      }],
+      multi_column_tables: vec![MultiColumnLookupTable {
+        table_id: 0,
+        size: TABLE_SIZE,
+        columns: vec![],
+        value_commitments: vec![],
+      }],
+      num_addr_columns: 1,
+      num_witness_columns: 1,
+      witness_ell_cached: TABLE_LOG2,
+    };
+    let str_local = Structure::new_with_lookups(&shape, lookup_shape.clone());
+    let shape = str_local.S.clone();
+
+    // Two satisfying R1CS instance-witness pairs (mirrors M.14 at
+    // `nifs.rs:5787-5798`).
+    let make_r1cs = |x: u64| {
+      let circuit: DirectCircuit<E1Eng, NonTrivialCircuit<Scalar>> = DirectCircuit::new(
+        Some(vec![Scalar::from(x)]),
+        NonTrivialCircuit::<Scalar>::new(num_cons),
+      );
+      let mut cs = SatisfyingAssignment::<E1Eng>::new();
+      let _ = circuit.synthesize(&mut cs);
+      let (u, w) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
+      (u, w.pad(&shape))
+    };
+    let (u_step1, w_step1) = make_r1cs(2);
+    let (u_step2, w_step2) = make_r1cs(3);
+
+    // Per-table eq vector half-lengths: TABLE_LOG2 = 2 → ell1 = ell2 = 1 →
+    // w_left = w_right = 2.
+    let ell1 = TABLE_LOG2.div_ceil(2);
+    let ell2 = TABLE_LOG2 / 2;
+    let w_left = 1usize << ell1;
+    let w_right = 1usize << ell2;
+
+    // Absent-table bundle: zero address, zero multiplicities, no value
+    // columns (mirrors M.GH7.3a at `mod.rs:1561-1599`).
+    let mk_absent_bundle = |running_lw: LookupRunningWitness<E1Eng>| -> PerTableBundle<E1Eng> {
+      let zero_addr = vec![Scalar::ZERO; TABLE_SIZE];
+      let zero_mult = vec![Scalar::ZERO; TABLE_SIZE];
+      let payload = LookupPayload::<E1Eng> {
+        comm_L: <E1Eng as Engine>::CE::commit(&ck, &zero_addr, &Scalar::ZERO),
+        comm_ts: <E1Eng as Engine>::CE::commit(&ck, &zero_mult, &Scalar::ZERO),
+        comm_inv_w: Commitment::<E1Eng>::default(),
+        comm_inv_t: Commitment::<E1Eng>::default(),
+        T2_lookup: Scalar::ZERO,
+        comm_values: vec![],
+      };
+      PerTableBundle::<E1Eng> {
+        table_id: 0,
+        payload,
+        fresh_witness_address: zero_addr,
+        fresh_witness_value_columns: vec![],
+        fresh_multiplicities: zero_mult,
+        fresh_eq_w_left: vec![Scalar::ZERO; w_left],
+        fresh_eq_w_right: vec![Scalar::ZERO; w_right],
+        fresh_eq_t_left: vec![Scalar::ZERO; w_left],
+        fresh_eq_t_right: vec![Scalar::ZERO; w_right],
+        running_lw,
+      }
+    };
+
+    // === Fold #1: honest prove (outer base → fold #1). ===
+    let running_W_default = FoldedWitness::default(&str_local);
+    let running_U_default = FoldedInstance::default(&str_local);
+    let bundle_s1 = mk_absent_bundle(LookupRunningWitness::<E1Eng>::default(&lookup_shape));
+
+    let (_nifs1, (folded_U_s1, folded_W_s1), folded_lws_s1) =
+      NIFS::<E1Eng>::prove_with_multi_table_lookup(
+        &ck,
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &running_U_default,
+        &running_W_default,
+        &u_step1,
+        &w_step1,
+        &[bundle_s1],
+      )
+      .expect("fold #1 prove must succeed (positive baseline)");
+
+    assert_eq!(folded_lws_s1.len(), 1, "K=1: folded_lws_s1 must have length 1");
+    let t_lookup_after_fold_1 = folded_U_s1
+      .T_lookup
+      .as_ref()
+      .expect("fold #1 populates T_lookup");
+    assert_eq!(t_lookup_after_fold_1.len(), 1, "K=1: T_lookup length 1");
+
+    // === Fold #2: honest prove using fold-#1 folded state. ===
+    let bundle_s2 = mk_absent_bundle(folded_lws_s1[0].clone());
+    let payload_s2 = bundle_s2.payload.clone();
+    let (nifs2, _, _) = NIFS::<E1Eng>::prove_with_multi_table_lookup(
+      &ck,
+      &ro_consts,
+      &pp_digest,
+      &str_local,
+      &folded_U_s1,
+      &folded_W_s1,
+      &u_step2,
+      &w_step2,
+      &[bundle_s2],
+    )
+    .expect("fold #2 prove must succeed (positive baseline)");
+
+    let public_bundles_s2 = vec![LookupPayloadPublicMultiTable::<E1Eng> {
+      table_id: 0,
+      comm_L: payload_s2.comm_L,
+      comm_values: payload_s2.comm_values.clone(),
+      comm_ts: payload_s2.comm_ts,
+    }];
+
+    // Positive control: honest fold #2 verify MUST accept against honest
+    // folded_U_s1. If this fires the fixture is broken; halt before
+    // attributing failure to any corruption pattern. Suppress unused
+    // warning by discarding the Ok payload.
+    let _accepted = nifs2
+      .verify_with_multi_table_lookup(
+        &ro_consts,
+        &pp_digest,
+        &str_local,
+        &folded_U_s1,
+        &u_step2,
+        &public_bundles_s2,
+      )
+      .expect(
+        "M.GH7.3b positive control: honest fold #2 verify must accept against \
+         the honest folded_U_s1. If this fires, the fixture is broken — halt \
+         and surface BEFORE blaming any corruption pattern.",
+      );
+
+    // Burn the rng so the seed parameter is not unused (deterministic
+    // reviewer-reproducibility per US-05).
+    let _ = Scalar::random(&mut rng);
+
+    Bn256EngineKZGFixture {
+      ro_consts,
+      pp_digest,
+      str_local,
+      folded_U_s1,
+      u_step2,
+      nifs2,
+      public_bundles_s2,
+    }
+  }
+
+  /// Honest-baseline fixture handle returned by
+  /// `m_gh7_3b_build_honest_two_step_fixture`. Carries only what the three
+  /// negative tests need at the verifier-call boundary.
+  #[cfg(feature = "lookup-fold")]
+  struct Bn256EngineKZGFixture {
+    ro_consts: crate::traits::RO2Constants<Bn256EngineKZG>,
+    pp_digest: <Bn256EngineKZG as Engine>::Scalar,
+    str_local: crate::neutron::Structure<Bn256EngineKZG>,
+    folded_U_s1: crate::neutron::FoldedInstance<Bn256EngineKZG>,
+    u_step2: crate::r1cs::R1CSInstance<Bn256EngineKZG>,
+    nifs2: crate::neutron::NIFS<Bn256EngineKZG>,
+    public_bundles_s2:
+      Vec<crate::neutron::relation::LookupPayloadPublicMultiTable<Bn256EngineKZG>>,
+  }
+
+  /// **M.GH7.3b test (i)** — `prove_step_with_lookup_fold` negative test:
+  /// corrupt-`U1.T`-at-verifier-input-boundary rejects at the R1CS-side
+  /// (C)-binding (`vendor/nova/src/neutron/nifs.rs:2000-2001`).
+  ///
+  /// Sub-ratification 2026-05-12 late evening: this test was RE-TARGETED from
+  /// Corrigendum #15's original `bundles[j].running_lw = default(&shape)`
+  /// corruption (structurally inadequate at the lookup-side (C)-binding per
+  /// the `evals[1] := t_lookup_running - evals[0]` tautology in
+  /// `lookup_sumcheck.rs:278-285`) to verifier-input `U1.T += Scalar::ONE`,
+  /// which routes through a structurally-distinct rejection mechanism in the
+  /// SAME `verify_with_multi_table_lookup` body (Step 7, R1CS-side, fires
+  /// BEFORE the lookup-side loop at Step 8). Same `NovaError` variant,
+  /// different rejection locus. Fifth Halpert-class verify-don't-assume
+  /// failure named in Corrigendum #15 Sub-ratification §"Audit-trail
+  /// honesty".
+  ///
+  /// Rejection mechanism: `self.poly.eval_at_zero() + self.poly.eval_at_one()
+  /// != (ONE - rho) * U1.T` at `nifs.rs:2000-2001`. The prover's `self.poly`
+  /// was committed against `T_honest_target = (ONE - rho) * U1_honest.T`;
+  /// after `U1.T += ONE`, the verifier computes `T_corrupted_target = (ONE -
+  /// rho) * (U1_honest.T + ONE) = T_honest_target + (ONE - rho)`. For `rho ≠
+  /// ONE` (overwhelming probability under RO-squeeze + BN254 scalar field
+  /// characteristic), `(ONE - rho) ≠ ZERO` so `T_honest_target ≠
+  /// T_corrupted_target`; equation rejects deterministically with
+  /// `NovaError::InvalidSumcheckProof`.
+  ///
+  /// Anchored on Nova 2021/370 v3 §3 R1CS sumcheck soundness (the per-step
+  /// R1CS folding-step (C)-binding; M.4-landed in vendor at vendor HEAD
+  /// `e3fe75d` and reachable independent of M.GH7.4 progress).
+  ///
+  /// STOP-AND-ASK trigger #5 (per Sub-ratification): the rejection MUST occur
+  /// at the R1CS-side (C)-binding (`:2000-2001`, Step 7), NOT at the
+  /// lookup-side (C)-binding loop (`:2025-2028`, Step 8). The two sites
+  /// return the same `NovaError::InvalidSumcheckProof` variant, so the
+  /// typed-variant assertion alone cannot distinguish them — the
+  /// disambiguation is via the algebra: corrupting `U1.T` (NOT
+  /// `U1.T_lookup`) flips the R1CS-side equation while leaving the
+  /// lookup-side equation untouched, so Step 7 short-circuits with `Err`
+  /// before Step 8 is reached. The empirical-close confirmation is the
+  /// design pin §6.1 row M.GH7.3b SECONDARY falsifier.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn prove_step_with_lookup_fold_corrupt_t_at_index_in_consumed_u1_rejects_at_r1cs_c_binding() {
+    const SEED_M_GH7_3B_TEST_I: u64 = 0xC1BE_5BAD_C0DE_7031;
+    let fixture = m_gh7_3b_build_honest_two_step_fixture(SEED_M_GH7_3B_TEST_I);
+
+    // Corrupt the verifier-input R1CS-side running target U1.T by additive
+    // += ONE. `FoldedInstance.T` is `pub(crate)` at `relation.rs:254`;
+    // accessible from this `#[cfg(test)] mod tests` because the test module
+    // is a child of `crate::neutron` (sibling to `relation` and `nifs`).
+    let mut folded_U_step1_corrupted = fixture.folded_U_s1.clone();
+    folded_U_step1_corrupted.T += <Bn256EngineKZG as Engine>::Scalar::ONE;
+    assert_ne!(
+      folded_U_step1_corrupted.T, fixture.folded_U_s1.T,
+      "test (i) corruption non-vacuous: corrupted T must differ from honest T \
+       (BN254 scalar field is prime of size ≥ 2, so honest + ONE ≠ honest)"
+    );
+
+    let result = fixture.nifs2.verify_with_multi_table_lookup(
+      &fixture.ro_consts,
+      &fixture.pp_digest,
+      &fixture.str_local,
+      &folded_U_step1_corrupted,
+      &fixture.u_step2,
+      &fixture.public_bundles_s2,
+    );
+
+    // Primary assertion: typed-variant rejection (M.14 / M.GH5.7 pattern at
+    // `nifs.rs:6140`). The locus disambiguation (R1CS-side vs lookup-side
+    // (C)-binding) is via the algebra of the corruption — `U1.T` corruption
+    // can ONLY flip the R1CS-side equation at Step 7; the lookup-side
+    // equation at Step 8 reads `t_lookup_running_j = U1.T_lookup[j]`, which
+    // is UNCHANGED by this test's corruption.
+    assert!(
+      matches!(
+        result,
+        Err(crate::errors::NovaError::InvalidSumcheckProof)
+      ),
+      "M.GH7.3b test (i): verify_with_multi_table_lookup must REJECT the \
+       R1CS-side `U1.T += ONE` corruption at the R1CS-side (C)-binding \
+       (`vendor/nova/src/neutron/nifs.rs:2000-2001`, Step 7 of \
+       verify_with_multi_table_lookup) with `NovaError::InvalidSumcheckProof`. \
+       The prover's `self.poly` was committed against \
+       `T_honest_target = (ONE - rho) * U1_honest.T`; the corrupted verifier \
+       computes `T_corrupted_target = (ONE - rho) * (U1_honest.T + ONE)`. For \
+       `rho ≠ ONE` (overwhelming probability under RO-squeeze + BN254 \
+       characteristic), the equation rejects deterministically. \
+       Anchored on Nova 2021/370 v3 §3 R1CS sumcheck soundness. If this \
+       fires, halt and surface — this is the Constraint hygiene §70-78 \
+       discharge for the M.GH7.3a public prover API. Got: {:?}",
+      result.as_ref().err()
+    );
+  }
+
+  /// **M.GH7.3b test (ii)** — `prove_step_with_lookup_fold` negative test:
+  /// post-prove additive mutation of `nifs.poly_lookup[0].coeffs[0]` rejects
+  /// at the lookup-side (C)-binding (`vendor/nova/src/neutron/nifs.rs:2025-2028`).
+  ///
+  /// Sub-ratification 2026-05-12 late evening: mutation shape AMENDED from
+  /// Corrigendum #15's original multiplicative `× Scalar::from(2)` (which
+  /// preserves the (C)-binding tautology under all-zero `t_lookup_running =
+  /// 0`: `2·0 + 2·0 = 0 = 0`, per the crafter dispatch's empirical
+  /// "Gap 1" finding) to additive `coeffs[0] += Scalar::ONE`.
+  ///
+  /// Algebra of the additive mutation: for any `UniPoly<Scalar>`, the load-
+  /// bearing invariants at `vendor/nova/src/spartan/polys/univariate.rs` are
+  /// `eval_at_zero() = coeffs[0]` and `eval_at_one() = Σ coeffs[i]`. After
+  /// `coeffs[0] += ONE`:
+  ///   - eval_at_zero shifts by +ONE
+  ///   - eval_at_one  shifts by +ONE  (because coeffs[0] is one of the
+  ///                                   summands of `Σ coeffs[i]`)
+  ///   - mutated_sum = (eval_at_zero + ONE) + (eval_at_one + ONE)
+  ///                 = original_sum + 2·ONE
+  /// For any field of characteristic ≠ 2, `2·ONE ≠ ZERO` so `mutated_sum ≠
+  /// original_sum`. BN254 scalar field characteristic is the prime
+  /// `r ≈ 2^254` (odd, verified) — the additive mutation breaks the
+  /// (C)-binding equation under ANY fixture, including the all-zero
+  /// `t_lookup_running = 0` baseline inherited from the AbsentTableStepCircuit
+  /// shape. The empirical-close holds without fixture amendment.
+  ///
+  /// Anchored on FS-NIZK soundness for sumcheck-based protocols (Fischlin-
+  /// Fischlin 2005 / Bernhard-Pereira-Warinschi 2012). The `UniPoly`
+  /// `poly_lookup_j` is FS-bound at `nifs.rs:2003` and `:2030` via the prover
+  /// transcript; any post-prove mutation of `coeffs[0]` changes the
+  /// evaluations at `0` and `1` (deterministically by the invariants above),
+  /// and the verifier's (C)-binding check at `:2025-2028` reads the mutated
+  /// polynomial directly.
+  ///
+  /// STOP-AND-ASK trigger #6 (per Sub-ratification): under the all-zero
+  /// `t_lookup_running_j = 0` baseline, the additive mutation MUST produce
+  /// `eval_at_zero + eval_at_one = 2·ONE ≠ 0`. If the additive mutation
+  /// fails to reject, the coefficient-to-evaluation invariants are violated
+  /// at the vendor-side `polys/univariate.rs` — diagnose against the
+  /// load-bearing invariants `eval_at_zero = coeffs[0]` and `eval_at_one = Σ
+  /// coeffs[i]` before declaring the mutation shape wrong.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn prove_step_with_lookup_fold_post_prove_mutate_poly_lookup_via_nifs_rebuild_rejects_at_lookup_c_binding(
+  ) {
+    const SEED_M_GH7_3B_TEST_II: u64 = 0xC1BE_5BAD_C0DE_7032;
+    let fixture = m_gh7_3b_build_honest_two_step_fixture(SEED_M_GH7_3B_TEST_II);
+
+    // Mutate the NIFS's `poly_lookup[0]` constant term by additive += ONE.
+    // `NIFS::poly_lookup` is `pub` per the M.GH5.1 visibility bump at
+    // `nifs.rs:252`; mutation is mechanically feasible from outside the
+    // `neutron` module. We clone the NIFS to keep the fixture's honest copy
+    // available for symmetry with tests (i) and (iii).
+    let mut nifs_corrupted = fixture.nifs2.clone();
+    let poly_lookup_vec = nifs_corrupted
+      .poly_lookup
+      .as_mut()
+      .expect("fold #2 prove populates Some(poly_lookup) under lookup-fold");
+    assert_eq!(
+      poly_lookup_vec.len(),
+      1,
+      "K=1: poly_lookup must be a length-1 Vec"
+    );
+    let poly0 = &mut poly_lookup_vec[0];
+    // Snapshot the honest eval_at_zero + eval_at_one for the post-mutation
+    // sanity check below.
+    let honest_eval_sum = poly0.eval_at_zero() + poly0.eval_at_one();
+
+    // Additive mutation on the constant term: coeffs[0] += ONE.
+    // `UniPoly.coeffs` is `pub` per the existing vendor-side polynomial API
+    // (verified by the use in test (ii) compilation; see UniPoly source at
+    // `spartan/polys/univariate.rs`). If the field is not `pub`, the
+    // compilation will fail — STOP-AND-ASK at that point per the
+    // visibility-gap framing of trigger #1.
+    poly0.coeffs[0] += <Bn256EngineKZG as Engine>::Scalar::ONE;
+
+    let mutated_eval_sum = poly0.eval_at_zero() + poly0.eval_at_one();
+    let two_one = <Bn256EngineKZG as Engine>::Scalar::ONE
+      + <Bn256EngineKZG as Engine>::Scalar::ONE;
+    assert_eq!(
+      mutated_eval_sum,
+      honest_eval_sum + two_one,
+      "test (ii) additive-mutation effectiveness (STOP-AND-ASK trigger #6): \
+       additive `coeffs[0] += ONE` must shift eval_at_zero and eval_at_one \
+       each by +ONE (because `eval_at_zero = coeffs[0]` and `eval_at_one = \
+       Σ coeffs[i]`), so the sum shifts by +2·ONE. If this fires, the \
+       UniPoly coefficient-to-evaluation invariants at \
+       `spartan/polys/univariate.rs` are violated; halt before claiming \
+       additive mutation is wrong."
+    );
+    assert_ne!(
+      mutated_eval_sum, honest_eval_sum,
+      "test (ii) mutation non-vacuous: BN254 scalar field characteristic is \
+       odd (≠ 2), so 2·ONE ≠ ZERO; mutated_sum ≠ honest_sum"
+    );
+
+    let result = nifs_corrupted.verify_with_multi_table_lookup(
+      &fixture.ro_consts,
+      &fixture.pp_digest,
+      &fixture.str_local,
+      &fixture.folded_U_s1,
+      &fixture.u_step2,
+      &fixture.public_bundles_s2,
+    );
+
+    assert!(
+      matches!(
+        result,
+        Err(crate::errors::NovaError::InvalidSumcheckProof)
+      ),
+      "M.GH7.3b test (ii): verify_with_multi_table_lookup must REJECT the \
+       additive `poly_lookup[0].coeffs[0] += ONE` mutation at the lookup-side \
+       (C)-binding loop (`vendor/nova/src/neutron/nifs.rs:2025-2028`, Step 8 \
+       of verify_with_multi_table_lookup) with `NovaError::InvalidSumcheckProof`. \
+       The prover committed `poly_lookup_0` against the honest \
+       `t_lookup_running_0 = folded_U_s1.T_lookup[0]`; the additive constant- \
+       term mutation shifts `eval_at_zero() + eval_at_one()` by +2·ONE (≠ 0 \
+       in BN254's odd-characteristic prime field), breaking the (C)-binding \
+       equation. Anchored on FS-NIZK soundness (Fischlin-Fischlin 2005). If \
+       this fires, halt and surface — Constraint hygiene §70-78 discharge \
+       for the post-prove NIFS-message-tamper attack surface introduced by \
+       the M.GH7.3a public prover API. Got: {:?}",
+      result.as_ref().err()
+    );
+  }
+
+  /// **M.GH7.3b test (iii)** — `prove_step_with_lookup_fold` negative test:
+  /// corrupt-`U1.T_lookup`-at-verifier-input-boundary rejects at the
+  /// lookup-side (C)-binding (`vendor/nova/src/neutron/nifs.rs:2025-2028`).
+  ///
+  /// STANDS verbatim from Corrigendum #15 (modulo function-name suffix
+  /// `_at_c_binding → _at_lookup_c_binding` for symmetry with tests (i) and
+  /// (ii)). This is the direct dual of M.14's forward-cancellation pattern
+  /// at `nifs.rs:5719-6149` at the per-step-NIFS-routed-through-M.GH7.3a
+  /// surface (K=1 single-table variant; M.14 is K=2 cross-table).
+  ///
+  /// Rejection mechanism: `poly_lookup_0.eval_at_zero() +
+  /// poly_lookup_0.eval_at_one() != t_lookup_running_0` at `nifs.rs:2025-2028`.
+  /// The prover's `poly_lookup_0` was produced against
+  /// `U1_honest.T_lookup[0]` (the honest fold-#1 accumulated running
+  /// scalar); after `r_U_pre.T_lookup[0] += ONE`, the verifier reads
+  /// `t_lookup_running_0 = U1_corrupted.T_lookup[0] = honest + ONE`, but
+  /// `poly_lookup_0(0) + poly_lookup_0(1) = honest` (per the prover-side
+  /// `evals[1] := t_lookup_running − evals[0]` tautology — note that THIS
+  /// tautology is what makes the corruption observable here: the polynomial
+  /// is FROZEN at the honest running scalar, and the verifier-side
+  /// substitution surfaces the divergence). Equation rejects:
+  /// `honest ≠ honest + ONE` holds in any prime field of size ≥ 2.
+  ///
+  /// Anchored on Nova 2021/370 v3 §4 binding-by-hash composition.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  fn prove_step_with_lookup_fold_corrupt_t_lookup_at_index_in_consumed_u1_rejects_at_lookup_c_binding(
+  ) {
+    const SEED_M_GH7_3B_TEST_III: u64 = 0xC1BE_5BAD_C0DE_7033;
+    let fixture = m_gh7_3b_build_honest_two_step_fixture(SEED_M_GH7_3B_TEST_III);
+
+    // Corrupt the verifier-input lookup-side running target
+    // U1.T_lookup[0] by additive += ONE. `FoldedInstance.T_lookup` is
+    // `pub(crate)` at `relation.rs:294`; accessible from this sibling test
+    // module.
+    let mut folded_U_step1_corrupted_lookup = fixture.folded_U_s1.clone();
+    {
+      let t_lookup = folded_U_step1_corrupted_lookup
+        .T_lookup
+        .as_mut()
+        .expect("fold #1 populates Some(T_lookup) under lookup-fold");
+      assert_eq!(t_lookup.len(), 1, "K=1: T_lookup must have length 1");
+      let honest_value = t_lookup[0];
+      t_lookup[0] += <Bn256EngineKZG as Engine>::Scalar::ONE;
+      assert_ne!(
+        t_lookup[0], honest_value,
+        "test (iii) corruption non-vacuous: corrupted T_lookup[0] must differ \
+         from honest T_lookup[0] (BN254 scalar field is prime of size ≥ 2, \
+         so honest + ONE ≠ honest)"
+      );
+    }
+
+    let result = fixture.nifs2.verify_with_multi_table_lookup(
+      &fixture.ro_consts,
+      &fixture.pp_digest,
+      &fixture.str_local,
+      &folded_U_step1_corrupted_lookup,
+      &fixture.u_step2,
+      &fixture.public_bundles_s2,
+    );
+
+    assert!(
+      matches!(
+        result,
+        Err(crate::errors::NovaError::InvalidSumcheckProof)
+      ),
+      "M.GH7.3b test (iii): verify_with_multi_table_lookup must REJECT the \
+       lookup-side `U1.T_lookup[0] += ONE` corruption at the lookup-side \
+       (C)-binding loop (`vendor/nova/src/neutron/nifs.rs:2025-2028`, Step 8 \
+       of verify_with_multi_table_lookup, j=0 first-fire under K=1) with \
+       `NovaError::InvalidSumcheckProof`. The prover's `poly_lookup_0` was \
+       produced against `U1_honest.T_lookup[0]`; after corruption, the \
+       verifier reads `t_lookup_running_0 = honest + ONE`, but the \
+       polynomial's (C)-binding sum equals `honest` (frozen at prove time by \
+       the `evals[1] := t_lookup_running − evals[0]` construction in \
+       `lookup_sumcheck.rs:278-285`); equation `honest ≠ honest + ONE` in \
+       any prime field of size ≥ 2 rejects deterministically. Anchored on \
+       Nova 2021/370 v3 §4 binding-by-hash composition (direct dual of M.14 \
+       forward-cancellation at `nifs.rs:5719-6149` at the K=1 single-table \
+       variant). If this fires, halt and surface — Constraint hygiene \
+       §70-78 discharge for the verifier-input running-state-carry \
+       substitution attack surface. Got: {:?}",
+      result.as_ref().err()
+    );
+  }
 }
