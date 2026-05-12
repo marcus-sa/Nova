@@ -2766,6 +2766,7 @@ mod tests {
         vec![],
         0,
         0,
+        None,
       )
       .expect("PublicParams::setup must succeed at HyperKZG trivial-circuit shape");
       #[cfg(not(feature = "lookup-fold"))]
@@ -2818,6 +2819,7 @@ mod tests {
         vec![],
         0,
         0,
+        None,
       )
       .expect("PublicParams::setup must succeed at IPA-PC trivial-circuit shape");
       #[cfg(not(feature = "lookup-fold"))]
