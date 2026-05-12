@@ -49,13 +49,25 @@ pub struct SumcheckProof<E: Engine> {
 ///
 /// Each field is the value of the corresponding per-table multilinear polynomial
 /// at the outer-sumcheck challenge `r_x` (i.e., the polynomial bound through all
-/// `ell = log2(num_cons)` rounds). The M.GH7.4b dispatch consumes these as
-/// `PolyEvalInstance::e` values when extending the batch-eval-reduce u_vec/w_vec.
+/// `ell = log2(num_cons)` rounds). The M.GH7.4b dispatch consumes the PCS-opened
+/// subset `(eval_w, eval_ts, eval_inv_w, eval_inv_t)` as `PolyEvalInstance::e`
+/// values when extending the batch-eval-reduce u_vec/w_vec; the remaining three
+/// (`eval_T`, `eval_eq_w`, `eval_eq_t`) are NOT PCS-opened — `eval_T` is over
+/// fixed table data (caller-reconstructed at verify), and the eq-factors are
+/// verifier-reconstructed via `EqPolynomial::evaluate` against the eq-factor
+/// challenges that defined them at construction time.
 ///
 /// All seven polynomials are bound to length 1 after the outer sumcheck; the
 /// engine reads `poly[0]` for each (mirroring how the R1CS-side
 /// `(claim_Az, claim_Bz, claim_Cz)` are recovered at `sumcheck.rs:703-705`).
-#[derive(Clone, Debug)]
+///
+/// Embedded in [`crate::spartan::snark::RelaxedR1CSSNARK`] as the new
+/// `per_table_outer_evals: Option<Vec<PerTableOuterEvals<E::Scalar>>>` field at
+/// M.GH7.4b — the seven evals are part of the serialised proof envelope so the
+/// verifier can reconstruct the outer-sumcheck unified residue claim per
+/// Corrigendum #16 Finding B.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
 #[allow(non_snake_case)]
 pub struct PerTableOuterEvals<F: ff::PrimeField> {
   /// Value of the witness polynomial `w_j(r_x)`.
