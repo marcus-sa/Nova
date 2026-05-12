@@ -8,6 +8,8 @@ use crate::{
   neutron::{circuit::r1cs::AllocatedNonnativeR1CSInstance, relation::FoldedInstance},
   traits::{commitment::CommitmentTrait, Engine, ROCircuitTrait},
 };
+#[cfg(feature = "lookup-fold")]
+use crate::Commitment;
 use ff::Field;
 
 /// An in-circuit representation of NeutronNova's FoldedInstance
@@ -44,6 +46,36 @@ pub struct AllocatedFoldedInstance<E: Engine> {
   /// at `vendor/nova/src/neutron/relation.rs:265`.
   #[cfg(feature = "lookup-fold")]
   pub(crate) T_lookup_per_table: Option<Vec<AllocatedNum<E::Scalar>>>,
+
+  /// Per-table running lookup-witness commitment VECTOR. `None` only at outer
+  /// base when no prior fold step has carried lookup data; for fold-depth >= 1
+  /// always `Some` (length pinned by the shape registry's
+  /// `multi_column_tables.len()`).
+  ///
+  /// GH-#7 design pin Corrigendum #18 (M.GH7.5.0 path α): in-circuit mirror of
+  /// the off-circuit `FoldedInstance::comm_L: Option<Vec<Commitment<E>>>` at
+  /// `vendor/nova/src/neutron/relation.rs:273-274`. Absorbed in `absorb_in_ro`
+  /// between the `T_lookup_per_table` block and `u` in `table_id`-canonical
+  /// order; the per-`j` independent fold update is M.GH7.5.0b scope (the
+  /// `verify_with_multi_table_lookup` in-circuit per-table fold body that
+  /// mirrors the off-circuit fold at `relation.rs:862-884` under Corrigendum
+  /// #6 primitive 3). At M.GH7.5.0a (this commit) the field is purely
+  /// load-bearing for STORAGE + ABSORB; `fold` and `from_lookup_fold_output`
+  /// propagate it unchanged from `self` (passthrough analogous to
+  /// `T_lookup_per_table` passthrough at `fold` line ~488).
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_L_per_table: Option<Vec<AllocatedNonnativePoint<E>>>,
+  /// Per-table running multiplicity-vector commitment VECTOR. See
+  /// `comm_L_per_table` for the Corrigendum #18 path α rationale. Mirrors
+  /// off-circuit `FoldedInstance::comm_ts: Option<Vec<Commitment<E>>>` at
+  /// `vendor/nova/src/neutron/relation.rs:277-278`.
+  ///
+  /// `comm_inv_w` / `comm_inv_t` are intentionally NOT mirrored on the
+  /// in-circuit side: per Corrigendum #17 chicken-and-egg resolution they are
+  /// envelope-fresh against envelope-`r_logup_j`, NOT bound into the IVC hash
+  /// chain.
+  #[cfg(feature = "lookup-fold")]
+  pub(crate) comm_ts_per_table: Option<Vec<AllocatedNonnativePoint<E>>>,
 
   pub(crate) u: AllocatedNum<E::Scalar>,
 
@@ -214,12 +246,99 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       }
     };
 
+    // GH-#7 design pin Corrigendum #18 (M.GH7.5.0a path α): allocate
+    // `comm_L_per_table` and `comm_ts_per_table` mirroring the off-circuit
+    // `FoldedInstance::comm_L` / `comm_ts` Vec fields at
+    // `vendor/nova/src/neutron/relation.rs:273-278`. Shape discipline matches
+    // `T_lookup_per_table` above:
+    //
+    // - `inst.comm_L == Some(vec)`: allocate per-element from the vec.
+    // - `inst.comm_L == None` AND `lookup_fold_k_hint > 0`: M.GH5.3-style
+    //   shape-derivation path, allocate `Some(vec![default; k])` so
+    //   `synthesize_non_base_case`'s shape matches the non-base-case shape that
+    //   M.GH7.5.0b's `verify_with_multi_table_lookup` will produce.
+    // - `inst.comm_L == None` AND `lookup_fold_k_hint == 0`: legacy path,
+    //   `None`. Used by non-lookup-fold vendor-internal tests / shape derivation
+    //   at `lookup_fold_k == 0`.
+    //
+    // The values are `AllocatedNonnativePoint::default(cs)` (which is
+    // `AllocatedNonnativePoint::alloc(cs, None)` with no infinity constraint
+    // beyond what the gadget enforces internally) for the k-hint path; this
+    // mirrors the `default_with_lookup_k` `comm_W` allocation pattern below.
+    #[cfg(feature = "lookup-fold")]
+    let comm_L_per_table = {
+      let comm_L_slice: Option<&[Commitment<E>]> = inst.and_then(|inst| inst.comm_L.as_deref());
+      match comm_L_slice {
+        Some(slice) => {
+          let allocated = slice
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+              AllocatedNonnativePoint::alloc(
+                cs.namespace(|| format!("allocate comm_L_per_table[{j}]")),
+                Some(c.to_coordinates()),
+              )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          Some(allocated)
+        }
+        None if lookup_fold_k_hint > 0 => {
+          let allocated = (0..lookup_fold_k_hint)
+            .map(|j| {
+              AllocatedNonnativePoint::alloc(
+                cs.namespace(|| format!("allocate comm_L_per_table[{j}] (k-hint)")),
+                None,
+              )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          Some(allocated)
+        }
+        None => None,
+      }
+    };
+
+    #[cfg(feature = "lookup-fold")]
+    let comm_ts_per_table = {
+      let comm_ts_slice: Option<&[Commitment<E>]> = inst.and_then(|inst| inst.comm_ts.as_deref());
+      match comm_ts_slice {
+        Some(slice) => {
+          let allocated = slice
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+              AllocatedNonnativePoint::alloc(
+                cs.namespace(|| format!("allocate comm_ts_per_table[{j}]")),
+                Some(c.to_coordinates()),
+              )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          Some(allocated)
+        }
+        None if lookup_fold_k_hint > 0 => {
+          let allocated = (0..lookup_fold_k_hint)
+            .map(|j| {
+              AllocatedNonnativePoint::alloc(
+                cs.namespace(|| format!("allocate comm_ts_per_table[{j}] (k-hint)")),
+                None,
+              )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+          Some(allocated)
+        }
+        None => None,
+      }
+    };
+
     Ok(Self {
       comm_W,
       comm_E,
       T,
       #[cfg(feature = "lookup-fold")]
       T_lookup_per_table,
+      #[cfg(feature = "lookup-fold")]
+      comm_L_per_table,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts_per_table,
       u,
       X,
     })
@@ -284,11 +403,31 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     let T_lookup_zero = alloc_zero(cs.namespace(|| "allocate T_lookup_zero"));
     let T_lookup_per_table = Some((0..k).map(|_| T_lookup_zero.clone()).collect::<Vec<_>>());
 
+    // GH-#7 design pin Corrigendum #18 (M.GH7.5.0a path α): default-zero
+    // `comm_L_per_table` and `comm_ts_per_table` Vecs of length `k`,
+    // analogous to `T_lookup_per_table` outer-base discipline. Use a single
+    // `AllocatedNonnativePoint::default(...)` and clone across all k slots so
+    // each slot shares the same zero-binding allocation (audit-surface
+    // mirror of the `T_lookup_zero` discipline above and of the
+    // `comm_E = comm_W.clone()` pattern at line ~251 above).
+    //
+    // The native-side `FoldedInstance::default` produces `comm_L = None` /
+    // `comm_ts = None` (structurally-empty outer base); the in-circuit
+    // `Some(vec![default; k])` shape is intentional per §2.3 / §3.2 for the
+    // constant-shape FS schedule across base / non-base, consistent with the
+    // existing `T_lookup_per_table` constant-shape pin (Corrigendum #6).
+    let comm_L_zero = AllocatedNonnativePoint::default(cs.namespace(|| "allocate comm_L_zero"))?;
+    let comm_L_per_table = Some((0..k).map(|_| comm_L_zero.clone()).collect::<Vec<_>>());
+    let comm_ts_zero = AllocatedNonnativePoint::default(cs.namespace(|| "allocate comm_ts_zero"))?;
+    let comm_ts_per_table = Some((0..k).map(|_| comm_ts_zero.clone()).collect::<Vec<_>>());
+
     Ok(Self {
       comm_W,
       comm_E,
       T,
       T_lookup_per_table,
+      comm_L_per_table,
+      comm_ts_per_table,
       u,
       X,
     })
@@ -333,6 +472,14 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       T,
       #[cfg(feature = "lookup-fold")]
       T_lookup_per_table: None,
+      // GH-#7 design pin Corrigendum #18 (M.GH7.5.0a path α): outer-base
+      // `None` mirrors the off-circuit `FoldedInstance::default` produces
+      // `comm_L = None` / `comm_ts = None`. Co-defaulted with
+      // `T_lookup_per_table` per Corrigendum #6 outer-base discipline.
+      #[cfg(feature = "lookup-fold")]
+      comm_L_per_table: None,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts_per_table: None,
       u,
       X,
     })
@@ -374,6 +521,41 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
     if let Some(t_lookup) = &self.T_lookup_per_table {
       for t_j in t_lookup {
         ro.absorb(t_j);
+      }
+    }
+
+    // GH-#7 design pin Corrigendum #18 M.GH7.5.0a path α: bind per-table
+    // running `comm_L` and `comm_ts` into the IVC public-input hash chain.
+    // Inserted AFTER the `T_lookup_per_table` block above and BEFORE the
+    // `u` / `X` absorbs below — `table_id`-canonical order. comm_L's full
+    // per-table block is absorbed first, then comm_ts's full per-table
+    // block (mirroring the off-circuit `FoldedInstance::absorb_in_ro2`
+    // byte-equivalent counterpart at
+    // `vendor/nova/src/neutron/relation.rs`).
+    //
+    // `comm_inv_w` / `comm_inv_t` are intentionally NOT absorbed here per
+    // Corrigendum #17 chicken-and-egg resolution (envelope-fresh against
+    // envelope-`r_logup_j`, NOT bound into IVC hash chain).
+    //
+    // Outer-base `None`-skip mirrors the `T_lookup_per_table` discipline
+    // above: at outer base (`comm_L_per_table == None`) no commitments
+    // are absorbed (the sequence is empty, not skipped). At k > 0 with
+    // `default_with_lookup_k` the field is `Some(vec![default; k])` and k
+    // zero-commitments are absorbed — constant-shape FS schedule across
+    // base / non-base per Corrigendum #6.
+    //
+    // M.GH7.5.0a STORAGE + ABSORB only; the in-circuit per-table fold
+    // update (`verify_with_multi_table_lookup` body) is M.GH7.5.0b scope.
+    #[cfg(feature = "lookup-fold")]
+    if let Some(comm_L_pt) = &self.comm_L_per_table {
+      for (j, c) in comm_L_pt.iter().enumerate() {
+        c.absorb_in_ro(cs.namespace(|| format!("absorb running comm_L[{j}]")), ro)?;
+      }
+    }
+    #[cfg(feature = "lookup-fold")]
+    if let Some(comm_ts_pt) = &self.comm_ts_per_table {
+      for (j, c) in comm_ts_pt.iter().enumerate() {
+        c.absorb_in_ro(cs.namespace(|| format!("absorb running comm_ts[{j}]")), ro)?;
       }
     }
 
@@ -486,6 +668,20 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       T: T_out.clone(),
       #[cfg(feature = "lookup-fold")]
       T_lookup_per_table: self.T_lookup_per_table.clone(),
+      // GH-#7 design pin Corrigendum #18 (M.GH7.5.0a path α): `fold` passes
+      // `comm_L_per_table` / `comm_ts_per_table` through unchanged from
+      // `self`, analogous to the `T_lookup_per_table` passthrough above.
+      // The post-fold update of the per-table running commitments is the
+      // responsibility of the lookup verifier path
+      // (`verify_with_multi_table_lookup`); M.GH7.5.0b's augmented-circuit
+      // caller will wire the post-fold commitments into the post-fold
+      // `AllocatedFoldedInstance` via the widened `from_lookup_fold_output`
+      // sibling. Mirrors the off-circuit `FoldedInstance::fold` post-fold
+      // override at `vendor/nova/src/neutron/relation.rs:862-884`.
+      #[cfg(feature = "lookup-fold")]
+      comm_L_per_table: self.comm_L_per_table.clone(),
+      #[cfg(feature = "lookup-fold")]
+      comm_ts_per_table: self.comm_ts_per_table.clone(),
       u: u_fold,
       X: vec![X_fold],
     })
@@ -519,6 +715,18 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       comm_E: u_fold.comm_E,
       T: u_fold.T,
       T_lookup_per_table: Some(t_lookup_out_per_table),
+      // GH-#7 design pin Corrigendum #18 M.GH7.5.0a path α: propagate
+      // `comm_L_per_table` / `comm_ts_per_table` through from `u_fold`
+      // unchanged. M.GH7.5.0a defers the signature widening (carrying
+      // explicit `comm_L_fold_per_table` / `comm_ts_fold_per_table` args
+      // analogous to `t_lookup_out_per_table`) to M.GH7.5.0b; at M.GH7.5.0a
+      // the post-fold per-table commitments are NOT yet computed in-circuit
+      // (the `verify_with_multi_table_lookup` in-circuit per-table fold body
+      // is M.GH7.5.0b scope), so the passthrough from `u_fold` (which
+      // inherits from `self.fold`'s `self.comm_L_per_table.clone()` passthrough
+      // above) is the structurally-only-correct choice.
+      comm_L_per_table: u_fold.comm_L_per_table,
+      comm_ts_per_table: u_fold.comm_ts_per_table,
       u: u_fold.u,
       X: u_fold.X,
     }
@@ -621,12 +829,81 @@ impl<E: Engine> AllocatedFoldedInstance<E> {
       }
     };
 
+    // GH-#7 design pin Corrigendum #18 M.GH7.5.0a path α: per-table
+    // shape-matched select for `comm_L_per_table` / `comm_ts_per_table`,
+    // identical shape-mismatch-invariant discipline as `T_lookup_per_table`
+    // above. The augmented-circuit's `synthesize_base_case` allocates via
+    // `default_with_lookup_k(cs, k)` (which produces `Some(vec![default; k])`
+    // for both new fields) and `synthesize_non_base_case` will (at M.GH7.5.0b)
+    // produce a post-fold instance with matching length-k Vecs; honest
+    // synthesis preserves the invariant. Shape-mismatch indicates a wire-up
+    // bug at the caller; fail-close at synthesis time rather than panic.
+    #[cfg(feature = "lookup-fold")]
+    let comm_L_per_table = match (&self.comm_L_per_table, &other.comm_L_per_table) {
+      (None, None) => None,
+      (Some(self_v), Some(other_v)) if self_v.len() == other_v.len() => {
+        let selected = self_v
+          .iter()
+          .zip(other_v.iter())
+          .enumerate()
+          .map(|(j, (s, o))| {
+            AllocatedNonnativePoint::conditionally_select(
+              cs.namespace(|| {
+                format!("comm_L_per_table[{j}] = cond ? self.comm_L_per_table[{j}] : other.comm_L_per_table[{j}]")
+              }),
+              s,
+              o,
+              condition,
+            )
+          })
+          .collect::<Result<Vec<_>, _>>()?;
+        Some(selected)
+      }
+      _ => {
+        return Err(SynthesisError::Unsatisfiable(
+          "AllocatedFoldedInstance::conditionally_select: comm_L_per_table shape mismatch (None/Some or unequal lengths) — invariant violated by caller".to_string(),
+        ));
+      }
+    };
+
+    #[cfg(feature = "lookup-fold")]
+    let comm_ts_per_table = match (&self.comm_ts_per_table, &other.comm_ts_per_table) {
+      (None, None) => None,
+      (Some(self_v), Some(other_v)) if self_v.len() == other_v.len() => {
+        let selected = self_v
+          .iter()
+          .zip(other_v.iter())
+          .enumerate()
+          .map(|(j, (s, o))| {
+            AllocatedNonnativePoint::conditionally_select(
+              cs.namespace(|| {
+                format!("comm_ts_per_table[{j}] = cond ? self.comm_ts_per_table[{j}] : other.comm_ts_per_table[{j}]")
+              }),
+              s,
+              o,
+              condition,
+            )
+          })
+          .collect::<Result<Vec<_>, _>>()?;
+        Some(selected)
+      }
+      _ => {
+        return Err(SynthesisError::Unsatisfiable(
+          "AllocatedFoldedInstance::conditionally_select: comm_ts_per_table shape mismatch (None/Some or unequal lengths) — invariant violated by caller".to_string(),
+        ));
+      }
+    };
+
     Ok(Self {
       comm_W,
       comm_E,
       T,
       #[cfg(feature = "lookup-fold")]
       T_lookup_per_table,
+      #[cfg(feature = "lookup-fold")]
+      comm_L_per_table,
+      #[cfg(feature = "lookup-fold")]
+      comm_ts_per_table,
       u,
       X,
     })

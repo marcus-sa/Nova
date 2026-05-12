@@ -930,6 +930,44 @@ impl<E: Engine> AbsorbInRO2Trait<E> for FoldedInstance<E> {
       }
     }
 
+    // GH-#7 design pin Corrigendum #18 M.GH7.5.0a path α NATIVE-SIDE MIRROR:
+    // bind per-table running `comm_L` and `comm_ts` into the IVC public-input
+    // hash chain. Byte-equivalent counterpart to the in-circuit
+    // `AllocatedFoldedInstance::absorb_in_ro` extension at
+    // `vendor/nova/src/neutron/circuit/relation.rs`. Inserted AFTER the
+    // `T_lookup` block above and BEFORE the `u` / `X` absorbs below — full
+    // per-table `comm_L` block first, then full per-table `comm_ts` block,
+    // each in `table_id`-canonical order (which the off-circuit `Vec<...>`
+    // storage shape already preserves via the
+    // `LookupPayloadPublicMultiTable::sort_by_key(|t| t.table_id)` discipline
+    // upstream of `prove_with_multi_table_lookup`'s Vec construction).
+    //
+    // `comm_inv_w` / `comm_inv_t` are intentionally NOT absorbed here per
+    // Corrigendum #17 chicken-and-egg resolution (envelope-fresh against
+    // envelope-`r_logup_j`, NOT bound into IVC hash chain).
+    //
+    // At outer base where `comm_L == None` / `comm_ts == None` no
+    // commitments are absorbed (the sequence is empty, not skipped). The
+    // gating is on `feature = "lookup-fold"`: non-`lookup-fold` builds emit
+    // the original absorption shape (T, u, X) without the new branch.
+    //
+    // M.GH7.5.0a STORAGE + ABSORB only; the per-table fold update of
+    // `comm_L` / `comm_ts` in the off-circuit `fold` body at
+    // `relation.rs:862-884` already lands per M.GH7.0a, so the binding is
+    // load-bearing immediately on the native side.
+    #[cfg(feature = "lookup-fold")]
+    if let Some(comm_L) = &self.comm_L {
+      for c in comm_L {
+        c.absorb_in_ro2(ro);
+      }
+    }
+    #[cfg(feature = "lookup-fold")]
+    if let Some(comm_ts) = &self.comm_ts {
+      for c in comm_ts {
+        c.absorb_in_ro2(ro);
+      }
+    }
+
     ro.absorb(self.u);
     for x in &self.X {
       ro.absorb(*x);
