@@ -5059,4 +5059,538 @@ mod tests {
       }
     }
   }
+
+  // ============================================================
+  // Corrigendum #24 Experiment D-prime — n=1 hash-chain
+  // divergence-locus diagnostic. NOT a fix for Obstruction 2.
+  // PASSES at vendor HEAD `b233301` as a documented record of
+  // the (iv.γ) constant-shape-vs-Option-shape absorb-sequence
+  // drift between the augmented circuit's base-case allocation
+  // (`AllocatedFoldedInstance::default_with_lookup_k` at
+  // `circuit/relation.rs:363-434`, populating
+  // `T_lookup_per_table = Some(vec![0; k])`,
+  // `comm_L_per_table = Some(vec![default; k])`,
+  // `comm_ts_per_table = Some(vec![default; k])`) versus the
+  // native verifier's `FoldedInstance::default` at base case
+  // (`relation.rs:661-684`, producing `T_lookup = None`,
+  // `comm_L = None`, `comm_ts = None`). If a future Corrigendum
+  // #25 fix-α resolves the divergence, this test will FAIL —
+  // that's the intended signal.
+  // ============================================================
+
+  /// **Corrigendum #24 Experiment D-prime — n=1 hash-chain divergence locus.**
+  ///
+  /// Pinpoints WHICH absorb step in the IVC-output-hash chain produces the
+  /// first divergence between (a) the native verifier's hash re-derive at
+  /// `mod.rs:774-789` (which feeds `if hash != self.l_u.X[0]` at
+  /// `mod.rs:791-794`, the n=1 `ProofVerifyError` locus) and (b) the
+  /// prover-equivalent absorb sequence that the augmented circuit's
+  /// base-case synthesis emits at `circuit/mod.rs:939-955` (which becomes
+  /// `recursive_snark.l_u.X[0]` after `RecursiveSNARK::new`).
+  ///
+  /// Two diagnostic helpers (closures) each construct an isolated absorb
+  /// sequence as a `Vec<(label, GH75Scalar)>`. We then re-absorb prefixes
+  /// of those sequences into fresh `PoseidonRO` instances and squeeze at
+  /// each prefix length to get a partial-squeeze digest. Comparing the
+  /// two prefix-squeeze sequences pinpoints the first absorb step where
+  /// they diverge.
+  ///
+  /// **Why fresh hashers per prefix and not `hasher.clone()`?** The vendor
+  /// `PoseidonRO<Base>` is `Serialize` / `Deserialize` but does NOT derive
+  /// `Clone` (`provider/poseidon.rs:38-44`). Building a fresh hasher and
+  /// re-absorbing each prefix is O(N²) in absorb count, but N ~ 12 here
+  /// — well under any cost concern, and the byte-equivalence to the
+  /// production verifier's single-stream `absorb`/`squeeze` is preserved.
+  ///
+  /// **Native-side absorb sequence (mirrors `mod.rs:774-789`):**
+  /// `pp.digest()` | `Scalar::from(num_steps as u64)` | `z0[0]` |
+  /// `self.zi[0]` | (via `self.r_U.absorb_in_ro2`:) `comm_W` | `comm_E` |
+  /// `T` | (cfg lookup-fold) `T_lookup if Some` | (cfg lookup-fold)
+  /// `comm_L if Some` | (cfg lookup-fold) `comm_ts if Some` | `u` |
+  /// `X[..]` | `self.ri`. At n=1 against `FoldedInstance::default`, the
+  /// three `Option` blocks are SKIPPED (sequence empty, not skipped).
+  ///
+  /// **Prover-equivalent absorb sequence (mirrors `circuit/mod.rs:940-950`
+  /// composed with `circuit/relation.rs:502-570`, where the base-case
+  /// `Unew_base = default_with_lookup_k(cs, 1, k=1)` per
+  /// `circuit/mod.rs:553-559`):** identical to native-side EXCEPT
+  /// `T_lookup_per_table = Some(vec![ZERO; 1])` (1 zero scalar absorb),
+  /// `comm_L_per_table = Some(vec![Commitment::default(); 1])` (1 zero
+  /// commitment absorb), `comm_ts_per_table = Some(vec![Commitment::default(); 1])`
+  /// (1 zero commitment absorb). We model this by constructing a hand-
+  /// crafted `FoldedInstance` natively with the `Some(..)` fields populated,
+  /// then invoking the same `absorb_in_ro2` so the byte sequence matches
+  /// the circuit's `absorb_in_ro` (which is byte-equivalent to
+  /// `absorb_in_ro2` for equal values per the M.GH5.0 STAGE 0 acceptance
+  /// criterion at `circuit/relation.rs:501`).
+  ///
+  /// **Routing on the empirical outcome at vendor HEAD `b233301`**:
+  /// - D1: first divergence at one of the cfg-gated lookup-side blocks
+  ///   (`T_lookup` / `comm_L` / `comm_ts`) — confirms (iv.γ).
+  ///   Corrigendum #25 authors Fix-α.
+  /// - D2: first divergence at `comm_W` or `comm_E` — confirms (iv.α).
+  ///   Corrigendum #25 routes to `comm_E = comm_W.clone()` shared-variable
+  ///   investigation.
+  /// - D3: first divergence at `ri` — confirms (iv.β) ri-allocation drift.
+  /// - D4: NO divergence in the partial-squeeze sequence yet
+  ///   `verifier_recomputed_hash != l_u_X_0` — routes deeper.
+  ///
+  /// **Asserts the divergence EXISTS** at vendor HEAD `b233301`: this test
+  /// PASSES as long as Obstruction 2 reproduces at the n=1 hash-chain locus.
+  /// If Corrigendum #25's Fix-α lands and the divergence disappears, this
+  /// test FAILS to signal that the obstruction has been resolved; at that
+  /// point this fixture should be promoted into a positive single-step n=1
+  /// acceptance test (Corrigendum #23 layer 5b deferred deliverable).
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_5_obstruction2_experiment_d_prime_n1_hash_chain_divergence_locus() {
+    // (1) Construct the n=1 IVC trace using the shared Experiment A/B helper.
+    //     This invokes RecursiveSNARK::new + one prove_step_with_lookup_fold
+    //     (which takes the bootstrap branch at mod.rs:955-958 and returns
+    //     without mutating r_U / l_u / etc.). We DO NOT call verify here —
+    //     we reconstruct the verify-side hash-chain re-derive ourselves so
+    //     we can introspect intermediate partial squeezes.
+    let (_ignored_verify_result, pp, recursive_snark, z0) = gh75_experiment_run_ivc_verify(1);
+    let num_steps: usize = 1;
+
+    // Sanity: at n=1 post-bootstrap, recursive_snark.i should be 1, and
+    // r_U / ri / zi should be unchanged from the RecursiveSNARK::new
+    // initial state (the bootstrap branch at mod.rs:955-958 mutates only
+    // self.i). Verified at mod.rs:949-958.
+    assert_eq!(recursive_snark.i, 1, "post-bootstrap i must be 1");
+    assert_eq!(z0.len(), 1, "arity = 1 for IdentityStepCircuit");
+    assert_eq!(recursive_snark.zi.len(), 1, "zi arity = 1");
+
+    // (2) Build the NATIVE-SIDE absorb sequence — byte-for-byte mirror of
+    //     mod.rs:774-789. Each entry is (label, scalar) so we can re-absorb
+    //     prefixes into fresh hashers for partial-squeeze diagnostics.
+    //
+    //     For r_U.absorb_in_ro2 we manually inline the absorb body from
+    //     relation.rs:900-975 so we can emit one entry per scalar absorbed
+    //     (Commitment::absorb_in_ro2 absorbs a small fixed number of scalars
+    //     internally — we model the per-commitment block as a single labeled
+    //     "synthetic" step by chaining the absorbs onto the same prefix
+    //     hasher).
+    //
+    //     Rather than materialising the full byte stream as scalars (which
+    //     would require re-implementing AllocatedNonnativePoint's serialise
+    //     shape) we use the LIVE absorb API: build a labelled list of
+    //     "absorb steps" where each step is a CLOSURE that absorbs into a
+    //     supplied &mut RO2. For each prefix we apply all closures 0..=k
+    //     then squeeze. This preserves byte-equivalence with the production
+    //     hash-chain re-derive at mod.rs:774-789.
+    type RO2 = <GH75E as Engine>::RO2;
+    type AbsorbStep = Box<dyn Fn(&mut RO2)>;
+
+    let native_steps: Vec<(String, AbsorbStep)> = {
+      let mut steps: Vec<(String, AbsorbStep)> = Vec::new();
+      let pp_digest = pp.digest();
+      steps.push((
+        "pp.digest()".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(pp_digest)),
+      ));
+      let num_steps_scalar = GH75Scalar::from(num_steps as u64);
+      steps.push((
+        "num_steps as u64".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(num_steps_scalar)),
+      ));
+      for (i, e) in z0.iter().enumerate() {
+        let e = *e;
+        steps.push((
+          format!("z0[{i}]"),
+          Box::new(move |ro: &mut RO2| ro.absorb(e)),
+        ));
+      }
+      for (i, e) in recursive_snark.zi.iter().enumerate() {
+        let e = *e;
+        steps.push((
+          format!("zi[{i}]"),
+          Box::new(move |ro: &mut RO2| ro.absorb(e)),
+        ));
+      }
+      // self.r_U.absorb_in_ro2(&mut hasher) — inlined per relation.rs:900-975
+      // so we can label each constituent absorb.
+      let r_U = recursive_snark.r_U.clone();
+      let r_U_for_comm_W = r_U.clone();
+      steps.push((
+        "r_U.comm_W (via absorb_in_ro2)".to_string(),
+        Box::new(move |ro: &mut RO2| r_U_for_comm_W.comm_W.absorb_in_ro2(ro)),
+      ));
+      let r_U_for_comm_E = r_U.clone();
+      steps.push((
+        "r_U.comm_E (via absorb_in_ro2)".to_string(),
+        Box::new(move |ro: &mut RO2| r_U_for_comm_E.comm_E.absorb_in_ro2(ro)),
+      ));
+      let r_U_T = r_U.T;
+      steps.push((
+        "r_U.T".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(r_U_T)),
+      ));
+      // cfg-gated lookup-side blocks — under feature = "lookup-fold" AND
+      // with r_U.T_lookup / comm_L / comm_ts being Some(...). At n=1 with
+      // FoldedInstance::default these are all None, so the block is empty.
+      // We emit a labelled NOOP "marker" step so the prover-side equivalent
+      // (which DOES emit absorbs at this position) can be index-aligned.
+      match &r_U.T_lookup {
+        None => steps.push((
+          "[cfg-gated] r_U.T_lookup = None → SKIP".to_string(),
+          Box::new(|_ro: &mut RO2| {}),
+        )),
+        Some(v) => {
+          for (j, t_j) in v.iter().enumerate() {
+            let t_j = *t_j;
+            steps.push((
+              format!("r_U.T_lookup[{j}]"),
+              Box::new(move |ro: &mut RO2| ro.absorb(t_j)),
+            ));
+          }
+        }
+      }
+      match &r_U.comm_L {
+        None => steps.push((
+          "[cfg-gated] r_U.comm_L = None → SKIP".to_string(),
+          Box::new(|_ro: &mut RO2| {}),
+        )),
+        Some(v) => {
+          for (j, c) in v.iter().cloned().enumerate() {
+            steps.push((
+              format!("r_U.comm_L[{j}]"),
+              Box::new(move |ro: &mut RO2| c.absorb_in_ro2(ro)),
+            ));
+          }
+        }
+      }
+      match &r_U.comm_ts {
+        None => steps.push((
+          "[cfg-gated] r_U.comm_ts = None → SKIP".to_string(),
+          Box::new(|_ro: &mut RO2| {}),
+        )),
+        Some(v) => {
+          for (j, c) in v.iter().cloned().enumerate() {
+            steps.push((
+              format!("r_U.comm_ts[{j}]"),
+              Box::new(move |ro: &mut RO2| c.absorb_in_ro2(ro)),
+            ));
+          }
+        }
+      }
+      let r_U_u = r_U.u;
+      steps.push((
+        "r_U.u".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(r_U_u)),
+      ));
+      for (i, x) in r_U.X.iter().cloned().enumerate() {
+        steps.push((
+          format!("r_U.X[{i}]"),
+          Box::new(move |ro: &mut RO2| ro.absorb(x)),
+        ));
+      }
+      let ri = recursive_snark.ri;
+      steps.push((
+        "ri".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(ri)),
+      ));
+      steps
+    };
+
+    // (3) Build the PROVER-EQUIVALENT absorb sequence — what the augmented
+    //     circuit's base-case synthesis at circuit/mod.rs:939-955 absorbs
+    //     into `ro = E::RO2Circuit::new(self.ro_consts)`, composed with
+    //     the base-case `Unew_base = synthesize_base_case(...) =
+    //     AllocatedFoldedInstance::default_with_lookup_k(cs, 1, k=1)` at
+    //     circuit/mod.rs:553-559, whose `absorb_in_ro` at
+    //     circuit/relation.rs:502-570 emits the cfg-gated Some-blocks for
+    //     T_lookup_per_table / comm_L_per_table / comm_ts_per_table — each
+    //     of length k=1 — at base case.
+    //
+    //     We model this natively by constructing a hand-crafted
+    //     `FoldedInstance<GH75E>` with the Some(...) fields populated to
+    //     mirror `default_with_lookup_k(cs, 1, k=1)`'s zero-witness shape,
+    //     then invoking native `absorb_in_ro2` (byte-equivalent to circuit
+    //     `absorb_in_ro` at equal values per M.GH5.0 STAGE 0).
+    //
+    //     The other inputs are deterministic: pp_digest, i_new = 0+1 = 1
+    //     (matches num_steps as u64 = 1), z_0 = z0, z_next = z0 (since
+    //     IdentityStepCircuit::synthesize at base case operates on z_input
+    //     = z_0; verified at circuit/mod.rs:921-931 + IdentityStepCircuit's
+    //     synthesize body at compressed_snark.rs:4226-4235), and r_next =
+    //     recursive_snark.ri (verified at mod.rs:616 + 666: ri is
+    //     threaded as r_next into the augmented-circuit witness AND stored
+    //     on RecursiveSNARK as self.ri).
+    let k = pp.lookup_fold_k;
+    assert_eq!(k, GH75_K, "k mismatch — fixture uses GH75_K = 1");
+    let num_io = pp.structure.S.num_io;
+    let prover_equiv_r_U: FoldedInstance<GH75E> = FoldedInstance {
+      comm_W: Commitment::<GH75E>::default(),
+      // Mirror circuit/relation.rs:368-369: comm_E = comm_W.clone().
+      // Native Commitment::default() is byte-equal to comm_W.clone() at the
+      // value level (both are the point at infinity / zero Pedersen
+      // commitment); the shared-variable-vs-distinct-zero question (iv.α)
+      // probes RO2-absorb-byte determinism on equal-value-distinct-handle
+      // inputs, which on the native side collapses (both are byte-equal
+      // Commitment values).
+      comm_E: Commitment::<GH75E>::default(),
+      T: GH75Scalar::ZERO,
+      u: GH75Scalar::ZERO,
+      X: vec![GH75Scalar::ZERO; num_io],
+      // (iv.γ) probe — circuit allocates Some(vec![alloc_zero; k]) at base
+      // case under lookup_fold_k > 0; native verifier r_U has these = None.
+      // This is THE divergence under test.
+      T_lookup: Some(vec![GH75Scalar::ZERO; k]),
+      comm_L: Some(vec![Commitment::<GH75E>::default(); k]),
+      comm_ts: Some(vec![Commitment::<GH75E>::default(); k]),
+      // comm_inv_w / comm_inv_t are NOT absorbed in absorb_in_ro2 per
+      // Corrigendum #17 chicken-and-egg resolution (verified at
+      // relation.rs:945-947 + circuit/relation.rs:536-538). Leave as
+      // None — they don't enter the byte stream.
+      comm_inv_w: None,
+      comm_inv_t: None,
+    };
+
+    let prover_equiv_steps: Vec<(String, AbsorbStep)> = {
+      let mut steps: Vec<(String, AbsorbStep)> = Vec::new();
+      let pp_digest = pp.digest();
+      steps.push((
+        "pp_digest (witness)".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(pp_digest)),
+      ));
+      // i_new = i + 1 = 0 + 1 = 1 (since base case sets i = ZERO and
+      // i_new = i + Scalar::ONE per circuit/mod.rs:911-919).
+      let i_new = GH75Scalar::from(1u64);
+      steps.push((
+        "i_new = i + 1 = 1".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(i_new)),
+      ));
+      for (i, e) in z0.iter().enumerate() {
+        let e = *e;
+        steps.push((
+          format!("z_0[{i}]"),
+          Box::new(move |ro: &mut RO2| ro.absorb(e)),
+        ));
+      }
+      // z_next for IdentityStepCircuit at base case is z_input = z_0
+      // (per circuit/mod.rs:921-931 conditionally_select_vec picks z_0
+      // when is_base_case = true, then IdentityStepCircuit::synthesize
+      // at compressed_snark.rs:4226-4235 returns z = z_0).
+      for (i, e) in z0.iter().enumerate() {
+        let e = *e;
+        steps.push((
+          format!("z_next[{i}] (= z_0[{i}] at base case)"),
+          Box::new(move |ro: &mut RO2| ro.absorb(e)),
+        ));
+      }
+      // Unew_base.absorb_in_ro — inlined from circuit/relation.rs:502-570
+      // composed with prover_equiv_r_U's hand-crafted shape (Some-blocks
+      // populated to mirror default_with_lookup_k).
+      let U = prover_equiv_r_U.clone();
+      let U_for_comm_W = U.clone();
+      steps.push((
+        "Unew_base.comm_W (default zero point)".to_string(),
+        Box::new(move |ro: &mut RO2| U_for_comm_W.comm_W.absorb_in_ro2(ro)),
+      ));
+      let U_for_comm_E = U.clone();
+      steps.push((
+        "Unew_base.comm_E (= comm_W.clone() per circuit)".to_string(),
+        Box::new(move |ro: &mut RO2| U_for_comm_E.comm_E.absorb_in_ro2(ro)),
+      ));
+      let U_T = U.T;
+      steps.push((
+        "Unew_base.T = 0".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(U_T)),
+      ));
+      // (iv.γ) — under default_with_lookup_k, circuit emits k zero scalars
+      // here. Native equivalent walks the Some(vec![ZERO; k]) shape.
+      if let Some(v) = &U.T_lookup {
+        for (j, t_j) in v.iter().enumerate() {
+          let t_j = *t_j;
+          steps.push((
+            format!("Unew_base.T_lookup_per_table[{j}] = 0 (constant-shape)"),
+            Box::new(move |ro: &mut RO2| ro.absorb(t_j)),
+          ));
+        }
+      }
+      if let Some(v) = &U.comm_L {
+        for (j, c) in v.iter().cloned().enumerate() {
+          steps.push((
+            format!("Unew_base.comm_L_per_table[{j}] = default (constant-shape)"),
+            Box::new(move |ro: &mut RO2| c.absorb_in_ro2(ro)),
+          ));
+        }
+      }
+      if let Some(v) = &U.comm_ts {
+        for (j, c) in v.iter().cloned().enumerate() {
+          steps.push((
+            format!("Unew_base.comm_ts_per_table[{j}] = default (constant-shape)"),
+            Box::new(move |ro: &mut RO2| c.absorb_in_ro2(ro)),
+          ));
+        }
+      }
+      let U_u = U.u;
+      steps.push((
+        "Unew_base.u = 0".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(U_u)),
+      ));
+      for (i, x) in U.X.iter().cloned().enumerate() {
+        steps.push((
+          format!("Unew_base.X[{i}] = 0"),
+          Box::new(move |ro: &mut RO2| ro.absorb(x)),
+        ));
+      }
+      // r_next is the augmented-circuit's witness allocator for the
+      // new ri (mod.rs:616 — `ri` is threaded as `r_next` into
+      // NeutronAugmentedCircuitInputs). The augmented circuit absorbs it
+      // last (circuit/mod.rs:950: `ro.absorb(&r_next)`).
+      let r_next = recursive_snark.ri;
+      steps.push((
+        "r_next (= ri witness)".to_string(),
+        Box::new(move |ro: &mut RO2| ro.absorb(r_next)),
+      ));
+      steps
+    };
+
+    // (4) Compute partial-squeeze sequences. For each prefix length 1..=N:
+    //     - Build a fresh RO2 with pp.ro_consts;
+    //     - Apply the first `len` absorb steps;
+    //     - Squeeze NUM_HASH_BITS and record the result as a labelled
+    //       partial.
+    let compute_partials = |steps: &[(String, AbsorbStep)]| -> Vec<(String, GH75Scalar)> {
+      let mut out: Vec<(String, GH75Scalar)> = Vec::with_capacity(steps.len());
+      for prefix_len in 1..=steps.len() {
+        let mut hasher = <GH75E as Engine>::RO2::new(pp.ro_consts.clone());
+        for (_, step) in steps.iter().take(prefix_len) {
+          step(&mut hasher);
+        }
+        let partial = hasher.squeeze(NUM_HASH_BITS, false);
+        let label = steps[prefix_len - 1].0.clone();
+        out.push((label, partial));
+      }
+      out
+    };
+
+    let native_partials = compute_partials(&native_steps);
+    let prover_partials = compute_partials(&prover_equiv_steps);
+
+    // (5) Locate the first divergence. We walk the two sequences in
+    //     PARALLEL by min(len) — if either sequence is longer, the extra
+    //     tail steps are by-definition divergent (one side has steps the
+    //     other does not) and we report the prefix imbalance.
+    let common = native_partials.len().min(prover_partials.len());
+    let mut first_divergence: Option<(usize, String, String, GH75Scalar, GH75Scalar)> = None;
+    for i in 0..common {
+      if native_partials[i].1 != prover_partials[i].1 {
+        first_divergence = Some((
+          i,
+          native_partials[i].0.clone(),
+          prover_partials[i].0.clone(),
+          native_partials[i].1,
+          prover_partials[i].1,
+        ));
+        break;
+      }
+    }
+
+    // (6) Emit the verbatim side-by-side partial-squeeze dump. Visible
+    //     under `cargo test ... -- --nocapture`.
+    eprintln!(
+      "\n=== [D-prime] Native verifier-side absorb sequence ({} steps) ===",
+      native_partials.len()
+    );
+    for (i, (label, partial)) in native_partials.iter().enumerate() {
+      eprintln!("  [native i={i:02}] {label:<60}  partial = {partial:?}");
+    }
+    eprintln!(
+      "\n=== [D-prime] Prover-equivalent absorb sequence ({} steps) ===",
+      prover_partials.len()
+    );
+    for (i, (label, partial)) in prover_partials.iter().enumerate() {
+      eprintln!("  [prover i={i:02}] {label:<60}  partial = {partial:?}");
+    }
+
+    // (7) Pull out the actual verifier-recomputed hash (== last native
+    //     partial-squeeze when the full sequence is consumed) AND the
+    //     stored l_u.X[0] (the value the augmented circuit inputized). The
+    //     n=1 ProofVerifyError fires iff these are unequal.
+    let verifier_recomputed_hash = native_partials.last().expect("native_partials non-empty").1;
+    let l_u_X_0 = recursive_snark.l_u.X[0];
+    eprintln!("\n=== [D-prime] Final hash-chain comparison ===");
+    eprintln!("  verifier_recomputed_hash   = {verifier_recomputed_hash:?}");
+    eprintln!("  recursive_snark.l_u.X[0]   = {l_u_X_0:?}");
+    eprintln!(
+      "  equal?                     = {}",
+      verifier_recomputed_hash == l_u_X_0
+    );
+
+    // (8) Route to D1/D2/D3/D4 per the divergence locus.
+    if let Some((idx, native_label, prover_label, native_partial, prover_partial)) =
+      &first_divergence
+    {
+      let route = if native_label.contains("T_lookup")
+        || native_label.contains("comm_L")
+        || native_label.contains("comm_ts")
+        || prover_label.contains("T_lookup")
+        || prover_label.contains("comm_L")
+        || prover_label.contains("comm_ts")
+      {
+        "D1 — (iv.γ) constant-shape-vs-Option-shape absorb-sequence drift at base case"
+      } else if native_label.contains("comm_W")
+        || native_label.contains("comm_E")
+        || prover_label.contains("comm_W")
+        || prover_label.contains("comm_E")
+      {
+        "D2 — (iv.α) shared-variable-vs-distinct-zero RO2 byte divergence on comm_W / comm_E"
+      } else if native_label.contains("ri") || prover_label.contains("r_next") {
+        "D3 — (iv.β) ri-allocation drift between circuit r_next and native self.ri"
+      } else {
+        "DX — divergence at unexpected absorb step (not in (iv.α)/(iv.β)/(iv.γ) catalogue)"
+      };
+      eprintln!("\n=== [D-prime] DIVERGENCE LOCUS IDENTIFIED ===");
+      eprintln!("  first-divergence prefix index = {idx}");
+      eprintln!("  native step label   = {native_label}");
+      eprintln!("  prover step label   = {prover_label}");
+      eprintln!("  native partial      = {native_partial:?}");
+      eprintln!("  prover partial      = {prover_partial:?}");
+      eprintln!("  routing             = {route}");
+      eprintln!(
+        "\n  [Last matching prefix at idx={}]: native = {:?}, prover = {:?}",
+        idx.saturating_sub(1),
+        native_partials
+          .get(idx.saturating_sub(1))
+          .map(|p| &p.1)
+          .unwrap_or(&GH75Scalar::ZERO),
+        prover_partials
+          .get(idx.saturating_sub(1))
+          .map(|p| &p.1)
+          .unwrap_or(&GH75Scalar::ZERO),
+      );
+    } else if native_partials.len() != prover_partials.len() {
+      eprintln!(
+        "\n=== [D-prime] LENGTH IMBALANCE ===\n  native_partials.len() = {}; prover_partials.len() = {}",
+        native_partials.len(),
+        prover_partials.len()
+      );
+    } else {
+      eprintln!(
+        "\n=== [D-prime] NO DIVERGENCE IN PARTIAL-SQUEEZE SEQUENCE ===\n  Routes to D4 — n=1 ProofVerifyError comes from elsewhere."
+      );
+    }
+
+    // (9) Asserts (preferred pattern from Corrigendum #24 dispatch):
+    //     PASS at vendor HEAD `b233301` if Obstruction 2 reproduces at
+    //     the n=1 hash-chain divergence locus. FAIL when a future
+    //     Corrigendum #25 fix-α lands and the divergence disappears.
+    assert_ne!(
+      verifier_recomputed_hash, l_u_X_0,
+      "[D-prime] Obstruction 2 NO LONGER reproduces at n=1 hash-chain re-derive — \
+       verifier_recomputed_hash == recursive_snark.l_u.X[0]. If Corrigendum #25 fix-α \
+       has landed, this fixture should be promoted to a positive single-step n=1 \
+       acceptance test per Corrigendum #23 layer 5b deferred deliverable."
+    );
+    assert!(
+      first_divergence.is_some() || native_partials.len() != prover_partials.len(),
+      "[D-prime] verifier hash differs from l_u.X[0] BUT partial-squeeze sequences \
+       agree at all common prefixes AND have equal length — routes to D4 (n=1 \
+       ProofVerifyError NOT from output-hash absorb-sequence divergence)."
+    );
+  }
 }
