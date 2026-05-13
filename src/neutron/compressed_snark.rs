@@ -4874,4 +4874,134 @@ mod tests {
        (mod.rs:148-150) has been removed"
     );
   }
+
+  // ============================================================
+  // Corrigendum #23 Experiment Protocol A/B/C/D — diagnostic
+  // fixtures for Obstruction 2 (`recursive_snark.verify`
+  // `Err(NovaError::UnSat { sum != U.T })`). These tests are
+  // *coverage* additions; they are NOT a fix for Obstruction 2.
+  // PASS/FAIL outcomes are recorded in the crafter dispatch
+  // report and will be folded into Corrigendum #24 by authoring
+  // Halpert. Do NOT modify these without re-running the protocol.
+  // ============================================================
+
+  /// Shared driver — build an honest IVC trace with `n_steps`
+  /// `prove_step_with_lookup_fold` invocations, run
+  /// `recursive_snark.verify(&pp, n_steps, &z0)`, and return the
+  /// `Result`. Mirrors the prove-side construction algebra of
+  /// `gh75_build_honest_fixture` byte-for-byte EXCEPT for the
+  /// parametrised `n_steps`. Used by Experiments A and B.
+  ///
+  /// Diagnostic-only: the body deliberately stops at
+  /// `recursive_snark.verify` so the experiment can interrogate
+  /// the verify-side outcome at the smallest n that fails (or
+  /// largest n that succeeds), without coupling to the envelope
+  /// path (which is downstream of verify-side R1CS-sat).
+  #[cfg(feature = "lookup-fold")]
+  #[allow(clippy::type_complexity)]
+  fn gh75_experiment_run_ivc_verify(
+    n_steps: usize,
+  ) -> (
+    Result<Vec<GH75Scalar>, NovaError>,
+    PublicParams<GH75E, GH75E2, IdentityStepCircuit>,
+    RecursiveSNARK<GH75E, GH75E2, IdentityStepCircuit>,
+    Vec<GH75Scalar>,
+  ) {
+    let circuit = IdentityStepCircuit::new();
+    let lookup_shape = gh75_lookup_shape();
+
+    let mut pp = PublicParams::<GH75E, GH75E2, IdentityStepCircuit>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![GH75Scalar::ZERO],
+      GH75_K,
+      1,
+      Some(lookup_shape),
+    )
+    .expect("pp setup must succeed");
+    let d = pp.digest();
+    pp.shape_registry = vec![d];
+    assert_eq!(
+      pp.digest(),
+      d,
+      "Corrigendum #22 fix: pp.digest() must be invariant under #[serde(skip)] mutation"
+    );
+
+    let z0 = vec![GH75Scalar::ZERO];
+    let mut recursive_snark =
+      RecursiveSNARK::<GH75E, GH75E2, IdentityStepCircuit>::new(&pp, &circuit, &z0)
+        .expect("RecursiveSNARK::new must succeed");
+    for step in 0..n_steps {
+      recursive_snark
+        .prove_step_with_lookup_fold(&pp, &circuit)
+        .unwrap_or_else(|e| panic!(
+          "prove_step_with_lookup_fold MUST succeed for diagnostic experiment; failed at step={step}: {e:?}"
+        ));
+    }
+
+    let result = recursive_snark.verify(&pp, n_steps, &z0);
+    (result, pp, recursive_snark, z0)
+  }
+
+  /// **Corrigendum #23 Experiment A — n=1 single-step IVC verify.**
+  ///
+  /// Diagnostic fixture for Corrigendum #23 Experiment A — NOT a fix
+  /// for Obstruction 2. Records the empirical verify-side outcome at
+  /// n=1 to triage whether the failure is (a) a single-step witness
+  /// defect (A2: this test FAILS with `sum != U.T` → routes to
+  /// candidate (i) or (ii)) or (b) a multi-step accumulation defect
+  /// (A1: this test PASSES → routes to candidate (iii); proceed to
+  /// Experiment B).
+  ///
+  /// Test EXPECTATION is unknown at authoring time — the test is
+  /// authored as an EMPIRICAL CLOSE: it asserts the result is `Ok(_)`
+  /// (the soundness-class expectation under candidate (iii)) so a
+  /// failure surface is recorded if the empirical outcome routes to
+  /// (i)/(ii). The PASS/FAIL outcome at vendor HEAD is the diagnostic
+  /// signal.
+  ///
+  /// **Recorded outcome at vendor HEAD (Corrigendum #23 dispatch,
+  /// 2026-05-13)**: A3 FAIL with `Err(NovaError::ProofVerifyError
+  /// { reason: "Invalid output hash in R1CS instance" })`. This is a
+  /// DIFFERENT error variant than the n=4 case's `UnSat { sum != U.T }`
+  /// — surfaces from `mod.rs:791-794`'s IVC-hash-chain check, which
+  /// fires BEFORE the `is_sat` invocation at `mod.rs:798-805`.
+  /// STOP-AND-ASK trigger per the dispatch protocol (different error
+  /// variant routes to a different root-cause family than Corrigendum
+  /// #23's three candidates anticipated).
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_5_obstruction2_experiment_a_n1_ivc_verify() {
+    let (result, _pp, _rs, _z0) = gh75_experiment_run_ivc_verify(1);
+    match &result {
+      Ok(zn) => {
+        // A1 PASS: single-step IVC verify succeeds → root cause is
+        // multi-step accumulation (candidate (iii)). Proceed to
+        // Experiment B (n=2).
+        assert_eq!(zn.len(), 1, "zn arity must be 1 (IdentityStepCircuit::arity)");
+        assert_eq!(zn[0], GH75Scalar::ZERO, "IdentityStepCircuit zn = z0 = [ZERO]");
+        eprintln!(
+          "[Corrigendum #23 Experiment A] OUTCOME = A1 PASS (single-step \
+           IVC verify succeeds; failure is multi-step accumulation; proceed \
+           to Experiment B)"
+        );
+      }
+      Err(e) => {
+        // A2 (sum != U.T) or A3 (other variant): single-step witness
+        // defect → routes to candidate (i)/(ii). Record exact message
+        // for Halpert.
+        eprintln!(
+          "[Corrigendum #23 Experiment A] OUTCOME = A2/A3 FAIL: {e:?} \
+           (single-step witness defect; routes to candidate (i)/(ii))"
+        );
+        panic!(
+          "Experiment A: recursive_snark.verify(&pp, 1, &z0) FAILED — \
+           single-step witness defect surfaced. Empirical evidence routes \
+           to candidate (i) or (ii); error: {e:?}"
+        );
+      }
+    }
+  }
 }
