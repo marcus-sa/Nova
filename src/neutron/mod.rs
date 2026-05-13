@@ -521,7 +521,13 @@ where
   E2: Engine<Base = <E1 as Engine>::Scalar>,
   C: StepCircuit<E1::Scalar>,
 {
-  z0: Vec<E1::Scalar>,
+  // GH-#7 M.GH7.5 visibility bump (Corrigendum #20 (VS-2) (S2) disposition):
+  // `z0` bumped to `pub(crate)` so the sibling `neutron::compressed_snark`
+  // module's `prove_with_lookup_fold<E2, C>` wrapper can snapshot it into
+  // the envelope `z0_snapshot` field. Parallel to the existing M.GH7.0.2
+  // bracket immediately below. See pin §M.GH7.5 work-item 4 for the
+  // wrapper's per-field consumption.
+  pub(crate) z0: Vec<E1::Scalar>,
 
   // GH-#7 M.GH7.0.2 visibility bumps (Corrigendum #10 + #11): `r_W`, `r_U`,
   // `zi` bumped from fully-private to `pub(crate)` so the sibling
@@ -533,12 +539,22 @@ where
   // from the inumbra side; only the in-crate envelope reads them.
   pub(crate) r_W: FoldedWitness<E1>,
   pub(crate) r_U: FoldedInstance<E1>,
-  ri: E1::Scalar,
+  // M.GH7.5 (Corrigendum #20) extension: `ri` bumped to `pub(crate)` so the
+  // envelope `ri_snapshot` field can be populated by `prove_with_lookup_fold`.
+  pub(crate) ri: E1::Scalar,
 
   l_w: R1CSWitness<E1>,
-  l_u: R1CSInstance<E1>,
+  // M.GH7.5 (Corrigendum #20) extension: `l_u` bumped to `pub(crate)` so the
+  // envelope `l_u_X0_snapshot` field can be populated (`l_u.X[0]` is the IVC
+  // public-input hash bound by the augmented-circuit final-step inputize at
+  // `circuit/mod.rs:955`). Per Corrigendum #20 second-order issue #3, only
+  // `X[0]` is snapshotted (not the full `R1CSInstance`); `comm_W` is bound
+  // redundantly by the Spartan-close envelope.
+  pub(crate) l_u: R1CSInstance<E1>,
 
-  i: usize,
+  // M.GH7.5 (Corrigendum #20) extension: `i` bumped to `pub(crate)` so the
+  // envelope `i_snapshot` field can be populated.
+  pub(crate) i: usize,
 
   pub(crate) zi: Vec<E1::Scalar>,
 
@@ -562,8 +578,14 @@ where
   /// is `Serialize, Deserialize` per `relation.rs:409`, so the
   /// existing `#[derive(Serialize, Deserialize)]` on `RecursiveSNARK`
   /// at line 482-483 continues to typecheck.
+  // M.GH7.5 (Corrigendum #20) extension: `running_lws` bumped to `pub(crate)`
+  // so `compressed_snark::prove_with_lookup_fold<E2, C>` can read
+  // `running_lws[j].witness` (the `v_j` of Corrigendum #17 Claim 2; verified
+  // at vendor HEAD `39aaec4` per F2 finding) to project into the
+  // length-`num_cons` synthetic-data flat embedding consumed by
+  // `prove_from_parts_with_logup`. Crate-private from the inumbra side.
   #[cfg(feature = "lookup-fold")]
-  running_lws: Vec<LookupRunningWitness<E1>>,
+  pub(crate) running_lws: Vec<LookupRunningWitness<E1>>,
 
   _p: PhantomData<(C, E2)>,
 }
