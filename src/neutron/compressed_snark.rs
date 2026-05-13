@@ -5004,4 +5004,59 @@ mod tests {
       }
     }
   }
+
+  /// **Corrigendum #23 Experiment B — n=2 IVC verify.**
+  ///
+  /// Diagnostic fixture for Corrigendum #23 Experiment B — NOT a fix
+  /// for Obstruction 2. Records the empirical verify-side outcome at
+  /// n=2 to triage the multi-step accumulation locus.
+  ///
+  /// - B1 PASS: failure is at n=3 or n=4 specifically — boundary
+  ///   `(n=1 PASS, n=2 PASS, n=3 ?, n=4 FAIL)`.
+  /// - B2 FAIL with `sum != U.T`: failure is at the i=1→2 transition;
+  ///   narrows to (iii.a) `T_lookup_running` non-zero at i=2 or (i.a)
+  ///   `t_lookup_running_j` propagation.
+  ///
+  /// Run UNCONDITIONALLY at n=2 (do not gate on Experiment A's
+  /// outcome — the dispatch protocol's "if A1 PASS" branch is a
+  /// reporting branch, not a runtime branch; running B at vendor HEAD
+  /// produces a diagnostic data point either way).
+  ///
+  /// **Recorded outcome at vendor HEAD (Corrigendum #23 dispatch,
+  /// 2026-05-13)**: FAIL with `Err(NovaError::UnSat { reason: "R1CS
+  /// is unsatisfiable" })`. This is a THIRD distinct error variant
+  /// (different from Experiment A's `ProofVerifyError` at n=1 and from
+  /// the existing acceptance test's `UnSat { sum != U.T }` at n=4).
+  /// Surfaces from `vendor/nova/src/r1cs/mod.rs:516-519`, which is the
+  /// FRESH `l_u/l_w` instance `is_sat` check at `mod.rs:800`
+  /// (`pp.structure.S.is_sat(&pp.ck, &self.l_u, &self.l_w)`) — i.e.
+  /// the plain `Az[i] * Bz[i] != Cz[i]` failure on the latest step's
+  /// un-folded R1CS slot, NOT the eq-weighted-sumcheck identity on
+  /// the running accumulator side.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_5_obstruction2_experiment_b_n2_ivc_verify() {
+    let (result, _pp, _rs, _z0) = gh75_experiment_run_ivc_verify(2);
+    match &result {
+      Ok(zn) => {
+        assert_eq!(zn.len(), 1, "zn arity must be 1");
+        assert_eq!(zn[0], GH75Scalar::ZERO, "IdentityStepCircuit zn = z0 = [ZERO]");
+        eprintln!(
+          "[Corrigendum #23 Experiment B] OUTCOME = B1 PASS (n=2 IVC \
+           verify succeeds; failure must be at n=3 or n=4)"
+        );
+      }
+      Err(e) => {
+        eprintln!(
+          "[Corrigendum #23 Experiment B] OUTCOME = B2 FAIL: {e:?} \
+           (failure at i=1→2 transition; narrows to (iii.a) or (i.a))"
+        );
+        panic!(
+          "Experiment B: recursive_snark.verify(&pp, 2, &z0) FAILED — \
+           multi-step accumulation defect at i=1→2 transition; error: {e:?}"
+        );
+      }
+    }
+  }
 }
