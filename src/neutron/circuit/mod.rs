@@ -760,10 +760,10 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
     // Allocate the per-table public bundles.
     //
     // For M.GH5.3 the per-table value-column count `num_value_columns` is
-    // sourced from the supplied bundle when present, defaulting to 1 for
-    // shape derivation (matches the production single-value-column shape
-    // per ADR-0021's chunked-Strauss-Shamir tables). M.GH5.4 will pin
-    // `num_value_columns` from the inumbra-side `LookupShape::multi_column_tables[j].columns.len()`.
+    // sourced from the supplied bundle when present; `unwrap_or(0)` — zero-column
+    // default per Corrigendum #27 (absent bundle ⇒ no value commitments to allocate,
+    // not a synthetic 1-column shape that poisons R1CS-sat at the verify step).
+    // M.GH5.4 will supersede with `LookupShape`-sourced per-table column counts.
     let public_bundles_native: Option<&Vec<LookupPayloadPublicMultiTable<E>>> = self
       .inputs
       .as_ref()
@@ -772,7 +772,7 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
       .lookup_fold_k)
       .map(|j| {
         let bundle_j = public_bundles_native.and_then(|bundles| bundles.get(j));
-        let num_value_columns = bundle_j.map(|b| b.comm_values.len()).unwrap_or(1);
+        let num_value_columns = bundle_j.map(|b| b.comm_values.len()).unwrap_or(0);
         AllocatedLookupPayloadPublicMultiTable::alloc(
           cs.namespace(|| format!("allocate public_bundle[{j}]")),
           bundle_j,
