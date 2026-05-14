@@ -662,6 +662,25 @@ where
     Ok(Self {
       z0: z0.to_vec(),
       r_W: FoldedWitness::default(&pp.structure),
+      // GH-#7 design pin Corrigendum #25 (Fix-α native-side mirror):
+      // initialize `r_U` with constant-shape `Some(vec![..; k])` for the
+      // three IVC-hash-chain-absorbed lookup-side Options (`T_lookup`,
+      // `comm_L`, `comm_ts`) when `pp.lookup_fold_k > 0`, mirroring the
+      // in-circuit `AllocatedFoldedInstance::default_with_lookup_k` at
+      // `circuit/relation.rs:363-434` so the verifier's `absorb_in_ro2`
+      // hash-chain re-derive at `mod.rs:785` byte-equals the prover's
+      // `absorb_in_ro` at `circuit/mod.rs:947`. Closes Obstruction 2 at
+      // base case under `lookup_fold_k > 0`. Single production call site
+      // narrowing per Corrigendum #25 finding 4 (the 26 remaining
+      // call sites are all test-internal and exercise `None`-shape paths
+      // — they continue to invoke the legacy `default(S)`). At
+      // `pp.lookup_fold_k == 0`, the new constructor returns
+      // byte-identical to `default(S)`. Under
+      // `#[cfg(not(feature = "lookup-fold"))]`, the legacy `default(S)`
+      // path is preserved verbatim.
+      #[cfg(feature = "lookup-fold")]
+      r_U: FoldedInstance::default_with_lookup_k(&pp.structure, pp.lookup_fold_k),
+      #[cfg(not(feature = "lookup-fold"))]
       r_U: FoldedInstance::default(&pp.structure),
       ri,
       l_w,

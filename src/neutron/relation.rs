@@ -683,6 +683,67 @@ impl<E: Engine> FoldedInstance<E> {
     }
   }
 
+  /// GH-#7 design pin Corrigendum #25 (Fix-α): create a default instance at the
+  /// base case under `lookup_fold_k > 0`, producing constant-shape
+  /// `Some(vec![..; k])` for the IVC-hash-chain-absorbed lookup-side Options
+  /// (`T_lookup`, `comm_L`, `comm_ts`) and `None` for the not-absorbed Options
+  /// (`comm_inv_w`, `comm_inv_t`, per Corrigendum #17 chicken-and-egg
+  /// resolution).
+  ///
+  /// Mirrors the in-circuit `AllocatedFoldedInstance::default_with_lookup_k`
+  /// at `circuit/relation.rs:363-434` so that `FoldedInstance::absorb_in_ro2`
+  /// at `relation.rs:900-975` is byte-equivalent to the circuit-side
+  /// `AllocatedFoldedInstance::absorb_in_ro` at `circuit/relation.rs:502-575`
+  /// when invoked on the same content at base case under `lookup_fold_k > 0`.
+  ///
+  /// Closes the Corrigendum #6 antecedent verify-don't-assume failure
+  /// (`constant-shape-FS-schedule-circuit-side-without-native-side-mirror-verification`)
+  /// and the inherited Corrigendum #18 Path α omission. The legacy
+  /// `default(S)` constructor is RETAINED VERBATIM so that all 26
+  /// test-internal call sites continue to operate at the existing
+  /// `None`-shape semantics. STAGE-0 byte-equivalence at `lookup_fold_k = 0`
+  /// PRESERVED: when `lookup_fold_k == 0`, the new constructor returns a
+  /// `FoldedInstance` byte-identical to the legacy `default(S)` (all five
+  /// Option fields = `None`).
+  ///
+  /// Soundness restoration anchor: under Fix-α at base case with
+  /// `lookup_fold_k = k > 0`, the native-side `absorb_in_ro2` absorb stream
+  /// is byte-equivalent to the circuit-side `absorb_in_ro` absorb stream
+  /// (Criterion 4 of Corrigendum #25 Fix-α algebra). The IVC hash-chain
+  /// re-derive at `mod.rs:785` consequently byte-equals
+  /// `recursive_snark.l_u.X[0]` on the honest path, closing Obstruction 2.
+  #[cfg(feature = "lookup-fold")]
+  pub fn default_with_lookup_k(S: &Structure<E>, lookup_fold_k: usize) -> Self {
+    FoldedInstance {
+      comm_W: Commitment::<E>::default(),
+      comm_E: Commitment::<E>::default(),
+      T: E::Scalar::ZERO,
+      u: E::Scalar::ZERO,
+      X: vec![E::Scalar::ZERO; S.S.num_io],
+      T_lookup: if lookup_fold_k > 0 {
+        Some(vec![E::Scalar::ZERO; lookup_fold_k])
+      } else {
+        None
+      },
+      comm_L: if lookup_fold_k > 0 {
+        Some(vec![Commitment::<E>::default(); lookup_fold_k])
+      } else {
+        None
+      },
+      comm_ts: if lookup_fold_k > 0 {
+        Some(vec![Commitment::<E>::default(); lookup_fold_k])
+      } else {
+        None
+      },
+      // comm_inv_w / comm_inv_t stay None at base case regardless of
+      // lookup_fold_k. They are NOT absorbed in absorb_in_ro2 per
+      // Corrigendum #17 chicken-and-egg resolution (verified at
+      // relation.rs:943-947: no `.absorb_in_ro2` call for these fields).
+      comm_inv_w: None,
+      comm_inv_t: None,
+    }
+  }
+
   /// Per-table running lookup-claim accumulator, exposed for differential
   /// harnesses that need to compare against an off-circuit reference.
   ///
