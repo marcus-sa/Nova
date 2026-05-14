@@ -6286,4 +6286,345 @@ mod tests {
       }
     }
   }
+
+  /// Shape consistency diagnostic: compare the R1CS shape triple
+  /// `(num_cons, num_vars, num_io)` from three sources:
+  ///
+  /// (a) `pp.structure.S` — the shape embedded in `PublicParams`, derived
+  ///     by `ShapeCS` with `NeutronAugmentedCircuitInputs = None`.
+  /// (b) `TestCS` synthesizing step i=1 — the same inputs as Experiment E.
+  /// (c) `TestCS` synthesizing the shape-derivation pass — `None` inputs,
+  ///     matching what `PublicParams::setup` does.
+  ///
+  /// If (a)/(b)/(c) disagree on counts, the Fix-α `Some(vec![ZERO; k])`
+  /// hint causes a different allocation path than the `None` hint used
+  /// during setup — which means `r1cs_instance_and_witness` on the
+  /// production `SatisfyingAssignment` extracts a witness vector whose
+  /// length mismatches `pp.structure.S.num_vars`, causing `is_sat` to fail.
+  ///
+  /// If counts MATCH, this test additionally runs `SatisfyingAssignment` on
+  /// step i=1 inputs and checks `pp.structure.S.is_sat(...)`.
+  ///
+  /// Release-mode mandatory per `.claude/rules/testing.md`.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_5_shape_consistency_diagnostic() {
+    use crate::frontend::r1cs::NovaWitness;
+    use crate::frontend::solver::SatisfyingAssignment;
+    use crate::frontend::test_shape_cs::TestShapeCS;
+    use crate::frontend::util_cs::test_cs::TestConstraintSystem;
+    use crate::frontend::ConstraintSystem;
+    use crate::neutron::nifs::NIFS;
+    use crate::neutron::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
+    use crate::traits::RO2ConstantsCircuit;
+
+    eprintln!("\n========================================================");
+    eprintln!("  Shape Consistency Diagnostic (m_gh7_5)");
+    eprintln!("========================================================\n");
+
+    // ================================================================
+    // (1) Setup pp — verbatim from Experiment E fixture
+    // ================================================================
+    let circuit = IdentityStepCircuit::new();
+    let lookup_shape = gh75_lookup_shape();
+
+    let mut pp = PublicParams::<GH75E, GH75E2, IdentityStepCircuit>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![GH75Scalar::ZERO],
+      GH75_K,
+      1, // index_n_bits = 1 (single-entry registry)
+      Some(lookup_shape.clone()),
+    )
+    .expect("pp setup must succeed");
+    let d = pp.digest();
+    pp.shape_registry = vec![d];
+
+    // ================================================================
+    // (A) Extract shape triple from pp.structure.S
+    // ================================================================
+    let shape_num_cons = pp.structure.S.num_cons;
+    let shape_num_vars = pp.structure.S.num_vars;
+    let shape_num_io = pp.structure.S.num_io;
+
+    eprintln!("(A) pp.structure.S:");
+    eprintln!("    num_cons = {shape_num_cons}");
+    eprintln!("    num_vars = {shape_num_vars}");
+    eprintln!("    num_io   = {shape_num_io}");
+    eprintln!();
+
+    // ================================================================
+    // (C) TestShapeCS at shape-derivation pass — None inputs, matching
+    //     PublicParams::setup's ShapeCS path. TestShapeCS (like ShapeCS)
+    //     does NOT evaluate the value closures, so it works with None inputs.
+    // ================================================================
+    let ro_consts_circuit = RO2ConstantsCircuit::<GH75E>::default();
+
+    let shape_deriv_circuit: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+      NeutronAugmentedCircuit::new(None, &circuit, ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1);
+    let mut test_cs_shape = TestShapeCS::<GH75E>::new();
+    let _ = shape_deriv_circuit
+      .synthesize(&mut test_cs_shape)
+      .expect("shape-derivation synthesis into TestShapeCS must not panic");
+
+    let shape_deriv_cons = test_cs_shape.num_constraints();
+    let shape_deriv_aux = test_cs_shape.num_aux();
+    let shape_deriv_inputs = test_cs_shape.num_inputs();
+
+    eprintln!("(C) TestCS at shape-derivation (None inputs):");
+    eprintln!("    num_constraints = {shape_deriv_cons}");
+    eprintln!("    num_aux         = {shape_deriv_aux}");
+    eprintln!("    num_inputs      = {shape_deriv_inputs}");
+    eprintln!("    [R1CSShape mapping: num_vars = num_aux = {shape_deriv_aux}, num_io = num_inputs - 1 = {}]",
+              shape_deriv_inputs - 1);
+    eprintln!();
+
+    // ================================================================
+    // (2) Base-case synthesis — mirrors Experiment E verbatim
+    // ================================================================
+    let ri = GH75Scalar::ZERO;
+    let z0 = vec![GH75Scalar::ZERO];
+
+    let base_inputs: NeutronAugmentedCircuitInputs<GH75E> = NeutronAugmentedCircuitInputs::new(
+      pp.digest(),
+      GH75Scalar::ZERO,
+      z0.clone(),
+      None,
+      None,
+      None,
+      ri,
+      None,
+      None,
+      None,
+      None,
+    );
+
+    let base_circuit: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+      NeutronAugmentedCircuit::new(Some(base_inputs), &circuit, ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1);
+    let mut base_cs = SatisfyingAssignment::<GH75E>::new();
+    let zi_alloc = base_circuit
+      .synthesize(&mut base_cs)
+      .expect("base-case synthesis must succeed");
+
+    let (l_u, l_w) = base_cs
+      .r1cs_instance_and_witness(&pp.structure.S, &pp.ck)
+      .expect("base-case r1cs_instance_and_witness must succeed");
+
+    let zi: Vec<GH75Scalar> = zi_alloc
+      .iter()
+      .map(|v| v.get_value().expect("base-case zi must have witness values"))
+      .collect();
+
+    let r_U: FoldedInstance<GH75E> =
+      FoldedInstance::default_with_lookup_k(&pp.structure, pp.lookup_fold_k);
+    let r_W: FoldedWitness<GH75E> = FoldedWitness::default(&pp.structure);
+
+    let running_lws: Vec<LookupRunningWitness<GH75E>> =
+      match pp.structure.lookups.as_ref() {
+        Some(shape) if pp.lookup_fold_k > 0 => shape
+          .multi_column_tables
+          .iter()
+          .map(|_| LookupRunningWitness::default(shape))
+          .collect(),
+        _ => vec![],
+      };
+
+    // ================================================================
+    // (3) Step i=1: NIFS + augmented circuit
+    // ================================================================
+    let i: usize = 1;
+
+    let bundles: Vec<crate::neutron::nifs::PerTableBundle<GH75E>> = circuit
+      .per_table_bundles_at_step(&pp.ck, i, &running_lws)
+      .expect("per_table_bundles_at_step must succeed at step i=1");
+
+    let (nifs, (r_U_new, _r_W_new), _next_running_lws) =
+      NIFS::prove_with_multi_table_lookup(
+        &pp.ck,
+        &pp.ro_consts,
+        &pp.digest(),
+        &pp.structure,
+        &r_U,
+        &r_W,
+        &l_u,
+        &l_w,
+        &bundles,
+      )
+      .expect("NIFS::prove_with_multi_table_lookup must succeed at step i=1");
+
+    let public_bundles = IdentityStepCircuit::public_bundles(&bundles);
+    let r_next = GH75Scalar::ZERO;
+
+    // Build step_inputs for TestCS (B)
+    let step_inputs_b: NeutronAugmentedCircuitInputs<GH75E> = NeutronAugmentedCircuitInputs::new(
+      pp.digest(),
+      GH75Scalar::from(i as u64),
+      z0.clone(),
+      Some(zi.clone()),
+      Some(r_U.clone()),
+      Some(ri),
+      r_next,
+      Some(l_u.clone()),
+      Some(nifs.clone()),
+      Some(r_U_new.comm_W),
+      Some(r_U_new.comm_E),
+    )
+    .with_multi_table_bundles(Some(public_bundles.clone()));
+
+    // ================================================================
+    // (B) TestCS at step i=1
+    // ================================================================
+    let step_circuit_aug_testcs: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+      NeutronAugmentedCircuit::new(Some(step_inputs_b), &circuit, ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1);
+
+    let mut test_cs_step1 = TestConstraintSystem::<GH75Scalar>::new();
+    let _ = step_circuit_aug_testcs
+      .synthesize(&mut test_cs_step1)
+      .expect("step i=1 synthesis into TestCS must not panic");
+
+    let step1_cons = test_cs_step1.num_constraints();
+    let step1_aux = test_cs_step1.num_aux();
+    let step1_inputs = test_cs_step1.num_inputs();
+
+    eprintln!("(B) TestCS at step i=1:");
+    eprintln!("    num_constraints = {step1_cons}");
+    eprintln!("    num_aux         = {step1_aux}");
+    eprintln!("    num_inputs      = {step1_inputs}");
+    eprintln!("    [R1CSShape mapping: num_vars = num_aux = {step1_aux}, num_io = num_inputs - 1 = {}]",
+              step1_inputs - 1);
+    eprintln!();
+
+    // ================================================================
+    // COMPARISON
+    // ================================================================
+    let counts_match_a_vs_b = shape_num_cons == step1_cons
+      && shape_num_vars == step1_aux
+      && shape_num_io == (step1_inputs - 1);
+
+    let counts_match_a_vs_c = shape_num_cons == shape_deriv_cons
+      && shape_num_vars == shape_deriv_aux
+      && shape_num_io == (shape_deriv_inputs - 1);
+
+    let counts_match_b_vs_c = step1_cons == shape_deriv_cons
+      && step1_aux == shape_deriv_aux
+      && step1_inputs == shape_deriv_inputs;
+
+    eprintln!("--- COMPARISON ---");
+    eprintln!("(A) pp.structure.S  vs (B) TestCS step i=1:          {}",
+              if counts_match_a_vs_b { "MATCH" } else { "MISMATCH" });
+    eprintln!("(A) pp.structure.S  vs (C) TestCS shape-derivation:  {}",
+              if counts_match_a_vs_c { "MATCH" } else { "MISMATCH" });
+    eprintln!("(B) TestCS step i=1 vs (C) TestCS shape-derivation:  {}",
+              if counts_match_b_vs_c { "MATCH" } else { "MISMATCH" });
+    eprintln!();
+
+    if !counts_match_a_vs_b {
+      eprintln!("==> SHAPE MISMATCH DETECTED between pp.structure.S and step i=1 synthesis.");
+      eprintln!("    pp.structure.S: (cons={shape_num_cons}, vars={shape_num_vars}, io={shape_num_io})");
+      eprintln!("    step i=1:       (cons={step1_cons}, vars={step1_aux}, io={})", step1_inputs - 1);
+      let cons_delta: isize = shape_num_cons as isize - step1_cons as isize;
+      let vars_delta: isize = shape_num_vars as isize - step1_aux as isize;
+      let io_delta: isize = shape_num_io as isize - (step1_inputs as isize - 1);
+      eprintln!("    delta: cons={cons_delta:+}, vars={vars_delta:+}, io={io_delta:+}");
+      eprintln!("    DIAGNOSIS: Fix-alpha's Some(vec![ZERO; k]) hint causes a different");
+      eprintln!("    allocation path than the None hint used during setup.");
+      eprintln!();
+    }
+
+    if !counts_match_b_vs_c {
+      eprintln!("==> SHAPE MISMATCH DETECTED between TestCS step i=1 and TestCS shape-derivation.");
+      eprintln!("    shape-deriv: (cons={shape_deriv_cons}, aux={shape_deriv_aux}, inputs={shape_deriv_inputs})");
+      eprintln!("    step i=1:    (cons={step1_cons}, aux={step1_aux}, inputs={step1_inputs})");
+      let cons_delta: isize = shape_deriv_cons as isize - step1_cons as isize;
+      let aux_delta: isize = shape_deriv_aux as isize - step1_aux as isize;
+      let inputs_delta: isize = shape_deriv_inputs as isize - step1_inputs as isize;
+      eprintln!("    delta: cons={cons_delta:+}, aux={aux_delta:+}, inputs={inputs_delta:+}");
+      eprintln!("    DIAGNOSIS: num_value_columns divergence — shape-derivation defaults to 1");
+      eprintln!("    when public_bundles is None; step i=1 reads comm_values.len() = 0 from");
+      eprintln!("    the IdentityStepCircuit's absent-table bundle (comm_values: vec![]).");
+      eprintln!();
+    }
+
+    // ================================================================
+    // (5) If A vs B counts match: deeper check via SatisfyingAssignment
+    // ================================================================
+    if counts_match_a_vs_b {
+      eprintln!("Counts match — running deeper SatisfyingAssignment + is_sat check...");
+
+      // Build fresh step_inputs for SatisfyingAssignment
+      let step_inputs_sa: NeutronAugmentedCircuitInputs<GH75E> = NeutronAugmentedCircuitInputs::new(
+        pp.digest(),
+        GH75Scalar::from(i as u64),
+        z0.clone(),
+        Some(zi.clone()),
+        Some(r_U.clone()),
+        Some(ri),
+        r_next,
+        Some(l_u.clone()),
+        Some(nifs.clone()),
+        Some(r_U_new.comm_W),
+        Some(r_U_new.comm_E),
+      )
+      .with_multi_table_bundles(Some(public_bundles.clone()));
+
+      let step_circuit_aug_sa: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+        NeutronAugmentedCircuit::new(Some(step_inputs_sa), &circuit, ro_consts_circuit.clone())
+          .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1);
+
+      let mut sa_cs = SatisfyingAssignment::<GH75E>::new();
+      let _ = step_circuit_aug_sa
+        .synthesize(&mut sa_cs)
+        .expect("step i=1 synthesis into SatisfyingAssignment must succeed");
+
+      eprintln!("  SatisfyingAssignment: aux_len = {}, input_len = {}",
+                sa_cs.aux_assignment().len(),
+                sa_cs.input_assignment().len());
+
+      match sa_cs.r1cs_instance_and_witness(&pp.structure.S, &pp.ck) {
+        Ok((l_u_step1, l_w_step1)) => {
+          eprintln!("  r1cs_instance_and_witness: OK");
+          match pp.structure.S.is_sat(&pp.ck, &l_u_step1, &l_w_step1) {
+            Ok(()) => {
+              eprintln!("  is_sat: PASS");
+              eprintln!("  DIAGNOSIS: step i=1 satisfies pp.structure.S. The n=2 verify");
+              eprintln!("  failure is NOT in the extraction — it's downstream (verify-side");
+              eprintln!("  hash-chain re-derive or cross-step state threading).");
+            }
+            Err(e) => {
+              eprintln!("  is_sat: FAIL — {e:?}");
+              eprintln!("  DIAGNOSIS: step i=1 extraction succeeds but is_sat fails.");
+              eprintln!("  This is an ORDERING problem — the witness vector has the right");
+              eprintln!("  LENGTH but wrong CONTENT at specific positions. Likely the");
+              eprintln!("  SatisfyingAssignment and ShapeCS allocate the same count but");
+              eprintln!("  in different order (variable-ordering mismatch).");
+            }
+          }
+        }
+        Err(e) => {
+          eprintln!("  r1cs_instance_and_witness: FAIL — {e:?}");
+          eprintln!("  DIAGNOSIS: witness extraction failed at the shape boundary.");
+          eprintln!("  Likely a length mismatch between SatisfyingAssignment aux and");
+          eprintln!("  pp.structure.S.num_vars that the TestCS counts missed.");
+        }
+      }
+    } else {
+      eprintln!("Skipping SatisfyingAssignment + is_sat check — shape mismatch is the root cause.");
+      eprintln!("The production path's r1cs_instance_and_witness will fail because the");
+      eprintln!("witness vector from SatisfyingAssignment has a different length than");
+      eprintln!("pp.structure.S.num_vars expects.");
+    }
+
+    eprintln!("\n========================================================");
+    eprintln!("  Shape Consistency Diagnostic COMPLETE");
+    eprintln!("========================================================\n");
+
+    // Assert: test always passes (diagnostic-only). The eprintln output
+    // is the deliverable. A hard failure would mask the diagnostic output.
+    // The MISMATCH findings above are the actionable signal.
+  }
 }

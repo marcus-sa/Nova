@@ -95,6 +95,16 @@ impl<Scalar: PrimeField> TestConstraintSystem<Scalar> {
     self.constraints.len()
   }
 
+  /// Get the number of auxiliary (witness) variables
+  pub fn num_aux(&self) -> usize {
+    self.aux.len()
+  }
+
+  /// Get the number of input (public) variables (including ONE)
+  pub fn num_inputs(&self) -> usize {
+    self.inputs.len()
+  }
+
   /// Get path which is unsatisfied
   pub fn which_is_unsatisfied(&self) -> Option<&str> {
     for (a, b, c, path) in &self.constraints {
