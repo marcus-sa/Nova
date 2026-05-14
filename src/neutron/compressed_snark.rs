@@ -5885,4 +5885,208 @@ mod tests {
        Gadget contract earned-trust threshold ≥1000 satisfied."
     );
   }
+
+  /// **Corrigendum #26 Experiment E — `TestCS::which_is_unsatisfied` diagnostic
+  /// at step i=1.**
+  ///
+  /// Diagnostic fixture — NOT a fix. Identifies the SPECIFIC R1CS constraint
+  /// that is unsatisfied at step i=1 of the augmented circuit under Fix-α.
+  ///
+  /// Setup replicates `gh75_experiment_run_ivc_verify`'s algebra verbatim but
+  /// avoids `RecursiveSNARK` so we can access the base-case `l_w` (private field)
+  /// and use a deterministic `ri = ZERO` for reproducibility.
+  ///
+  /// Approach:
+  /// 1. Construct `pp` identically to the GH75 fixture.
+  /// 2. Manually run the base-case synthesis (mirroring `RecursiveSNARK::new`)
+  ///    with `ri = ZERO` to obtain `(l_u, l_w, zi, r_U, r_W, running_lws)`.
+  /// 3. Bootstrap step i=0: set `i = 1` (mirrors `prove_step_with_lookup_fold`).
+  /// 4. For step i=1: compute bundles, NIFS, build `NeutronAugmentedCircuitInputs`,
+  ///    build `NeutronAugmentedCircuit`, synthesize into `TestConstraintSystem`.
+  /// 5. Call `test_cs.which_is_unsatisfied()` and report.
+  ///
+  /// Release-mode mandatory per `.claude/rules/testing.md`.
+  #[cfg(feature = "lookup-fold")]
+  #[test]
+  #[allow(non_snake_case)]
+  fn m_gh7_5_corrigendum_26_experiment_e_testcs_which_is_unsatisfied_at_step_i1() {
+    use crate::frontend::r1cs::NovaWitness;
+    use crate::frontend::solver::SatisfyingAssignment;
+    use crate::frontend::util_cs::test_cs::TestConstraintSystem;
+    use crate::frontend::ConstraintSystem;
+    use crate::neutron::nifs::NIFS;
+    use crate::neutron::{NeutronAugmentedCircuit, NeutronAugmentedCircuitInputs};
+    use crate::traits::RO2ConstantsCircuit;
+
+    // ----------------------------------------------------------------
+    // (1) Setup pp — verbatim from gh75_experiment_run_ivc_verify
+    // ----------------------------------------------------------------
+    let circuit = IdentityStepCircuit::new();
+    let lookup_shape = gh75_lookup_shape();
+
+    let mut pp = PublicParams::<GH75E, GH75E2, IdentityStepCircuit>::setup(
+      &circuit,
+      &*default_ck_hint(),
+      &*default_ck_hint(),
+      vec![GH75Scalar::ZERO],
+      GH75_K,
+      1, // index_n_bits = 1 (single-entry registry)
+      Some(lookup_shape.clone()),
+    )
+    .expect("pp setup must succeed");
+    let d = pp.digest();
+    pp.shape_registry = vec![d];
+    assert_eq!(
+      pp.digest(),
+      d,
+      "Corrigendum #22 fix: pp.digest() must be invariant under #[serde(skip)] mutation"
+    );
+
+    // ----------------------------------------------------------------
+    // (2) Base-case synthesis — mirrors RecursiveSNARK::new at mod.rs:600-694
+    //     with ri = ZERO for determinism (per Corrigendum #26 pin adaptation 6).
+    // ----------------------------------------------------------------
+    let ri = GH75Scalar::ZERO;
+    let z0 = vec![GH75Scalar::ZERO];
+
+    let base_inputs: NeutronAugmentedCircuitInputs<GH75E> = NeutronAugmentedCircuitInputs::new(
+      pp.digest(),
+      GH75Scalar::ZERO, // i = 0 (base case)
+      z0.clone(),
+      None,
+      None,
+      None,
+      ri, // r_next = ZERO (deterministic)
+      None,
+      None,
+      None,
+      None,
+    );
+
+    let ro_consts_circuit = RO2ConstantsCircuit::<GH75E>::default();
+
+    let base_circuit: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+      NeutronAugmentedCircuit::new(Some(base_inputs), &circuit, ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1 /* index_n_bits */);
+    let mut base_cs = SatisfyingAssignment::<GH75E>::new();
+    let zi_alloc = base_circuit
+      .synthesize(&mut base_cs)
+      .expect("base-case synthesis must succeed");
+
+    let (l_u, l_w) = base_cs
+      .r1cs_instance_and_witness(&pp.structure.S, &pp.ck)
+      .expect("base-case r1cs_instance_and_witness must succeed");
+
+    let zi: Vec<GH75Scalar> = zi_alloc
+      .iter()
+      .map(|v| v.get_value().expect("base-case zi must have witness values"))
+      .collect();
+
+    // Initialize r_U, r_W, running_lws — mirrors RecursiveSNARK::new:662-694
+    let r_U: FoldedInstance<GH75E> =
+      FoldedInstance::default_with_lookup_k(&pp.structure, pp.lookup_fold_k);
+    let r_W: FoldedWitness<GH75E> = FoldedWitness::default(&pp.structure);
+
+    let running_lws: Vec<LookupRunningWitness<GH75E>> =
+      match pp.structure.lookups.as_ref() {
+        Some(shape) if pp.lookup_fold_k > 0 => shape
+          .multi_column_tables
+          .iter()
+          .map(|_| LookupRunningWitness::default(shape))
+          .collect(),
+        _ => vec![],
+      };
+
+    // ----------------------------------------------------------------
+    // (3) Step i=0 bootstrap — just note i=1 (prove_step_with_lookup_fold:974-977)
+    // ----------------------------------------------------------------
+    let i: usize = 1;
+
+    // ----------------------------------------------------------------
+    // (4) Step i=1: NIFS + augmented circuit synthesis into TestCS
+    // ----------------------------------------------------------------
+
+    // (4a) Construct prover-side per-table bundles
+    let bundles: Vec<crate::neutron::nifs::PerTableBundle<GH75E>> = circuit
+      .per_table_bundles_at_step(&pp.ck, i, &running_lws)
+      .expect("per_table_bundles_at_step must succeed at step i=1");
+
+    // (4b) NIFS::prove_with_multi_table_lookup
+    let (nifs, (r_U_new, _r_W_new), _next_running_lws) =
+      NIFS::prove_with_multi_table_lookup(
+        &pp.ck,
+        &pp.ro_consts,
+        &pp.digest(),
+        &pp.structure,
+        &r_U,
+        &r_W,
+        &l_u,
+        &l_w,
+        &bundles,
+      )
+      .expect("NIFS::prove_with_multi_table_lookup must succeed at step i=1");
+
+    // (4c) Project bundles to verifier-public hints
+    let public_bundles = IdentityStepCircuit::public_bundles(&bundles);
+
+    // r_next = ZERO (deterministic per Corrigendum #26 pin adaptation 6)
+    let r_next = GH75Scalar::ZERO;
+
+    // (4d) Build NeutronAugmentedCircuitInputs — mirrors mod.rs:1017-1030
+    let step_inputs: NeutronAugmentedCircuitInputs<GH75E> = NeutronAugmentedCircuitInputs::new(
+      pp.digest(),
+      GH75Scalar::from(i as u64),
+      z0.clone(),
+      Some(zi.clone()),
+      Some(r_U.clone()),
+      Some(ri),
+      r_next,
+      Some(l_u.clone()),
+      Some(nifs),
+      Some(r_U_new.comm_W),
+      Some(r_U_new.comm_E),
+    )
+    .with_multi_table_bundles(Some(public_bundles));
+
+    // (4e) Build NeutronAugmentedCircuit — mirrors mod.rs:1034-1036
+    let step_circuit_aug: NeutronAugmentedCircuit<'_, GH75E, IdentityStepCircuit> =
+      NeutronAugmentedCircuit::new(Some(step_inputs), &circuit, ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, 1 /* index_n_bits */);
+
+    // (4f) Synthesize into TestConstraintSystem
+    let mut test_cs = TestConstraintSystem::<GH75Scalar>::new();
+    let _zi_step1 = step_circuit_aug
+      .synthesize(&mut test_cs)
+      .expect("step i=1 synthesis into TestCS must not panic");
+
+    // ----------------------------------------------------------------
+    // (5) Diagnostic: which_is_unsatisfied
+    // ----------------------------------------------------------------
+    let total_constraints = test_cs.num_constraints();
+    match test_cs.which_is_unsatisfied() {
+      Some(constraint_path) => {
+        eprintln!(
+          "\n[Corrigendum #26 Experiment E] UNSATISFIED CONSTRAINT FOUND\n\
+           constraint path: {constraint_path}\n\
+           total constraints: {total_constraints}\n"
+        );
+        panic!(
+          "Corrigendum #26 Experiment E: TestCS::which_is_unsatisfied at step i=1 \
+           returned Some(\"{constraint_path}\") out of {total_constraints} total constraints. \
+           Grep for this constraint's namespace in vendor/nova/src/neutron/circuit/."
+        );
+      }
+      None => {
+        eprintln!(
+          "\n[Corrigendum #26 Experiment E] ALL SATISFIED\n\
+           total constraints: {total_constraints}\n\
+           No unsatisfied constraint found at step i=1. If Experiment B (n=2 IVC verify) \
+           still fails, the issue is NOT in the augmented circuit's R1CS satisfaction \
+           at step i=1 with deterministic ri=ZERO — investigate whether the failure \
+           requires the production random ri path, or is in the verify-side hash-chain \
+           re-derive rather than the circuit satisfaction.\n"
+        );
+      }
+    }
+  }
 }
