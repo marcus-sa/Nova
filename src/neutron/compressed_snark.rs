@@ -1342,6 +1342,7 @@ pub(crate) fn build_per_table_commitments<E: Engine>(
 /// the witnesses were built against, by virtue of the deterministic ChaCha20
 /// seed used by the test helper.
 #[allow(non_snake_case)]
+#[allow(dead_code)]
 pub(crate) fn build_honest_logup_witnesses<E: Engine>(
   rng: &mut rand_chacha::ChaCha20Rng,
   num_cons: usize,

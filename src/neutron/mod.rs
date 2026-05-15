@@ -147,7 +147,7 @@ where
   // the bracket above.
   #[cfg(feature = "lookup-fold")]
   #[serde(skip, default)]
-  pub(crate) shape_registry: Vec<E1::Scalar>,
+  pub shape_registry: Vec<E1::Scalar>,
 
   /// GH-#5 M.GH5.4 / pin §3.1: structurally-pinned per-table count
   /// (`LookupShape::multi_column_tables.len()`). Production: k=2 per
