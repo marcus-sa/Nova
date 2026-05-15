@@ -1059,11 +1059,28 @@ where
   pub per_table_comm_inv_w: Vec<Commitment<E>>,
   /// Per-table table-side inverse commitments (length `k`; empty at k=0).
   pub per_table_comm_inv_t: Vec<Commitment<E>>,
-  /// Per-table `T_lookup` data vectors (length `k`; each inner Vec at length
-  /// `num_cons`; empty outer Vec at k=0). The verifier re-evaluates `T_j(r_x)`
-  /// against these public table data MLEs at the outer-sumcheck challenge
-  /// point per `verify_with_T_claim_split_error_with_logup` discipline.
-  pub per_table_T_lookup: Vec<Vec<E::Scalar>>,
+  /// Per-table commitments to `T_lookup` data (length `k`; empty Vec at k=0).
+  /// Each commitment is taken against the structural-prefix `ck` slice
+  /// (matching the `per_table_comm_L` / `per_table_comm_ts` /
+  /// `per_table_comm_inv_w` / `per_table_comm_inv_t` discipline above and the
+  /// R1CS-side `comm_W` basis).
+  ///
+  /// **Corrigendum #29 (2026-05-16; GH-#7 Stage K)** — replaces the
+  /// pre-corrigendum `per_table_T_lookup: Vec<Vec<E::Scalar>>` envelope field
+  /// whose inner length `num_cons` was the dominant envelope-size contributor
+  /// at slice-04 (KPI #3 = 12,288-byte ceiling) and would have grown
+  /// catastrophically at slice-06 (`num_cons ≈ 1.7M`).
+  ///
+  /// The verifier batched-opens this commitment at the outer-sumcheck
+  /// challenge `r_x` (via a 5th per-table entry in the existing `u_vec`
+  /// `PolyEvalInstance` batch consumed by `batch_eval_verify`) to recover the
+  /// public table-data MLE evaluation `T_j(r_x)`. The HyperKZG batched-opening
+  /// soundness (eprint.iacr.org/2020/081 v3 §4) + Pedersen binding on
+  /// `comm_T_lookup_j` + FS-pinning of `comm_T_lookup_j` BEFORE `r_x` is
+  /// squeezed delivers the same soundness guarantee as the pre-corrigendum
+  /// raw-vector MLE-eval at `verify_with_T_claim_split_error_with_logup`,
+  /// with no new cryptographic assumption.
+  pub per_table_comm_T_lookup: Vec<Commitment<E>>,
   /// Per-table LogUp running-scalars (length `k`; empty at k=0). Under
   /// (D-i)/(P1) at M.GH7.4c, these are the WITNESS-CONSTRUCTION `r_logup_j`
   /// scalars threaded by the prover (sampled INSIDE `build_honest_logup_witnesses`
@@ -1267,7 +1284,12 @@ pub(crate) fn build_per_table_commitments<E: Engine>(
   per_table_ts: &[Vec<E::Scalar>],
   per_table_inv_w: &[Vec<E::Scalar>],
   per_table_inv_t: &[Vec<E::Scalar>],
+  // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the fifth per-table commitment
+  // is to the public table-data poly `T_j` at length `num_cons` (flat-embedded
+  // per Finding F). Same `ck` prefix-basis as the four siblings; zero blinding.
+  per_table_T: &[Vec<E::Scalar>],
 ) -> (
+  Vec<Commitment<E>>,
   Vec<Commitment<E>>,
   Vec<Commitment<E>>,
   Vec<Commitment<E>>,
@@ -1277,12 +1299,14 @@ pub(crate) fn build_per_table_commitments<E: Engine>(
   assert_eq!(per_table_ts.len(), k);
   assert_eq!(per_table_inv_w.len(), k);
   assert_eq!(per_table_inv_t.len(), k);
+  assert_eq!(per_table_T.len(), k);
 
   let zero = E::Scalar::ZERO;
   let mut comm_L = Vec::with_capacity(k);
   let mut comm_ts = Vec::with_capacity(k);
   let mut comm_inv_w = Vec::with_capacity(k);
   let mut comm_inv_t = Vec::with_capacity(k);
+  let mut comm_T = Vec::with_capacity(k);
   for j in 0..k {
     comm_L.push(<E::CE as CommitmentEngineTrait<E>>::commit(
       ck,
@@ -1304,8 +1328,13 @@ pub(crate) fn build_per_table_commitments<E: Engine>(
       &per_table_inv_t[j],
       &zero,
     ));
+    comm_T.push(<E::CE as CommitmentEngineTrait<E>>::commit(
+      ck,
+      &per_table_T[j],
+      &zero,
+    ));
   }
-  (comm_L, comm_ts, comm_inv_w, comm_inv_t)
+  (comm_L, comm_ts, comm_inv_w, comm_inv_t, comm_T)
 }
 
 /// **M.GH7.4c (Corrigendum #16 sub-ratification) helper.** Build `k` honest
@@ -1713,14 +1742,20 @@ where
     // M.GH7.4b/4c parity. Per Claim 2, this yields commitments byte-equal to
     // `r_U.comm_L[j]` / `r_U.comm_ts[j]` by Pedersen MSM linearity over the
     // structural prefix.
-    let (per_table_comm_L, per_table_comm_ts, per_table_comm_inv_w, per_table_comm_inv_t) =
-      build_per_table_commitments::<E>(
-        &pp.ck,
-        &per_table_w,
-        &per_table_ts,
-        &per_table_inv_w,
-        &per_table_inv_t,
-      );
+    let (
+      per_table_comm_L,
+      per_table_comm_ts,
+      per_table_comm_inv_w,
+      per_table_comm_inv_t,
+      per_table_comm_T_lookup,
+    ) = build_per_table_commitments::<E>(
+      &pp.ck,
+      &per_table_w,
+      &per_table_ts,
+      &per_table_inv_w,
+      &per_table_inv_t,
+      &per_table_T,
+    );
 
     // (3) Delegate to prove_from_parts_with_logup with the synthetic-data +
     // IVC-extracted (r_U, r_W, zi). The returned envelope has the per-table
@@ -1745,6 +1780,7 @@ where
       per_table_comm_ts,
       per_table_comm_inv_w,
       per_table_comm_inv_t,
+      per_table_comm_T_lookup,
     )?;
 
     // (4) Destructure-reconstruct pattern (Corrigendum #20 work-item 4 step 5
@@ -1773,7 +1809,7 @@ where
       per_table_comm_ts: envelope.per_table_comm_ts,
       per_table_comm_inv_w: envelope.per_table_comm_inv_w,
       per_table_comm_inv_t: envelope.per_table_comm_inv_t,
-      per_table_T_lookup: envelope.per_table_T_lookup,
+      per_table_comm_T_lookup: envelope.per_table_comm_T_lookup,
       per_table_r_logup: envelope.per_table_r_logup,
       // Corrigendum #20 (S2) snapshot fields — populated from the IVC trace.
       r_U_snapshot: Some(recursive_snark.r_U.clone()),
@@ -1978,6 +2014,9 @@ where
         &[],
         &[],
         &[],
+        // Corrigendum #29 (2026-05-16; GH-#7 Stage K) — 5th per-table
+        // commitment slice. Empty at k=0 STAGE-0 path.
+        &[],
       )?;
 
     Ok(CompressedSNARK {
@@ -1992,7 +2031,7 @@ where
       per_table_comm_ts: Vec::new(),
       per_table_comm_inv_w: Vec::new(),
       per_table_comm_inv_t: Vec::new(),
-      per_table_T_lookup: Vec::new(),
+      per_table_comm_T_lookup: Vec::new(),
       per_table_r_logup: Vec::new(),
       // Corrigendum #20 (M.GH7.5 path (b) (S2) disposition): k=0 snapshot
       // fields all None. STAGE-0 byte-equivalence preserved by the `None`
@@ -2029,15 +2068,15 @@ where
   ///    `vk_digest`, `r_U_derand_comm_E`, `comm_E1`, `comm_E2_bind`,
   ///    `comm_E2_pcs`, `T_bind`, `T_pcs` (all inside Σ-protocol helper).
   /// 3. Σ-protocol Step 2 challenge squeeze (`α`) UNCHANGED.
-  /// 4. NEW (M.GH7.4c): per-table absorption on envelope-side transcript in
-  ///    `table_id`-canonical order:
+  /// 4. NEW (M.GH7.4c; FS-tag updated by Corrigendum #29): per-table
+  ///    absorption on envelope-side transcript in `table_id`-canonical order:
   ///    ```text
   ///    for j in 0..k {
-  ///      ts_env.absorb(b"comm_L_j",      &per_table_comm_L[j])
-  ///      ts_env.absorb(b"comm_ts_j",     &per_table_comm_ts[j])
-  ///      ts_env.absorb(b"comm_inv_w_j",  &per_table_comm_inv_w[j])
-  ///      ts_env.absorb(b"comm_inv_t_j",  &per_table_comm_inv_t[j])
-  ///      ts_env.absorb(b"T_lookup_j",    &per_table_T_lookup[j])
+  ///      ts_env.absorb(b"comm_L_j",       &per_table_comm_L[j])
+  ///      ts_env.absorb(b"comm_ts_j",      &per_table_comm_ts[j])
+  ///      ts_env.absorb(b"comm_inv_w_j",   &per_table_comm_inv_w[j])
+  ///      ts_env.absorb(b"comm_inv_t_j",   &per_table_comm_inv_t[j])
+  ///      ts_env.absorb(b"comm_T_lookup_j", &per_table_comm_T_lookup[j])
   ///    }
   ///    ```
   /// 5. NEW (M.GH7.4c): per-table sequential `r_logup_j` squeezes
@@ -2047,8 +2086,8 @@ where
   ///    per-table polynomial slices + per-table commitment slices + the
   ///    PROVER-THREADED `r_logup_per_table` (NOT the FS-squeezed value).
   /// 7. Return extended `CompressedSNARK<E, EE>` envelope carrying the
-  ///    per-table commitments + `T_lookup_j` + `r_logup_per_table` for
-  ///    verifier re-derivation.
+  ///    per-table commitments (including `per_table_comm_T_lookup` per
+  ///    Corrigendum #29) + `r_logup_per_table` for verifier re-derivation.
   ///
   /// # Gate #11 (binding-deferral narration) — disposition documented
   ///
@@ -2092,6 +2131,13 @@ where
     per_table_comm_ts: Vec<Commitment<E>>,
     per_table_comm_inv_w: Vec<Commitment<E>>,
     per_table_comm_inv_t: Vec<Commitment<E>>,
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the 5th per-table commitment
+    // is to the public table-data poly `T_j`. Envelope absorbs it (in lieu of
+    // the raw vector pre-#29) under the new FS-tag `b"comm_T_lookup_j"`; the
+    // Spartan-side sibling appends the 5th `PolyEvalInstance` to `u_vec` so
+    // the verifier batched-opens `T_j(r_x)` rather than MLE-evaluating the raw
+    // vector at `r_x`.
+    per_table_comm_T_lookup: Vec<Commitment<E>>,
   ) -> Result<Self, NovaError> {
     let k = r_logup_per_table.len();
     assert_eq!(per_table_w.len(), k, "per_table_w cardinality must equal k");
@@ -2105,6 +2151,7 @@ where
     assert_eq!(per_table_comm_ts.len(), k);
     assert_eq!(per_table_comm_inv_w.len(), k);
     assert_eq!(per_table_comm_inv_t.len(), k);
+    assert_eq!(per_table_comm_T_lookup.len(), k);
 
     // (1) Build BLINDED SplitECommitments — identical to `prove_from_parts`.
     let SplitECommitments {
@@ -2171,12 +2218,21 @@ where
     // (7) NEW per dispatch authoring step (6): per-table absorption in
     // `table_id`-canonical order. At k=0 this loop is a no-op and the
     // envelope-transcript state matches `prove_from_parts` byte-equivalently.
+    //
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the 5th per-table entry
+    // absorbs `per_table_comm_T_lookup[j]` (a `Commitment<E>`) under the
+    // FS-tag `b"comm_T_lookup_j"`. The FS-tag substitution from the
+    // pre-corrigendum `b"T_lookup_j"` (which named a raw `&[E::Scalar]`
+    // payload) is REQUIRED — preserving the old tag against a
+    // different-typed payload would silently re-derive a different challenge
+    // stream that the verifier-side did not match. Forward-incompatible
+    // breaking change per design pin §4.4; no envelope back-compat shim.
     for j in 0..k {
       ts_env.absorb(b"comm_L_j", &per_table_comm_L[j]);
       ts_env.absorb(b"comm_ts_j", &per_table_comm_ts[j]);
       ts_env.absorb(b"comm_inv_w_j", &per_table_comm_inv_w[j]);
       ts_env.absorb(b"comm_inv_t_j", &per_table_comm_inv_t[j]);
-      ts_env.absorb(b"T_lookup_j", &per_table_T[j].as_slice());
+      ts_env.absorb(b"comm_T_lookup_j", &per_table_comm_T_lookup[j]);
     }
 
     // (8) NEW per dispatch authoring step (7): per-table sequential
@@ -2231,6 +2287,7 @@ where
         &per_table_comm_ts,
         &per_table_comm_inv_w,
         &per_table_comm_inv_t,
+        &per_table_comm_T_lookup,
       )?;
 
     Ok(CompressedSNARK {
@@ -2245,7 +2302,7 @@ where
       per_table_comm_ts,
       per_table_comm_inv_w,
       per_table_comm_inv_t,
-      per_table_T_lookup: per_table_T,
+      per_table_comm_T_lookup,
       per_table_r_logup: r_logup_per_table,
       // Corrigendum #20 (VT-3 disposition): the existing M.GH7.4c synthetic-data
       // acceptance-test path through THIS entry point does NOT carry an IVC
@@ -2397,7 +2454,7 @@ where
     if self.per_table_comm_ts.len() != k
       || self.per_table_comm_inv_w.len() != k
       || self.per_table_comm_inv_t.len() != k
-      || self.per_table_T_lookup.len() != k
+      || self.per_table_comm_T_lookup.len() != k
     {
       return Err(NovaError::ProofVerifyError {
         reason: "per-table envelope fields have inconsistent cardinality".to_string(),
@@ -2505,12 +2562,19 @@ where
       }
     }
 
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): mirror of the prover-side
+    // envelope absorb at `prove_from_parts_with_logup` step (7) — the 5th
+    // per-table entry is `per_table_comm_T_lookup[j]` (a `Commitment<E>`)
+    // absorbed under FS-tag `b"comm_T_lookup_j"`. The FS-tag substitution
+    // from the pre-corrigendum `b"T_lookup_j"` (raw `&[E::Scalar]` payload)
+    // is forward-incompatible per design pin §4.4 — same-tag-different-payload
+    // would silently re-derive a different challenge stream.
     for j in 0..k {
       ts_env.absorb(b"comm_L_j", &self.per_table_comm_L[j]);
       ts_env.absorb(b"comm_ts_j", &self.per_table_comm_ts[j]);
       ts_env.absorb(b"comm_inv_w_j", &self.per_table_comm_inv_w[j]);
       ts_env.absorb(b"comm_inv_t_j", &self.per_table_comm_inv_t[j]);
-      ts_env.absorb(b"T_lookup_j", &self.per_table_T_lookup[j].as_slice());
+      ts_env.absorb(b"comm_T_lookup_j", &self.per_table_comm_T_lookup[j]);
     }
     // Per-table sequential `r_logup_j` squeezes — mirrors the prover discipline
     // at `prove_from_parts_with_logup` and the vendor NIFS-side parallel-
@@ -2540,7 +2604,7 @@ where
       &self.U_bridged,
       self.U_bridged.comm_E1,
       self.U_bridged.comm_E2_pcs,
-      &self.per_table_T_lookup,
+      &self.per_table_comm_T_lookup,
       // At M.GH7.4c, the verifier obtains `r_logup_per_table` from the proof
       // envelope (`per_table_r_logup` field). At k=0 this is empty; at k>0 the
       // prover wrote the witness-construction scalars here.
@@ -4036,12 +4100,14 @@ mod tests {
       per_table_comm_ts,
       per_table_comm_inv_w,
       per_table_comm_inv_t,
+      per_table_comm_T_lookup,
     ) = build_per_table_commitments::<E>(
       &ck,
       &per_table_w,
       &per_table_ts,
       &per_table_inv_w,
       &per_table_inv_t,
+      &per_table_T,
     );
 
     // Arbitrary IVC final state — only used by the envelope verify body
@@ -4070,6 +4136,7 @@ mod tests {
       per_table_comm_ts,
       per_table_comm_inv_w,
       per_table_comm_inv_t,
+      per_table_comm_T_lookup,
     )
     .expect(
       "CompressedSNARK::prove_from_parts_with_logup must succeed at \
@@ -4078,19 +4145,19 @@ mod tests {
     );
 
     // Independent pre-check: the envelope-side per-table fields are populated.
+    // Per Corrigendum #29 (2026-05-16; GH-#7 Stage K), `per_table_T_lookup`
+    // (a `Vec<Vec<E::Scalar>>` at length `num_cons` per inner entry) is
+    // replaced by `per_table_comm_T_lookup` (a `Vec<Commitment<E>>`).
+    // The per-table inner-length-`num_cons` assertion is no longer
+    // applicable (commitments have no inner length); cardinality assertion
+    // remains.
     assert_eq!(snark.per_table_comm_L.len(), k);
     assert_eq!(snark.per_table_comm_ts.len(), k);
     assert_eq!(snark.per_table_comm_inv_w.len(), k);
     assert_eq!(snark.per_table_comm_inv_t.len(), k);
-    assert_eq!(snark.per_table_T_lookup.len(), k);
+    assert_eq!(snark.per_table_comm_T_lookup.len(), k);
     assert_eq!(snark.per_table_r_logup.len(), k);
-    for j in 0..k {
-      assert_eq!(
-        snark.per_table_T_lookup[j].len(),
-        num_cons,
-        "Finding F flat-embedding: per-table T_lookup at length num_cons",
-      );
-    }
+    let _ = num_cons; // retained as binding for fixture documentation
 
     // Independent structural assertion: off-FS Pedersen-additive binding
     // holds (M.GH7.0.2 invariant under M.GH7.4c authoring).

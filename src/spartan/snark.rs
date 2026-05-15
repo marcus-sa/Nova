@@ -1356,7 +1356,15 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     U_bridged: &crate::neutron::compressed_snark::BridgedNeutronInstance<E>,
     comm_E1: crate::Commitment<E>,
     comm_E2: crate::Commitment<E>,
-    per_table_T: &[Vec<E::Scalar>],
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the verifier consumes a
+    // per-table commitment slice (replaces the pre-#29 raw
+    // `&[Vec<E::Scalar>]`). The verifier no longer MLE-evaluates `T_j` at
+    // `r_x` from a raw envelope-published vector; instead it appends a 5th
+    // `PolyEvalInstance` per table to `u_vec` with eval claim
+    // `per_table_outer_evals[j].eval_T` (the prover's claimed value, embedded
+    // in the proof envelope) and the HyperKZG batched-opening at the end of
+    // this method authenticates the binding to `per_table_comm_T[j]`.
+    per_table_comm_T: &[crate::Commitment<E>],
     r_logup_per_table: &[E::Scalar],
     per_table_comm_L: &[crate::Commitment<E>],
     per_table_comm_ts: &[crate::Commitment<E>],
@@ -1373,7 +1381,7 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     if per_table_outer_evals.len() != k {
       return Err(NovaError::InvalidSumcheckProof);
     }
-    if per_table_T.len() != k
+    if per_table_comm_T.len() != k
       || per_table_comm_L.len() != k
       || per_table_comm_ts.len() != k
       || per_table_comm_inv_w.len() != k
@@ -1407,19 +1415,20 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     // Partition convention per Corrigendum #9 (2-A).
     let ell = vk.S.num_cons.log_2();
     let ell2 = ell / 2;
-    let num_cons = vk.S.num_cons;
 
-    // Reconstruct per-table table-data evaluations `eval_T_j = T_j(r_x)` —
-    // the verifier evaluates the public table-data MLEs against the
-    // outer-sumcheck challenge, then checks them against the prover's
-    // claimed `eval_T_j` in `per_table_outer_evals[j].eval_T`. Per-table T
-    // is fixed public input; if the prover's claimed value diverges from the
-    // public-input MLE evaluation at r_x, reject.
-    for j in 0..k {
-      if per_table_T[j].len() != num_cons {
-        return Err(NovaError::InvalidSumcheckProof);
-      }
-    }
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the pre-corrigendum
+    // per-table inner-length check `per_table_T[j].len() != num_cons` and the
+    // MLE-eval cross-check
+    //   eval_T_j_public = MLE(per_table_T[j]).evaluate(r_x)
+    //   if per_table_outer_evals[j].eval_T != eval_T_j_public { reject }
+    // are REMOVED. The migration is to the batched HyperKZG opening at the
+    // u_vec extension below — the 5th per-table `PolyEvalInstance` opens
+    // `per_table_comm_T[j]` at `r_x` with claimed evaluation
+    // `per_table_outer_evals[j].eval_T`; `batch_eval_verify` reduces all
+    // PCS instances to a single joint claim and `EE::verify` authenticates
+    // the binding. A malicious prover supplying any unauthorised `eval_T_j`
+    // would fail the HyperKZG opening soundness (eprint 2020/081 v3 §4) at
+    // the final `EE::verify` step.
 
     // Outer sumcheck verify: claim = T (mirrors β'); degree bound = 3
     // (Corrigendum #16 Finding C — additive composition preserves degree-3).
@@ -1431,19 +1440,14 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     // Reconstruct claim_outer_final per the M.GH7.4b unified residue identity
     // (Corrigendum #16 Finding B; additive composition under per-table
     // `r_logup_j` of the β' R1CS-side residue + per-table (A) + per-table (B)).
+    //
+    // The per-table (B) identity consumes `per_table_outer_evals[j].eval_T`
+    // (the prover's claimed value); Corrigendum #29 migrates the binding of
+    // that claimed value from a raw-vector MLE-eval to a HyperKZG batched-
+    // opening of `per_table_comm_T[j]` at the u_vec extension below.
     let (claim_Az, claim_Bz, claim_Cz) = self.claims_outer;
     let eval_E_combined = eval_E1 * eval_E2;
     let r1cs_residue_at_rx = eval_E_combined * (claim_Az * claim_Bz - claim_Cz);
-
-    // Verifier check: prover's claimed eval_T_j must equal the public
-    // table-data MLE evaluation at r_x. Without this, a malicious prover
-    // could supply any eval_T_j and trivially satisfy the (B) identity.
-    for j in 0..k {
-      let eval_T_j_public = MultilinearPolynomial::new(per_table_T[j].clone()).evaluate(&r_x);
-      if per_table_outer_evals[j].eval_T != eval_T_j_public {
-        return Err(NovaError::InvalidSumcheckProof);
-      }
-    }
 
     let mut per_table_residue_at_rx = E::Scalar::ZERO;
     for j in 0..k {
@@ -1526,14 +1530,26 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
       return Err(NovaError::InvalidSumcheckProof);
     }
 
-    // Batch step — extend β''s 3-entry u_vec to `3 + 4·k` entries by
-    // appending per-table PCS instances at eval point `r_x` (Corrigendum #16
-    // Finding F flat-embed; Corrigendum #12 heterogeneous-size capacity at
-    // `PolyEvalInstance::batch_diff_size`).
+    // Batch step — Corrigendum #29 (2026-05-16; GH-#7 Stage K) extends the
+    // per-table batch from `3 + 4·k` to `3 + 5·k` entries by appending one
+    // PCS instance per table for the T_lookup opening at `r_x`. The claimed
+    // evaluation is `per_table_outer_evals[j].eval_T` (the prover-claimed
+    // value consumed by the unified outer-sumcheck residue identity above);
+    // `batch_eval_verify` + `EE::verify` authenticate the binding to
+    // `per_table_comm_T[j]`. Pre-corrigendum, the binding was a raw-vector
+    // MLE-eval cross-check that required transmitting `T_j` in full at
+    // length `num_cons` (the envelope-cost regression that Corrigendum #29
+    // eliminates).
+    //
+    // Heterogeneous-size capacity at `PolyEvalInstance::batch_diff_size` is
+    // confirmed for the 5th per-table entry at length `num_cons` (verified-by-
+    // Read at design pin §5.4 issue 2 RESOLVED-AT-DISPATCH; the existing 4
+    // per-table entries already operate at length `num_cons` at this site,
+    // and the 5th uses identical machinery).
     let r_x_high = r_x[..ell2].to_vec();
     let r_x_low = r_x[ell2..].to_vec();
 
-    let mut u_vec: Vec<PolyEvalInstance<E>> = Vec::with_capacity(3 + 4 * k);
+    let mut u_vec: Vec<PolyEvalInstance<E>> = Vec::with_capacity(3 + 5 * k);
     u_vec.push(PolyEvalInstance {
       c: U_bridged.comm_W,
       x: r_y[1..].to_vec(),
@@ -1570,6 +1586,16 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
         c: per_table_comm_inv_t[j],
         x: r_x.clone(),
         e: evals_j.eval_inv_t,
+      });
+      // Corrigendum #29 — 5th per-table entry opening T_j(r_x) against
+      // per_table_comm_T[j]. The eval claim is the prover-published
+      // per_table_outer_evals[j].eval_T (already consumed by the unified
+      // outer-sumcheck residue identity above); the HyperKZG batched-opening
+      // at EE::verify below authenticates the binding.
+      u_vec.push(PolyEvalInstance {
+        c: per_table_comm_T[j],
+        x: r_x.clone(),
+        e: evals_j.eval_T,
       });
     }
 
@@ -1731,6 +1757,19 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     per_table_comm_ts: &[crate::Commitment<E>],
     per_table_comm_inv_w: &[crate::Commitment<E>],
     per_table_comm_inv_t: &[crate::Commitment<E>],
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): commitment to the
+    // public table-data poly `T_j` at length `num_cons`, taken against the
+    // same `ck` prefix-basis as the four siblings (zero blinding). Replaces
+    // the pre-corrigendum verifier-side raw `&[Vec<E::Scalar>]` parameter
+    // that drove the `eval_T_j_public = MLE(T_j).evaluate(r_x)` cross-check
+    // at `verify_with_T_claim_split_error_with_logup` lines 1441-1446.
+    // The prover-side u_vec/w_vec extend from `3 + 4·k` to `3 + 5·k` entries
+    // by appending one `PolyEvalInstance/PolyEvalWitness` per table for the
+    // T_lookup opening at `r_x`; the verifier reads `eval_T_j` from
+    // `per_table_outer_evals[j].eval_T` (the prover's claimed value) and
+    // `batch_eval_verify` + the HyperKZG batched-opening close the binding
+    // to `per_table_comm_T_lookup[j]`.
+    per_table_comm_T_lookup: &[crate::Commitment<E>],
   ) -> Result<
     (
       Self,
@@ -1800,6 +1839,8 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
     assert_eq!(per_table_comm_ts.len(), k);
     assert_eq!(per_table_comm_inv_w.len(), k);
     assert_eq!(per_table_comm_inv_t.len(), k);
+    // Corrigendum #29 — 5th per-table commitment cardinality.
+    assert_eq!(per_table_comm_T_lookup.len(), k);
 
     // z = [W.W, U.u, U.X] (β' construction at `snark.rs:978-983`).
     let mut z = [W.W.clone(), vec![U_bridged.u], U_bridged.X.clone()].concat();
@@ -1899,17 +1940,33 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
 
     let eval_W = MultilinearPolynomial::evaluate_with(&W.W, &r_y[1..]);
 
-    let mut w_vec = Vec::with_capacity(3 + 4 * k);
+    // Corrigendum #29 (2026-05-16; GH-#7 Stage K): the per-table batch grows
+    // from `3 + 4·k` to `3 + 5·k` entries — the 5th per-table entry per j is
+    // a `PolyEvalInstance/PolyEvalWitness` pair opening the public table-data
+    // poly `T_j` at `r_x`. Pre-corrigendum, `T_j(r_x)` was MLE-evaluated
+    // verifier-side from the raw `Vec<E::Scalar>` in the envelope; the raw
+    // vector was a linear-in-`num_cons` envelope cost. Post-corrigendum,
+    // `T_j(r_x)` is delivered as `per_table_outer_evals[j].eval_T` (the
+    // prover's claimed value) and authenticated by the batched HyperKZG
+    // opening of `per_table_comm_T_lookup[j]`. Soundness inherits from
+    // HyperKZG batched-opening (eprint 2020/081 v3 §4) + Pedersen binding +
+    // FS-pinning of `comm_T_lookup_j` BEFORE `r_x` is squeezed (the FS-tag
+    // substitution to `b"comm_T_lookup_j"` at the envelope-side absorb loop
+    // is what enforces this ordering — same-tag-different-payload would
+    // silently re-derive a different challenge stream, a Halpert-class
+    // forgery vector). See design pin §3 (soundness sketch).
+    let mut w_vec = Vec::with_capacity(3 + 5 * k);
     w_vec.push(PolyEvalWitness { p: W.W });
     w_vec.push(PolyEvalWitness { p: E1.to_vec() });
     w_vec.push(PolyEvalWitness { p: E2.to_vec() });
     // Per-table PCS-opened witness polynomials, in `table_id`-canonical order
-    // (j ascending). The four PCS-opened per-table polys per j are
-    // (w_j, ts_j, inv_w_j, inv_t_j); the remaining three per-table polys
-    // (T_j, eq_w_j, eq_t_j) are verifier-reconstructed public inputs (T_j is
-    // fixed table data; eq-factors are reconstructed via `EqPolynomial` against
-    // their construction-time challenges) and so are NOT in the PCS witness
-    // vector.
+    // (j ascending). The five PCS-opened per-table polys per j are
+    // (w_j, ts_j, inv_w_j, inv_t_j, T_j); the remaining two per-table polys
+    // (eq_w_j, eq_t_j) are verifier-reconstructed public inputs (eq-factors
+    // are reconstructed via `EqPolynomial` against their construction-time
+    // challenges) and so are NOT in the PCS witness vector. Pre-Corrigendum
+    // #29, T_j was verifier-reconstructed from the raw vector in the envelope;
+    // post-#29, it is PCS-opened from `per_table_comm_T_lookup[j]`.
     for j in 0..k {
       w_vec.push(PolyEvalWitness {
         p: per_table_w[j].clone(),
@@ -1923,9 +1980,12 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
       w_vec.push(PolyEvalWitness {
         p: per_table_inv_t[j].clone(),
       });
+      w_vec.push(PolyEvalWitness {
+        p: per_table_T[j].clone(),
+      });
     }
 
-    let mut u_vec = Vec::with_capacity(3 + 4 * k);
+    let mut u_vec = Vec::with_capacity(3 + 5 * k);
     u_vec.push(PolyEvalInstance {
       c: U_bridged.comm_W,
       x: r_y[1..].to_vec(),
@@ -1968,6 +2028,17 @@ impl<E: Engine, EE: EvaluationEngineTrait<E>> RelaxedR1CSSNARK<E, EE> {
         c: per_table_comm_inv_t[j],
         x: r_x.clone(),
         e: per_table_outer_evals[j].eval_inv_t,
+      });
+      // Corrigendum #29 (2026-05-16; GH-#7 Stage K) — 5th per-table entry
+      // opening `T_j(r_x)` against `per_table_comm_T_lookup[j]`. The claimed
+      // evaluation is `per_table_outer_evals[j].eval_T` (already computed by
+      // `prove_neutron_outer_with_logup` and embedded in the proof envelope
+      // per M.GH7.4a); the verifier reads the same value from the envelope
+      // and reconstructs the unified outer-sumcheck residue identically.
+      u_vec.push(PolyEvalInstance {
+        c: per_table_comm_T_lookup[j],
+        x: r_x.clone(),
+        e: per_table_outer_evals[j].eval_T,
       });
     }
 
@@ -2783,7 +2854,10 @@ mod tests {
       per_table_ts: &[Vec<E::Scalar>],
       per_table_inv_w: &[Vec<E::Scalar>],
       per_table_inv_t: &[Vec<E::Scalar>],
+      // Corrigendum #29 (2026-05-16; GH-#7 Stage K) — 5th per-table commitment.
+      per_table_T: &[Vec<E::Scalar>],
     ) -> (
+      Vec<crate::Commitment<E>>,
       Vec<crate::Commitment<E>>,
       Vec<crate::Commitment<E>>,
       Vec<crate::Commitment<E>>,
@@ -2793,12 +2867,14 @@ mod tests {
       assert_eq!(per_table_ts.len(), k);
       assert_eq!(per_table_inv_w.len(), k);
       assert_eq!(per_table_inv_t.len(), k);
+      assert_eq!(per_table_T.len(), k);
 
       let zero = E::Scalar::ZERO;
       let mut comm_L = Vec::with_capacity(k);
       let mut comm_ts = Vec::with_capacity(k);
       let mut comm_inv_w = Vec::with_capacity(k);
       let mut comm_inv_t = Vec::with_capacity(k);
+      let mut comm_T = Vec::with_capacity(k);
       for j in 0..k {
         comm_L.push(<E::CE as CommitmentEngineTrait<E>>::commit(
           ck,
@@ -2820,8 +2896,13 @@ mod tests {
           &per_table_inv_t[j],
           &zero,
         ));
+        comm_T.push(<E::CE as CommitmentEngineTrait<E>>::commit(
+          ck,
+          &per_table_T[j],
+          &zero,
+        ));
       }
-      (comm_L, comm_ts, comm_inv_w, comm_inv_t)
+      (comm_L, comm_ts, comm_inv_w, comm_inv_t, comm_T)
     }
 
     #[allow(non_snake_case)]
@@ -2960,21 +3041,26 @@ mod tests {
         r_logup_per_table,
       ) = build_honest_logup_witnesses::<E>(&mut rng, 4, k);
 
-      // M.GH7.4b: commit the four PCS-opened per-table polys (w_j, ts_j,
-      // inv_w_j, inv_t_j) against the same `ck` used for the R1CS-side
-      // openings. Zero blindings — the envelope-side handles the derandomised
-      // bridge, identical to how `comm_E1`/`comm_E2` are committed above.
+      // M.GH7.4b + Corrigendum #29 (2026-05-16; GH-#7 Stage K): commit the
+      // five PCS-opened per-table polys (w_j, ts_j, inv_w_j, inv_t_j, T_j)
+      // against the same `ck` used for the R1CS-side openings. Zero blindings
+      // — the envelope-side handles the derandomised bridge, identical to how
+      // `comm_E1`/`comm_E2` are committed above. Pre-#29, T_j was NOT
+      // committed (it was raw-transmitted in the envelope); post-#29 it is
+      // the 5th per-table commitment.
       let (
         per_table_comm_L,
         per_table_comm_ts,
         per_table_comm_inv_w,
         per_table_comm_inv_t,
+        per_table_comm_T_lookup,
       ) = build_per_table_commitments::<E>(
         &ck,
         &per_table_w,
         &per_table_ts,
         &per_table_inv_w,
         &per_table_inv_t,
+        &per_table_T,
       );
 
       // (i) Prover succeeds.
@@ -3004,6 +3090,7 @@ mod tests {
           &per_table_comm_ts,
           &per_table_comm_inv_w,
           &per_table_comm_inv_t,
+          &per_table_comm_T_lookup,
         )
         .expect(
           "prove_with_T_claim_split_error_with_logup must succeed at honest \
@@ -3098,8 +3185,9 @@ mod tests {
       let U_bridged = super::m_gh7_0_0b::bridged_from(&U_derand, comm_E1, comm_E2, T);
 
       // Build k=2 honest LogUp witnesses (flat-embedded onto R1CS variable
-      // space at length num_cons = 4) + per-table commitments to the four
-      // PCS-opened polys (w_j, ts_j, inv_w_j, inv_t_j).
+      // space at length num_cons = 4) + per-table commitments to the five
+      // PCS-opened polys (w_j, ts_j, inv_w_j, inv_t_j, T_j) per Corrigendum
+      // #29 (2026-05-16; GH-#7 Stage K).
       let k = 2;
       let (
         per_table_w,
@@ -3117,16 +3205,19 @@ mod tests {
         per_table_comm_ts,
         per_table_comm_inv_w,
         per_table_comm_inv_t,
+        per_table_comm_T_lookup,
       ) = build_per_table_commitments::<E>(
         &ck,
         &per_table_w,
         &per_table_ts,
         &per_table_inv_w,
         &per_table_inv_t,
+        &per_table_T,
       );
 
-      // (i) Prover succeeds — the M.GH7.4b extended `u_vec`/`w_vec` carrying
-      //     3 + 4·k = 11 PCS-opening entries closes via `batch_eval_reduce`.
+      // (i) Prover succeeds — the M.GH7.4b + Corrigendum #29 extended
+      //     `u_vec`/`w_vec` carrying 3 + 5·k = 13 PCS-opening entries closes
+      //     via `batch_eval_reduce` (was 3 + 4·k = 11 pre-#29).
       let (snark_with_logup, per_table_outer_evals) =
         RelaxedR1CSSNARK::<E, EE>::prove_with_T_claim_split_error_with_logup(
           &ck,
@@ -3153,11 +3244,12 @@ mod tests {
           &per_table_comm_ts,
           &per_table_comm_inv_w,
           &per_table_comm_inv_t,
+          &per_table_comm_T_lookup,
         )
         .expect(
           "prove_with_T_claim_split_error_with_logup must succeed with extended \
-           u_vec/w_vec (3 + 4·k = 11 PCS-opening entries) at honest LogUp \
-           witnesses, num_cons=4, k=2",
+           u_vec/w_vec (3 + 5·k = 13 PCS-opening entries per Corrigendum #29) \
+           at honest LogUp witnesses, num_cons=4, k=2",
         );
 
       assert_eq!(
@@ -3167,14 +3259,16 @@ mod tests {
          must equal k under the M.GH7.4b PCS-opening-wiring extension",
       );
 
-      // (ii) Verifier accepts — closes STOP-AND-ASK gates #4 + #5.
+      // (ii) Verifier accepts — closes STOP-AND-ASK gates #4 + #5 and the
+      //      Corrigendum #29 envelope-shape change at the per-table T_lookup
+      //      binding migration (raw-vector → batched-PCS-opening).
       snark_with_logup
         .verify_with_T_claim_split_error_with_logup(
           &vk,
           &U_bridged,
           comm_E1,
           comm_E2,
-          &per_table_T,
+          &per_table_comm_T_lookup,
           &r_logup_per_table,
           &per_table_comm_L,
           &per_table_comm_ts,
@@ -3183,8 +3277,8 @@ mod tests {
         )
         .expect(
           "verify_with_T_claim_split_error_with_logup must accept the proof \
-           — Corrigendum #16 M.GH7.4b PCS-opening wiring round-trip at \
-           num_cons=4, k=2, table_size=4",
+           — Corrigendum #16 M.GH7.4b + Corrigendum #29 PCS-opening wiring \
+           round-trip at num_cons=4, k=2, table_size=4",
         );
 
       // (iii) β' sibling regression: prove_with_T_claim_split_error +
