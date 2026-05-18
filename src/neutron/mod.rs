@@ -451,6 +451,100 @@ where
     Ok(pp)
   }
 
+  /// C1-β BIP-340 witness/ck threading sub-corrigendum §6 (Halpert,
+  /// 2026-05-18): shape-pass sibling of [`Self::setup_with_ptau_dir`]
+  /// that exercises the lookup-aware
+  /// [`crate::neutron::circuit::NeutronAugmentedCircuit::synthesize_aux`]
+  /// entry point so that `pp.structure` (the R1CS shape consumed at
+  /// `cs.r1cs_instance_and_witness(&pp.structure.S, &pp.ck)` at the
+  /// prove site of `prove_step_with_lookup_fold_aux`) includes the
+  /// per-chunk constraints emitted by the chunked BIP-340 helpers
+  /// inside the step-circuit's `synthesize_with_aux` body.
+  ///
+  /// Mirrors `setup_with_ptau_dir` byte-for-byte except for the
+  /// shape-pass synthesize call: `circuit.synthesize_aux(&mut cs)`
+  /// instead of `circuit.synthesize(&mut cs)`. The shape pass runs
+  /// against `ShapeCS<E1>` — `ShapeCS` implements `ConstraintSystem`
+  /// only (no witness assignment), so the `CSWithLookups` wrapper
+  /// inside `synthesize_aux` records constraint structure into the
+  /// inner `ShapeCS` and queries into the local `QueryCollector` that
+  /// drops on `synthesize_aux` return (the off-circuit
+  /// `LookupStepCircuit::per_table_bundles_at_step` is NOT exercised
+  /// at shape time; the chunk-lookup binding is bound only at prove
+  /// time via the off-circuit bundles assembled at
+  /// `prove_step_with_lookup_fold_aux:983` and the in-circuit
+  /// `register_chunk_lookup_table` content-addressed commitment
+  /// re-derivation).
+  ///
+  /// HG-A1.4-6 close criterion (parent corrigendum §4 CK-α.1): the
+  /// `register_chunk_lookup_table::<E>(default_shape_pass_ck(), ID)`
+  /// commitment at shape time equals
+  /// `register_chunk_lookup_table::<E>(pp.ck(), ID)` commitment at
+  /// prove time. Preserved by construction under the inumbra-side
+  /// `Default::default()` shape-pass-ck wiring (parent §4 + §5).
+  #[cfg(all(feature = "io", feature = "lookup-fold"))]
+  pub fn setup_with_ptau_dir_aux(
+    c: &C,
+    ck_hint1: &CommitmentKeyHint<E1>,
+    _ck_hint2: &CommitmentKeyHint<E2>,
+    ptau_dir: &std::path::Path,
+    shape_registry: Vec<E1::Scalar>,
+    lookup_fold_k: usize,
+    index_n_bits: usize,
+    lookup_shape: Option<LookupShape<E1>>,
+  ) -> Result<Self, NovaError>
+  where
+    E1::GE: crate::provider::traits::PairingGroup,
+    C: crate::traits::circuit::StepCircuitWithAux<E1::Scalar, E1>,
+  {
+    let F_arity = c.arity();
+
+    let ro_consts: RO2Constants<E1> = RO2Constants::<E1>::default();
+    let ro_consts_circuit: RO2ConstantsCircuit<E1> = RO2ConstantsCircuit::<E1>::default();
+
+    // Initialize shape for the primary — mirror of `setup_with_ptau_dir`
+    // with the synthesize-aux sibling call.
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(None, c, ro_consts_circuit.clone())
+        .with_lookup_fold(lookup_fold_k, &shape_registry, index_n_bits);
+    let mut cs: ShapeCS<E1> = ShapeCS::new();
+    let _ = circuit.synthesize_aux(&mut cs);
+    let r1cs_shape = cs.r1cs_shape()?;
+
+    if r1cs_shape.num_io != 1 {
+      return Err(NovaError::InvalidStepCircuitIO);
+    }
+
+    // Load the commitment key from ptau directory
+    let ck = R1CSShape::commitment_key_from_ptau_dir(&[&r1cs_shape], &[ck_hint1], ptau_dir)?;
+
+    let structure = match lookup_shape {
+      Some(shape) => Structure::new_with_lookups(&r1cs_shape, shape),
+      None => Structure::new(&r1cs_shape),
+    };
+
+    let pp = PublicParams {
+      F_arity,
+
+      ro_consts,
+      ro_consts_circuit,
+      ck,
+      structure,
+
+      shape_registry,
+      lookup_fold_k,
+      index_n_bits,
+
+      digest: OnceCell::new(),
+      _p: Default::default(),
+    };
+
+    // call pp.digest() so the digest is computed here rather than in RecursiveSNARK methods
+    let _ = pp.digest();
+
+    Ok(pp)
+  }
+
   /// `setup_with_ptau_dir` for non-`lookup-fold` builds — preserves the
   /// pre-M.GH5.4 signature.
   #[cfg(all(feature = "io", not(feature = "lookup-fold")))]
@@ -509,6 +603,17 @@ where
       .get_or_try_init(|| DigestComputer::new(self).digest())
       .cloned()
       .expect("Failure in retrieving digest")
+  }
+
+  /// C1-β BIP-340 witness/ck threading parent corrigendum §3 + §7
+  /// (Halpert, 2026-05-18): public accessor for the prove-time
+  /// commitment key. The inumbra-side `wrap_pipeline` snapshots this
+  /// into `InumbraSpendStepCircuitBn254::new_with_bip340_and_ck` so
+  /// the chunked-lookup table commitment registered inside
+  /// `synthesize_with_aux` is byte-equal to the shape-pass commitment
+  /// (CK-α.1 shape-pass-ck-equals-prove-time-ck discipline).
+  pub fn ck(&self) -> &CommitmentKey<E1> {
+    &self.ck
   }
 }
 
@@ -1042,6 +1147,112 @@ where
     //     `prove_with_multi_table_lookup` `next_running_lws` output —
     //     this is the byte-equal threading contract the acceptance
     //     test verifies.
+    self.zi = zi
+      .iter()
+      .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))
+      .collect::<Result<Vec<<E1 as Engine>::Scalar>, _>>()?;
+
+    self.r_U = r_U;
+    self.r_W = r_W;
+
+    self.i += 1;
+
+    self.ri = r_next;
+
+    self.l_u = l_u;
+    self.l_w = l_w;
+
+    self.running_lws = next_running_lws;
+
+    Ok(())
+  }
+
+  /// C1-β BIP-340 witness/ck threading sub-corrigendum §4.3 (Halpert,
+  /// 2026-05-18): prove-side sibling of
+  /// [`Self::prove_step_with_lookup_fold`] that routes the augmented-
+  /// circuit synthesize through
+  /// [`crate::neutron::circuit::NeutronAugmentedCircuit::synthesize_aux`]
+  /// (the lookup-aware sibling per §4.2). Mirrors
+  /// `prove_step_with_lookup_fold` byte-for-byte except:
+  ///
+  ///   1. Where-clause adds `C: StepCircuitWithAux<E1::Scalar, E1>` on
+  ///      top of the impl-block's `LookupStepCircuit<E1>` bound.
+  ///   2. The augmented-circuit synthesize call at the inumbra-side
+  ///      analog of `prove_step_with_lookup_fold:1037` invokes
+  ///      `circuit.synthesize_aux(&mut cs)` instead of
+  ///      `circuit.synthesize(&mut cs)`, so the inner step-circuit
+  ///      body sees a `CSWithLookups<F, SatisfyingAssignment<E1>>`
+  ///      wrapper satisfying its `LookupConstraintSystem<F>` bound.
+  ///
+  /// HG-A1.4-7 (trait-bound mismatch) DISCHARGED on this sibling
+  /// landing in conjunction with `synthesize_aux` (§4.2) and
+  /// `StepCircuitWithAux` (§4.1).
+  pub fn prove_step_with_lookup_fold_aux(
+    &mut self,
+    pp: &PublicParams<E1, E2, C>,
+    c: &C,
+  ) -> Result<(), NovaError>
+  where
+    C: crate::traits::circuit::StepCircuitWithAux<E1::Scalar, E1>,
+  {
+    // (1) Bootstrap at i=0 — mirrors `prove_step_with_lookup_fold:973-977`.
+    if self.i == 0 {
+      self.i = 1;
+      return Ok(());
+    }
+
+    // (2) Construct prover-side per-table bundles via the trait method.
+    let bundles: Vec<PerTableBundle<E1>> =
+      c.per_table_bundles_at_step(&pp.ck, self.i, &self.running_lws)?;
+
+    // (3) Invoke `NIFS::prove_with_multi_table_lookup`.
+    let (nifs, (r_U, r_W), next_running_lws) = NIFS::prove_with_multi_table_lookup(
+      &pp.ck,
+      &pp.ro_consts,
+      &pp.digest(),
+      &pp.structure,
+      &self.r_U,
+      &self.r_W,
+      &self.l_u,
+      &self.l_w,
+      &bundles,
+    )?;
+
+    // (4) Project bundles to verifier-public hints.
+    let public_bundles = C::public_bundles(&bundles);
+
+    let r_next = E1::Scalar::random(&mut OsRng);
+
+    // (5) Build `NeutronAugmentedCircuitInputs` byte-identical to
+    //     `prove_step_with_lookup_fold:1016-1030`.
+    let mut cs = SatisfyingAssignment::<E1>::new();
+    let inputs: NeutronAugmentedCircuitInputs<E1> = NeutronAugmentedCircuitInputs::new(
+      pp.digest(),
+      E1::Scalar::from(self.i as u64),
+      self.z0.to_vec(),
+      Some(self.zi.clone()),
+      Some(self.r_U.clone()),
+      Some(self.ri),
+      r_next,
+      Some(self.l_u.clone()),
+      Some(nifs),
+      Some(r_U.comm_W),
+      Some(r_U.comm_E),
+    )
+    .with_multi_table_bundles(Some(public_bundles));
+
+    // (6) Synthesise the augmented circuit via the lookup-aware
+    //     `synthesize_aux` sibling per §4.2 — the only divergence from
+    //     `prove_step_with_lookup_fold`.
+    let circuit: NeutronAugmentedCircuit<'_, E1, C> =
+      NeutronAugmentedCircuit::new(Some(inputs), c, pp.ro_consts_circuit.clone())
+        .with_lookup_fold(pp.lookup_fold_k, &pp.shape_registry, pp.index_n_bits);
+    let zi = circuit.synthesize_aux(&mut cs)?;
+
+    let (l_u, l_w) = cs.r1cs_instance_and_witness(&pp.structure.S, &pp.ck)?;
+
+    // (7) Update running state — byte-identical to
+    //     `prove_step_with_lookup_fold:1045-1062`.
     self.zi = zi
       .iter()
       .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))

@@ -339,6 +339,7 @@ impl<'a, E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'a, E, S
     self
   }
 
+
   /// Allocate all witnesses and return
   fn alloc_witness<CS: ConstraintSystem<<E as Engine>::Scalar>>(
     &self,
@@ -929,6 +930,140 @@ impl<E: Engine, SC: StepCircuit<E::Scalar>> NeutronAugmentedCircuit<'_, E, SC> {
     let z_next = self
       .step_circuit
       .synthesize(&mut cs.namespace(|| "F"), &z_input)?;
+
+    if z_next.len() != arity {
+      return Err(SynthesisError::IncompatibleLengthVector(
+        "z_next".to_string(),
+      ));
+    }
+
+    // Compute the new hash H(pp_digest, Unew, i+1, z0, z_{i+1})
+    let mut ro = E::RO2Circuit::new(self.ro_consts);
+    ro.absorb(&pp_digest);
+    ro.absorb(&i_new);
+    for e in &z_0 {
+      ro.absorb(e);
+    }
+    for e in &z_next {
+      ro.absorb(e);
+    }
+    Unew.absorb_in_ro(cs.namespace(|| "absorb U_new"), &mut ro)?;
+    ro.absorb(&r_next);
+    let hash_bits = ro.squeeze(cs.namespace(|| "output hash bits"), NUM_HASH_BITS, false)?;
+    let hash = le_bits_to_num(cs.namespace(|| "convert hash to num"), &hash_bits)?;
+
+    // Outputs the computed hash
+    hash.inputize(cs.namespace(|| "output new hash of this circuit"))?;
+
+    Ok(z_next)
+  }
+}
+
+/// C1-β BIP-340 witness/ck threading sub-corrigendum §4.2 (Halpert,
+/// 2026-05-18): sibling impl block keyed on
+/// [`crate::traits::circuit::StepCircuitWithAux<E::Scalar, E>`] carrying
+/// the lookup-aware augmented-circuit synthesize entry point. Sibling
+/// of [`NeutronAugmentedCircuit::synthesize`] (the upstream-tracking
+/// non-lookup-aware path); chosen at the call site by
+/// [`crate::neutron::RecursiveSNARK::prove_step_with_lookup_fold_aux`]
+/// and [`crate::neutron::PublicParams::setup_with_ptau_dir_aux`].
+///
+/// The body is byte-identical to `synthesize` except for the inner
+/// step-circuit invocation at the `cs.namespace(|| "F")` site: the
+/// CS is wrapped in [`crate::lookup::CSWithLookups`] before invoking
+/// [`crate::traits::circuit::StepCircuitWithAux::synthesize_with_aux`].
+/// The wrapper's local `QueryCollector` is intentionally NOT flushed
+/// per sub-corrigendum §4.2 + §3.1 sound-by-presumption analysis (the
+/// chunk-lookup binding is carried off-circuit by
+/// [`crate::neutron::LookupStepCircuit::per_table_bundles_at_step`]).
+#[cfg(feature = "lookup-fold")]
+impl<E: Engine, SC> NeutronAugmentedCircuit<'_, E, SC>
+where
+  SC: crate::traits::circuit::StepCircuitWithAux<E::Scalar, E>,
+{
+  /// Lookup-aware synthesize sibling — see impl-block doc-comment.
+  pub fn synthesize_aux<CS: ConstraintSystem<E::Scalar>>(
+    self,
+    cs: &mut CS,
+  ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+    let arity = self.step_circuit.arity();
+
+    // Allocate all witnesses
+    let (pp_digest, i, z_0, z_i, U, r_i, r_next, u, nifs, comm_W_fold, comm_E_fold) =
+      self.alloc_witness(cs.namespace(|| "allocate the circuit witness"), arity)?;
+
+    // Compute variable indicating if this is the base case
+    let zero = alloc_zero(cs.namespace(|| "zero"));
+    let is_base_case = alloc_num_equals(cs.namespace(|| "Check if base case"), &i.clone(), &zero)?;
+
+    // synthesize base case
+    let Unew_base = self.synthesize_base_case(cs.namespace(|| "synthesize base case"))?;
+
+    // Synthesize the circuit for the non-base case and get the new running
+    // instance along with a boolean indicating if all checks have passed
+    let (Unew_non_base, check_non_base_pass) = self.synthesize_non_base_case(
+      cs.namespace(|| "synthesize non base case"),
+      &pp_digest,
+      &i,
+      &z_0,
+      &z_i,
+      &U,
+      &r_i,
+      &u,
+      &nifs,
+      &comm_W_fold,
+      &comm_E_fold,
+    )?;
+
+    // Either check_non_base_pass=true or we are in the base case
+    let should_be_false = AllocatedBit::nor(
+      cs.namespace(|| "check_non_base_pass nor base_case"),
+      &check_non_base_pass,
+      &is_base_case,
+    )?;
+    cs.enforce(
+      || "check_non_base_pass nor base_case = false",
+      |lc| lc + should_be_false.get_variable(),
+      |lc| lc + CS::one(),
+      |lc| lc,
+    );
+
+    // we pick between the base case output and the non-base case output
+    let Unew = Unew_base.conditionally_select(
+      cs.namespace(|| "compute U_new"),
+      &Unew_non_base,
+      &Boolean::from(is_base_case.clone()),
+    )?;
+
+    // Compute i + 1
+    let i_new = AllocatedNum::alloc(cs.namespace(|| "i + 1"), || {
+      Ok(*i.get_value().get()? + E::Scalar::ONE)
+    })?;
+    cs.enforce(
+      || "check i + 1",
+      |lc| lc,
+      |lc| lc,
+      |lc| lc + i_new.get_variable() - CS::one() - i.get_variable(),
+    );
+
+    // Compute z_{i+1}
+    let z_input = conditionally_select_vec(
+      cs.namespace(|| "select input to F"),
+      &z_0,
+      &z_i,
+      &Boolean::from(is_base_case),
+    )?;
+
+    // Sub-corrigendum §4.2: wrap the step-circuit namespace in
+    // CSWithLookups so `register_lookup_query` / `register_chunk_lookup_table`
+    // calls from inside `synthesize_with_aux` find a `LookupConstraintSystem<F>`
+    // implementor. The wrapper's local `QueryCollector` is intentionally
+    // not flushed (per §4.2 + §3.1 sound-by-presumption).
+    let z_next = {
+      let mut ns = cs.namespace(|| "F");
+      let mut cs_aux = crate::lookup::CSWithLookups::new(&mut ns);
+      self.step_circuit.synthesize_with_aux(&mut cs_aux, &z_input)?
+    };
 
     if z_next.len() != arity {
       return Err(SynthesisError::IncompatibleLengthVector(
