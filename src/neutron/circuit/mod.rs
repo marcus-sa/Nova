@@ -1059,10 +1059,17 @@ where
     // calls from inside `synthesize_with_aux` find a `LookupConstraintSystem<F>`
     // implementor. The wrapper's local `QueryCollector` is intentionally
     // not flushed (per §4.2 + §3.1 sound-by-presumption).
+    //
+    // Shape-pass semantic model ratification (Halpert, 2026-05-19) §5
+    // note 4 U.host.c: thread `&i` (the fold-step counter allocated at
+    // `:370` / unpacked at `:992`) into the step-circuit body so the
+    // inumbra-side `synthesize_with_aux` can derive the host PC from
+    // `i.get_value()` at prove time (and fall back to a shape-time
+    // default when `get_value() == None` under `ShapeCS::alloc`).
     let z_next = {
       let mut ns = cs.namespace(|| "F");
       let mut cs_aux = crate::lookup::CSWithLookups::new(&mut ns);
-      self.step_circuit.synthesize_with_aux(&mut cs_aux, &z_input)?
+      self.step_circuit.synthesize_with_aux(&mut cs_aux, &i, &z_input)?
     };
 
     if z_next.len() != arity {

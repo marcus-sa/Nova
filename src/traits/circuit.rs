@@ -121,6 +121,18 @@ impl<F: PrimeField> StepCircuit<F> for NonTrivialCircuit<F> {
 ///   §6).
 ///
 /// HG-A1.4-7 (trait-bound mismatch) DISCHARGED on this trait landing.
+///
+/// C1-β BIP-340 chunked-IVC shape-pass semantic model ratification
+/// (Halpert, 2026-05-19) §4 Disposition U / §5 note 4 U.host.c:
+/// extended with a `&AllocatedNum<F>` fold-step counter parameter.
+/// Implementors derive the host-arithmetic PC from `i.get_value()` at
+/// prove time (returns `Some(step_index)`) and fall back to a default
+/// at shape time (`i.get_value() == None`). The augmented-circuit
+/// `synthesize_aux` body passes its locally-allocated `i: AllocatedNum<E::Scalar>`
+/// (vendor/nova/src/neutron/circuit/mod.rs:370 / :992) at the call site.
+/// The parameter is internal to the augmented-circuit body — it does
+/// NOT widen the public API of `RecursiveSNARK` or
+/// `prove_step_with_lookup_fold_aux`.
 #[cfg(feature = "lookup-fold")]
 pub trait StepCircuitWithAux<F: PrimeField, E: Engine<Scalar = F>>: StepCircuit<F> {
   /// Synthesize the step circuit with auxiliary inputs threaded from
@@ -133,9 +145,17 @@ pub trait StepCircuitWithAux<F: PrimeField, E: Engine<Scalar = F>>: StepCircuit<
   ///      prove-time `ck: &CommitmentKey<E>` and per-input BIP-340
   ///      witnesses) from `&self` per the parent corrigendum's
   ///      struct extension.
+  ///   3. The fold-step counter `i: &AllocatedNum<F>` is threaded from
+  ///      the augmented-circuit body per the shape-pass semantic model
+  ///      ratification §5 note 4 (U.host.c). At prove time
+  ///      `i.get_value() == Some(step_index)`; at shape time
+  ///      `i.get_value() == None`. Implementors MUST NOT early-return
+  ///      on `None` — at shape time the body emits the structural
+  ///      union of all sub-bands per Disposition U.
   fn synthesize_with_aux<CS>(
     &self,
     cs: &mut CS,
+    i: &AllocatedNum<F>,
     z: &[AllocatedNum<F>],
   ) -> Result<Vec<AllocatedNum<F>>, SynthesisError>
   where
