@@ -1669,11 +1669,15 @@ mod tests {
   ///    `next_running_lws_after_fold_1`; invocation #3 consumes
   ///    `&self.running_lws == next_running_lws_after_fold_1` as
   ///    `prior_running_lws` input (the byte-equal threading assertion).
-  /// 2. `r_U.T_lookup` accumulates per §1.2 algebra: `None` at outer
-  ///    base (after invocation #1, bootstrap-only), `Some(Vec)` of
-  ///    length k after invocation #2 (first real fold), still
-  ///    `Some(Vec)` after invocation #3 (second fold; per-table
-  ///    scalar advanced via the inner's running threading).
+  /// 2. `r_U.T_lookup` accumulates per §1.2 algebra and Corrigendum #25
+  ///    Fix-α: `Some(vec![ZERO; k])` at outer base (after invocation #1,
+  ///    bootstrap-only; the Fix-α native-side mirror initializes the
+  ///    Some-block at `RecursiveSNARK::new` for IVC-hash-chain
+  ///    byte-equivalence with `AllocatedFoldedInstance::default_with_lookup_k`),
+  ///    `Some(vec)` of length k with non-zero entries after invocation #2
+  ///    (first real fold accumulates the per-table running scalar from
+  ///    the inner `prove_with_multi_table_lookup`), still `Some(vec)`
+  ///    after invocation #3 (second fold advances each per-table scalar).
   /// 3. `running_lws[j]` next-step input is byte-equal to the prior
   ///    step's `next_running_lws[j]` output — captured via the trait
   ///    method's `prior_running_lws` parameter and asserted against a
@@ -1988,9 +1992,26 @@ mod tests {
         .is_none(),
       "bootstrap branch does NOT invoke per_table_bundles_at_step"
     );
+    // Corrigendum #25 (Fix-α native-side mirror): at outer base under
+    // `pp.lookup_fold_k > 0`, `r_U.T_lookup` is initialized by
+    // `FoldedInstance::default_with_lookup_k` to `Some(vec![ZERO; k])` so
+    // the native-side `absorb_in_ro2` walks the same Some-block the
+    // circuit-side `absorb_in_ro` emits at base case (closing Obstruction 2).
+    // The bootstrap branch of `prove_step_with_lookup_fold` does NOT mutate
+    // `r_U`, so the post-bootstrap state matches the post-`new` state.
+    let t_lookup_at_bootstrap = recursive_snark
+      .r_U
+      .T_lookup
+      .as_ref()
+      .expect("Corrigendum #25 Fix-α: r_U.T_lookup is Some(vec![ZERO; k]) at outer base under lookup_fold_k > 0");
+    assert_eq!(
+      t_lookup_at_bootstrap.len(),
+      K,
+      "Fix-α: r_U.T_lookup length is K at outer base, mirroring `running_lws` length-K invariant"
+    );
     assert!(
-      recursive_snark.r_U.T_lookup.is_none(),
-      "outer base / bootstrap: r_U.T_lookup still None (no fold yet)"
+      t_lookup_at_bootstrap.iter().all(|s| s.is_zero().into()),
+      "Fix-α: r_U.T_lookup entries are all-zero at outer base (no fold yet)"
     );
 
     // ── (E) Invocation #2: first real fold (i=1 → 2) ────────────────
