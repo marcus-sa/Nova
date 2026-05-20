@@ -263,10 +263,24 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
   }
 
   /// Asserts that the `BigNat` is well-formed by checking that each limb fits in the limb width.
-  pub fn assert_well_formed<CS: ConstraintSystem<Scalar>>(
+  ///
+  /// Selector-gated variant. The `selector` parameter is acknowledged but NOT consumed:
+  /// the per-limb bit-decomposition is a **witness-typing** invariant (Candidate (C)
+  /// per the bit-shape addendum at
+  /// `docs/research/cryptography/c1-beta-bip340-step-d-hg4-component-a-bit-shape-addendum-2026-05-20.md` §3),
+  /// not a soundness-gate invariant. It holds unconditionally for honest provers and
+  /// rejects non-bit witnesses regardless of which sub-band is active. Leaving the
+  /// per-bit booleans un-gated is *additional* soundness discipline at zero row/aux
+  /// cost-delta; gating them would force a Class Q 2-row + 1-aux rewrite (per
+  /// `docs/research/cryptography/c1-beta-bip340-shape-pass-r1cs-cost-bust-sub-corrigendum-addendum-per-shape-worked-examples-2026-05-19.md` §1.3)
+  /// for no soundness gain.
+  pub fn assert_well_formed_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<(), SynthesisError> {
+    // The selector is intentionally unused: see doc-comment above.
+    let _ = selector;
     // swap the option and iterator
     let limb_values_split =
       (0..self.limbs.len()).map(|i| self.limb_values.as_ref().map(|vs| vs[i]));
@@ -275,6 +289,21 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
         .fits_in_bits(cs.namespace(|| format!("{i}")), self.params.limb_width)?;
     }
     Ok(())
+  }
+
+  /// Asserts that the `BigNat` is well-formed by checking that each limb fits in the limb width.
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `assert_well_formed_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn assert_well_formed<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+  ) -> Result<(), SynthesisError> {
+    self.assert_well_formed_with_selector(
+      cs,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
   }
 
   /// Break `self` up into a bit-vector.
@@ -354,12 +383,22 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
   }
 
   /// Constrain `self` to be equal to `other`, after carrying both.
-  pub fn equal_when_carried<CS: ConstraintSystem<Scalar>>(
+  ///
+  /// Selector-gated variant. The 5 direct `cs.enforce` sites (per-limb carry,
+  /// final carry-out, two zero-padding loops) are rewritten as Class Z under
+  /// selector gating: pre `lc * lc = C` (i.e., `0 * 0 = C`, enforcing `C = 0`)
+  /// becomes post `C * selector = 0`. The internal `carry.fits_in_bits` call
+  /// is PRESERVED un-gated per the bit-shape addendum §5.3 — it is a
+  /// witness-typing invariant on freshly-allocated carry bits, identical
+  /// disposition to `Num::fits_in_bits` (see Candidate (C) at
+  /// `docs/research/cryptography/c1-beta-bip340-step-d-hg4-component-a-bit-shape-addendum-2026-05-20.md` §3).
+  pub fn equal_when_carried_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
     other: &Self,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<(), SynthesisError> {
-    self.enforce_limb_width_agreement(other, "equal_when_carried")?;
+    self.enforce_limb_width_agreement(other, "equal_when_carried_with_selector")?;
 
     // We'll propagate carries over the first `n` limbs.
     let n = min(self.limbs.len(), other.limbs.len());
@@ -386,10 +425,10 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       })?;
       accumulated_extra += max_word;
 
+      // Class Z rewrite: pre `0 * 0 = C` -> post `C * selector = 0`. Single row,
+      // vacuous at `selector = 0`, identical to original at `selector = 1`.
       cs.enforce(
         || format!("carry {i}"),
-        |lc| lc,
-        |lc| lc,
         |lc| {
           lc + &carry_in.num + &self.limbs[i] - &other.limbs[i]
             + (nat_to_f(max_word).unwrap(), CS::one())
@@ -399,51 +438,78 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
               CS::one(),
             )
         },
+        |_| selector.clone(),
+        |lc| lc,
       );
 
       accumulated_extra /= &target_base;
 
       if i < n - 1 {
+        // Witness-typing invariant: preserve un-gated per addendum §5.3.
         carry.fits_in_bits(cs.namespace(|| format!("carry {i} decomp")), carry_bits)?;
       } else {
+        // Class Z rewrite (final carry-out).
         cs.enforce(
           || format!("carry {i} is out"),
-          |lc| lc,
-          |lc| lc,
           |lc| lc + &carry.num - (nat_to_f(&accumulated_extra).unwrap(), CS::one()),
+          |_| selector.clone(),
+          |lc| lc,
         );
       }
       carry_in = carry;
     }
 
+    // Class Z rewrite (zero-padding loops).
     for (i, zero_limb) in self.limbs.iter().enumerate().skip(n) {
       cs.enforce(
         || format!("zero self {i}"),
-        |lc| lc,
-        |lc| lc,
         |lc| lc + zero_limb,
+        |_| selector.clone(),
+        |lc| lc,
       );
     }
     for (i, zero_limb) in other.limbs.iter().enumerate().skip(n) {
       cs.enforce(
         || format!("zero other {i}"),
-        |lc| lc,
-        |lc| lc,
         |lc| lc + zero_limb,
+        |_| selector.clone(),
+        |lc| lc,
       );
     }
     Ok(())
   }
 
   /// Constrain `self` to be equal to `other`, after carrying both.
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `equal_when_carried_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn equal_when_carried<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+    other: &Self,
+  ) -> Result<(), SynthesisError> {
+    self.equal_when_carried_with_selector(
+      cs,
+      other,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
+  }
+
+  /// Constrain `self` to be equal to `other`, after carrying both.
   /// Uses regrouping internally to take full advantage of the field size and reduce the amount
   /// of carrying.
-  pub fn equal_when_carried_regroup<CS: ConstraintSystem<Scalar>>(
+  ///
+  /// Selector-gated variant. Transitive wrapper: forwards `selector` to
+  /// `equal_when_carried_with_selector` on the regrouped BigNats. No direct
+  /// `cs.enforce` sites in this function body.
+  pub fn equal_when_carried_regroup_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
     other: &Self,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<(), SynthesisError> {
-    self.enforce_limb_width_agreement(other, "equal_when_carried_regroup")?;
+    self.enforce_limb_width_agreement(other, "equal_when_carried_regroup_with_selector")?;
     let max_word = max(&self.params.max_word, &other.params.max_word);
     let carry_bits = (((max_word.to_f64().unwrap() * 2.0).log2() - self.params.limb_width as f64)
       .ceil()
@@ -451,7 +517,30 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     let limbs_per_group = (Scalar::CAPACITY as usize - carry_bits) / self.params.limb_width;
     let self_grouped = self.group_limbs(limbs_per_group);
     let other_grouped = other.group_limbs(limbs_per_group);
-    self_grouped.equal_when_carried(cs.namespace(|| "grouped"), &other_grouped)
+    self_grouped.equal_when_carried_with_selector(
+      cs.namespace(|| "grouped"),
+      &other_grouped,
+      selector,
+    )
+  }
+
+  /// Constrain `self` to be equal to `other`, after carrying both.
+  /// Uses regrouping internally to take full advantage of the field size and reduce the amount
+  /// of carrying.
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `equal_when_carried_regroup_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn equal_when_carried_regroup<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+    other: &Self,
+  ) -> Result<(), SynthesisError> {
+    self.equal_when_carried_regroup_with_selector(
+      cs,
+      other,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
   }
 
   /// Adds two `BigNat`s together, returning a new `BigNat` with the sum.
