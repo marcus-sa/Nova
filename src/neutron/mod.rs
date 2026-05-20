@@ -615,6 +615,19 @@ where
   pub fn ck(&self) -> &CommitmentKey<E1> {
     &self.ck
   }
+
+  /// C1-β BIP-340 HG-A1.4-8 (3) acceptance accessor (Halpert
+  /// dispatcher-construction addendum 881c839 §6 cost ledger): public
+  /// accessor for the augmented circuit's R1CS constraint count. The
+  /// inumbra-side `wrap_pipeline` reads this immediately after
+  /// `setup_with_ptau_dir_aux` returns to populate
+  /// `WrappedProof.setup_constraints` for the ≤ 6M cons-per-fold-step
+  /// ceiling assertion. Non-soundness-bearing: exposes a measurement
+  /// surface only; the value is already readable in-crate by
+  /// `CompressedSNARK::setup`.
+  pub fn num_constraints(&self) -> usize {
+    self.structure.S.num_cons()
+  }
 }
 
 /// A SNARK that proves the correct execution of an incremental computation
