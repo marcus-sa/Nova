@@ -589,13 +589,31 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
   }
 
   /// Compute a `BigNat` constrained to be equal to `self * other % modulus`.
-  pub fn mult_mod<CS: ConstraintSystem<Scalar>>(
+  ///
+  /// Selector-gated variant. Transitive wrapper: forwards `selector` to the two
+  /// `assert_well_formed_with_selector` calls (range-check on `quotient` and
+  /// `remainder`) and to the terminal `equal_when_carried_regroup_with_selector`
+  /// call (the modular-reduction-equation soundness gate `a*b == q*m + r`).
+  /// The two intermediate `Polynomial::alloc_product` calls (`left = a*b`,
+  /// `right_product = q*m`) stay UN-GATED per the `alloc_product` policy
+  /// addendum's Path (ii)
+  /// (`docs/research/cryptography/c1-beta-bip340-step-d-hg4-component-a-alloc-product-policy-addendum-2026-05-20.md` §3,
+  /// §5): the polynomial-product binding is witness-typing-class
+  /// (Schwartz-Zippel uniqueness pins `product.coefficients` to a deterministic
+  /// function of inputs; no degree of freedom for forgery). Outputs flow to
+  /// exactly one downstream consumer (`equal_when_carried_regroup_with_selector`,
+  /// IN the cascade) whose dormant-sub-band emission is vacuous, and to
+  /// namespace-local sub-band-internal further operations whose dispatcher-terminal
+  /// binding is Lagrange-indicator-multiplexed to zero. No `_with_selector`
+  /// sibling for `Polynomial::alloc_product` is required.
+  pub fn mult_mod_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
     other: &Self,
     modulus: &Self,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<(BigNat<Scalar>, BigNat<Scalar>), SynthesisError> {
-    self.enforce_limb_width_agreement(other, "mult_mod")?;
+    self.enforce_limb_width_agreement(other, "mult_mod_with_selector")?;
     let limb_width = self.params.limb_width;
     let quotient_bits = (self.n_bits() + other.n_bits()).saturating_sub(modulus.params.min_bits);
     let quotient_limbs = quotient_bits.saturating_sub(1) / limb_width + 1;
@@ -612,7 +630,8 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       self.params.limb_width,
       quotient_limbs,
     )?;
-    quotient.assert_well_formed(cs.namespace(|| "quotient rangecheck"))?;
+    quotient
+      .assert_well_formed_with_selector(cs.namespace(|| "quotient rangecheck"), selector)?;
     let remainder = BigNat::alloc_from_nat(
       cs.namespace(|| "remainder"),
       || {
@@ -626,15 +645,17 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       self.params.limb_width,
       modulus.limbs.len(),
     )?;
-    remainder.assert_well_formed(cs.namespace(|| "remainder rangecheck"))?;
+    remainder
+      .assert_well_formed_with_selector(cs.namespace(|| "remainder rangecheck"), selector)?;
     let a_poly = Polynomial::from(self.clone());
     let b_poly = Polynomial::from(other.clone());
     let mod_poly = Polynomial::from(modulus.clone());
     let q_poly = Polynomial::from(quotient.clone());
     let r_poly = Polynomial::from(remainder.clone());
 
-    // a * b
+    // a * b — un-gated per Path (ii) (witness-typing-class binding).
     let left = a_poly.alloc_product(cs.namespace(|| "left"), &b_poly)?;
+    // q * m — un-gated per Path (ii) (witness-typing-class binding).
     let right_product = q_poly.alloc_product(cs.namespace(|| "right_product"), &mod_poly)?;
     // q * m + r
     let right = right_product.sum(&r_poly);
@@ -655,17 +676,51 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
 
     let left_int = BigNat::from_poly(left, limb_width, left_max_word);
     let right_int = BigNat::from_poly(right, limb_width, right_max_word);
-    left_int.equal_when_carried_regroup(cs.namespace(|| "carry"), &right_int)?;
+    left_int.equal_when_carried_regroup_with_selector(
+      cs.namespace(|| "carry"),
+      &right_int,
+      selector,
+    )?;
     Ok((quotient, remainder))
   }
 
   /// Compute a `BigNat` constrained to be equal to `self * other % modulus`.
-  pub fn red_mod<CS: ConstraintSystem<Scalar>>(
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `mult_mod_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn mult_mod<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+    other: &Self,
+    modulus: &Self,
+  ) -> Result<(BigNat<Scalar>, BigNat<Scalar>), SynthesisError> {
+    self.mult_mod_with_selector(
+      cs,
+      other,
+      modulus,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
+  }
+
+  /// Compute a `BigNat` constrained to be equal to `self % modulus`.
+  ///
+  /// Selector-gated variant. Transitive wrapper: forwards `selector` to the two
+  /// `assert_well_formed_with_selector` calls (range-check on `quotient` and
+  /// `remainder`) and to the terminal `equal_when_carried_regroup_with_selector`
+  /// call (the modular-reduction-equation soundness gate `self == q*m + r`).
+  /// The intermediate `Polynomial::alloc_product` call (`q*m`) stays UN-GATED
+  /// per the `alloc_product` policy addendum's Path (ii)
+  /// (`docs/research/cryptography/c1-beta-bip340-step-d-hg4-component-a-alloc-product-policy-addendum-2026-05-20.md` §3,
+  /// §5). See `mult_mod_with_selector` doc-comment for the witness-typing-class
+  /// soundness argument.
+  pub fn red_mod_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
     modulus: &Self,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<BigNat<Scalar>, SynthesisError> {
-    self.enforce_limb_width_agreement(modulus, "red_mod")?;
+    self.enforce_limb_width_agreement(modulus, "red_mod_with_selector")?;
     let limb_width = self.params.limb_width;
     let quotient_bits = self.n_bits().saturating_sub(modulus.params.min_bits);
     let quotient_limbs = quotient_bits.saturating_sub(1) / limb_width + 1;
@@ -675,19 +730,21 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       self.params.limb_width,
       quotient_limbs,
     )?;
-    quotient.assert_well_formed(cs.namespace(|| "quotient rangecheck"))?;
+    quotient
+      .assert_well_formed_with_selector(cs.namespace(|| "quotient rangecheck"), selector)?;
     let remainder = BigNat::alloc_from_nat(
       cs.namespace(|| "remainder"),
       || Ok(self.value.grab()? % modulus.value.grab()?),
       self.params.limb_width,
       modulus.limbs.len(),
     )?;
-    remainder.assert_well_formed(cs.namespace(|| "remainder rangecheck"))?;
+    remainder
+      .assert_well_formed_with_selector(cs.namespace(|| "remainder rangecheck"), selector)?;
     let mod_poly = Polynomial::from(modulus.clone());
     let q_poly = Polynomial::from(quotient.clone());
     let r_poly = Polynomial::from(remainder.clone());
 
-    // q * m + r
+    // q * m — un-gated per Path (ii) (witness-typing-class binding).
     let right_product = q_poly.alloc_product(cs.namespace(|| "right_product"), &mod_poly)?;
     let right = right_product.sum(&r_poly);
 
@@ -700,8 +757,29 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     };
 
     let right_int = BigNat::from_poly(right, limb_width, right_max_word);
-    self.equal_when_carried_regroup(cs.namespace(|| "carry"), &right_int)?;
+    self.equal_when_carried_regroup_with_selector(
+      cs.namespace(|| "carry"),
+      &right_int,
+      selector,
+    )?;
     Ok(remainder)
+  }
+
+  /// Compute a `BigNat` constrained to be equal to `self % modulus`.
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `red_mod_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn red_mod<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+    modulus: &Self,
+  ) -> Result<BigNat<Scalar>, SynthesisError> {
+    self.red_mod_with_selector(
+      cs,
+      modulus,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
   }
 
   /// Combines limbs into groups.
@@ -867,12 +945,23 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     Ok(scalar_bits)
   }
 
-  /// Compute self - other mod modulus
-  pub fn sub_mod<CS: ConstraintSystem<Scalar>>(
+  /// Compute self - other mod modulus.
+  ///
+  /// Selector-gated variant. Transitive wrapper: forwards `selector` to the
+  /// transitive `red_mod_with_selector` call (which threads through the
+  /// modular-reduction-equation cascade per its own doc-comment) and to the
+  /// terminal `equal_when_carried_regroup_with_selector` call (the
+  /// subtract-equality soundness gate `self == other + diff (mod modulus)`).
+  /// The `alloc_from_nat` for `diff` stays UNMODIFIED — witness-allocation
+  /// only, with range constraints arriving transitively via
+  /// `red_mod_with_selector` on `other.add(&diff)` (parent sub-corrigendum
+  /// §2.2.3 + addendum §3 disposition).
+  pub fn sub_mod_with_selector<CS: ConstraintSystem<Scalar>>(
     &self,
     mut cs: CS,
     other: &Self,
     modulus: &Self,
+    selector: &LinearCombination<Scalar>,
   ) -> Result<Self, SynthesisError> {
     let diff = BigNat::alloc_from_nat(
       cs.namespace(|| "sub_mod: compute diff"),
@@ -887,11 +976,36 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       self.params.n_limbs,
     )?;
 
-    let sum = other
-      .add(&diff)?
-      .red_mod(cs.namespace(|| "sub_mod: reduce sum"), modulus)?;
-    self.equal_when_carried_regroup(cs.namespace(|| "sub_mod: equality check"), &sum)?;
+    let sum = other.add(&diff)?.red_mod_with_selector(
+      cs.namespace(|| "sub_mod: reduce sum"),
+      modulus,
+      selector,
+    )?;
+    self.equal_when_carried_regroup_with_selector(
+      cs.namespace(|| "sub_mod: equality check"),
+      &sum,
+      selector,
+    )?;
     Ok(diff)
+  }
+
+  /// Compute self - other mod modulus.
+  ///
+  /// Original surface preserved as a one-line delegate to
+  /// `sub_mod_with_selector` with `selector = LC::one()`, per
+  /// method-rename discipline (sub-corrigendum §7, addendum §5).
+  pub fn sub_mod<CS: ConstraintSystem<Scalar>>(
+    &self,
+    cs: CS,
+    other: &Self,
+    modulus: &Self,
+  ) -> Result<Self, SynthesisError> {
+    self.sub_mod_with_selector(
+      cs,
+      other,
+      modulus,
+      &(LinearCombination::<Scalar>::zero() + CS::one()),
+    )
   }
 }
 
